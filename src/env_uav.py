@@ -11,24 +11,20 @@ from pathlib import Path
 import airsim
 import random
 from typing import Dict, List, Optional
-
 import tqdm
+
 from src.common.param import args
 from utils.logger import logger
+
 sys.path.append(str(Path(str(os.getcwd())).resolve()))
+
 from airsim_plugin.AirVLNSimulatorClientTool import AirVLNSimulatorClientTool
 from utils.env_utils_uav import SimState, getNextPosition
 from utils.env_vector_uav import VectorEnvUtil
 
 
-
 class AirVLNENV:
-    def __init__(self, batch_size=8, 
-                 dataset_path=None,
-                 save_path=None,
-                 seed=1,
-                 activate_maps=[]
-                 ):
+    def __init__(self, batch_size=8, dataset_path=None, save_path=None, seed=1, activate_maps=[] ):
         self.batch_size = batch_size
         self.dataset_path = dataset_path
         self.epoch_done = False
@@ -37,16 +33,19 @@ class AirVLNENV:
         #self.dataset_group_by_scene = dataset_group_by_scene
         self.activate_maps = set(activate_maps)
         self.exist_save_path = save_path
+
         load_data = self.load_my_datasets()
         self.data = load_data
         logger.info('Loaded dataset {}.'.format(len(self.data)))
         self.index_data = 0
+
         self.dataset_group_by_scene = True
         self.data = self._group_scenes()
         logger.info('dataset grouped by scene, ')
-        
+
         scenes = [item['map_name'] for item in self.data]
         self.scenes = set(scenes)
+
         self.sim_states: Optional[List[SimState]] = [None for _ in range(batch_size)]
         self.last_using_map_list = []
         self.one_scene_could_use_num = 5e3
@@ -55,13 +54,11 @@ class AirVLNENV:
 
     def load_my_datasets(self):
         """
-            load object location json file, reconstruct a json file with every infomation
-            
-            return: object_info (contains position, rotation, scale, object name, instruction )
+        load object location json file, reconstruct a json file with every infomation
+        return: object_info (contains position, rotation, scale, object name, instruction )
         """
         data=[]
         trajectory_path = os.path.join(self.dataset_path)
-
         data_file= json.load(open(self.dataset_path, 'r'))
         for index, item in enumerate(tqdm.tqdm(data_file, desc="Loading")):
             traj_info={}
@@ -78,17 +75,16 @@ class AirVLNENV:
             #traj_info['instruction'] = item['instruction']
             data.append(traj_info)
         return data
-    
+
     def _group_scenes(self):
         """
-            group all objects with their scene name, choose objects which
+        group all objects with their scene name, choose objects which
         """
         scene_sort_keys: OrderedDict[str, int] = {}
         for item in self.data:
             if str(item['map_name']) not in scene_sort_keys:
                 scene_sort_keys[str(item['map_name'])] = len(scene_sort_keys)
         return sorted(self.data, key=lambda e: (scene_sort_keys[str(e['map_name'])]))
-        
 
     def init_VectorEnvUtil(self):
         self.delete_VectorEnvUtil()
@@ -100,10 +96,8 @@ class AirVLNENV:
         import gc
         gc.collect()
 
-    
     def next_minibatch(self, skip_scenes=[], data_it=0):
         batch = []
-        
         if self.epoch_done and self.index_data >= len(self.data):
             self.batch = None
             return
@@ -116,40 +110,37 @@ class AirVLNENV:
                 if self.dataset_group_by_scene:
                     self.data = self._group_scenes()
                     logger.warning('dataset grouped by scene')
-
+                
                 if len(batch) == 0:
                     self.index_data = 0
                     self.batch = None
                     return
-
+                
                 self.index_data = self.batch_size - len(batch)
                 batch += self.data[:self.index_data]
                 self.index_data = len(self.data)+1
                 break
 
             task = self.data[self.index_data]
-
             if task['map_name'] in skip_scenes:
                 self.index_data += 1
                 continue
-
             batch.append(task)
             self.index_data += 1
 
             if len(batch) == self.batch_size:
-                break 
+                break
 
         self.batch = copy.deepcopy(batch)
         assert len(self.batch) == self.batch_size, 'next_minibatch error'
         self.VectorEnvUtil.set_batch(self.batch)
         return self.batch
-    
+
     def changeToNewTask(self):
         self._changeEnv(need_change=False)
         self._setDrone()
         self.update_measurements()
 
-    
     def _setDrone(self,):
         drone_position_info = [item['start_pose']['start_position'] for item in self.batch]
         drone_quaternior_info = [item['start_pose']['start_quaternionr'] for item in self.batch]
@@ -176,7 +167,6 @@ class AirVLNENV:
 
         self.simulator_tool.setPoses(poses=poses)
         state_info_results = self.simulator_tool.getSensorInfo()
-
         cnt = 0
         for index_1, item in enumerate(self.machines_info):
             for index_2, _ in enumerate(item['open_scenes']):
@@ -184,10 +174,8 @@ class AirVLNENV:
                 self.sim_states[cnt].sensorInfo = [state_info_results[index_1][index_2]]
                 cnt += 1
 
-
     def _changeEnv(self, need_change: bool = True):
         using_map_list = [item['map_name'] for item in self.batch]
-        
         assert len(using_map_list) == self.batch_size, '错误'
 
         machines_info_template = copy.deepcopy(args.machines_info)
@@ -202,7 +190,6 @@ class AirVLNENV:
             machines_info.append(item)
             delta = min(self.batch_size, item['MAX_SCENE_NUM'], len(using_map_list)-ix)
             machines_info[index]['open_scenes'] = using_map_list[ix : ix + delta]
-            
             machines_info[index]['gpus'] = [args.gpu_id] * len(machines_info[index]['open_scenes'])
             ix += delta
 
@@ -210,28 +197,25 @@ class AirVLNENV:
         for item in machines_info:
             cnt += len(item['open_scenes'])
         assert self.batch_size == cnt, 'error create machines_info'
-
-        #
-        if self.this_scene_used_cnt < self.one_scene_could_use_num and \
-            len(set(using_map_list)) == 1 and len(set(self.last_using_map_list)) == 1 and \
-            using_map_list[0] is not None and self.last_using_map_list[0] is not None and \
-            using_map_list[0] == self.last_using_map_list[0] and \
-            need_change == False:
-            self.this_scene_used_cnt += 1
-            logger.warning('no need to change env: {}'.format(using_map_list))
-            # use the current environments
-            return
-        else:
-            logger.warning('to change env: {}'.format(using_map_list))
- 
-        #
+        
+        # if self.this_scene_used_cnt < self.one_scene_could_use_num and \
+        #     len(set(using_map_list)) == 1 and len(set(self.last_using_map_list)) == 1 and \
+        #     using_map_list[0] is not None and self.last_using_map_list[0] is not None and \
+        #     using_map_list[0] == self.last_using_map_list[0] and \
+        #     need_change == False:
+        #     self.this_scene_used_cnt += 1
+        #     logger.warning('no need to change env: {}'.format(using_map_list))
+        #     # use the current environments
+        #     return
+        # else:
+        logger.warning('to change env: {}'.format(using_map_list))
+        
         while True:
             try:
                 self.machines_info = copy.deepcopy(machines_info)
                 print('machines_info:', self.machines_info)
                 self.simulator_tool = AirVLNSimulatorClientTool(machines_info=self.machines_info)
                 self.simulator_tool.run_call()
-                
                 break
             except Exception as e:
                 logger.error("启动场景失败 {}".format(e))
@@ -242,7 +226,6 @@ class AirVLNENV:
 
         self.last_using_map_list = using_map_list.copy()
         self.this_scene_used_cnt = 1
-
 
     def get_obs(self):
         obs_states = self._getStates()
@@ -259,16 +242,19 @@ class AirVLNENV:
         assert cnt == self.batch_size, 'error'
 
         states = [None for _ in range(self.batch_size)]
+
         cnt = 0
         for index_1, item in enumerate(self.machines_info):
             for index_2 in range(len(item['open_scenes'])):
                 rgb_images = responses[index_1][index_2][0]
                 depth_images = responses[index_1][index_2][1]
                 state = self.sim_states[cnt]
+
                 states[cnt] = (rgb_images, depth_images, state)
                 cnt += 1
+
         return states
-    
+
     def _get_current_state(self) -> list:
         states = []
         cnt = 0
@@ -276,13 +262,16 @@ class AirVLNENV:
             states.append([])
             for index_2, _ in enumerate(item['open_scenes']):
                 s = self.sim_states[cnt].state
+
                 state = airsim.KinematicsState()
                 state.position = airsim.Vector3r(*s['position'])
                 state.orientation = airsim.Quaternionr(*s['orientation'])
                 state.linear_velocity = airsim.Vector3r(*s['linear_velocity'])
                 state.angular_velocity = airsim.Vector3r(*s['angular_velocity'])
+
                 states[index_1].append(state)
                 cnt += 1
+
         return states
 
     def _get_current_pose(self) -> list:
@@ -295,71 +284,95 @@ class AirVLNENV:
                     self.sim_states[cnt].pose
                 )
                 cnt += 1
+
         return poses
 
     def reset(self):
         self.changeToNewTask()
         return self.get_obs()
-        
+
     def makeActions(self, action_list, steps_size, is_fixed):
         poses = []
         fly_types = []
+
         for index, action in enumerate(action_list):
             if self.sim_states[index].is_end == True:
                 action = 'stop'
                 # continue
+
             if action == 'stop' or self.sim_states[index].step >= int(args.maxActions):
                 self.sim_states[index].is_end = True
 
             current_pose = self.sim_states[index].pose
-
             if isinstance(current_pose, list):
                 pos = current_pose[:3]
                 quat = current_pose[3:]
-                airsim_pose = airsim.Pose(airsim.Vector3r(*pos),
-                                          airsim.Quaternionr(x_val=quat[0], y_val=quat[1], z_val=quat[2], w_val=quat[3]))
-        
+                airsim_pose = airsim.Pose(
+                    airsim.Vector3r(*pos),
+                    airsim.Quaternionr(x_val=quat[0], y_val=quat[1], z_val=quat[2], w_val=quat[3])
+                )
+
             (new_pose, fly_type) = getNextPosition(airsim_pose, action, steps_size[index],is_fixed)
 
             (prev_pitch,prev_roll, prev_yaw) = airsim.to_eularian_angles(airsim_pose.orientation)
             (curr_pitch,curr_roll, curr_yaw) = airsim.to_eularian_angles(new_pose.orientation)
             delta_yaw = abs((math.degrees(curr_yaw - prev_yaw) + 180) % 360 - 180)
             self.sim_states[index].heading_changes.append(delta_yaw)
-            pos = new_pose.position
 
+            pos = new_pose.position
             curr = np.array([pos.x_val, pos.y_val, pos.z_val])
             coords = np.array(self.batch[index]["object_position"])
+
             if coords.ndim == 2 and coords.shape[1] == 3:
                 dists = np.linalg.norm(coords - curr[None, :], axis=1)
                 min_dist = dists.min()
             else:
                 min_dist = np.linalg.norm(curr - coords)
+
             if min_dist < self.sim_states[index].SUCCESS_DISTANCE:
                 self.sim_states[index].oracle_success = True
 
             poses.append(new_pose)
             fly_types.append(fly_type)
-            
+
         format_pose =[]
         format_fly_type =[]
+
         cnt = 0
         for index1, item in enumerate(self.machines_info):
             format_pose.append([])
             format_fly_type.append([])
+
             for index2 ,_ in enumerate(item['open_scenes']):
                 format_pose[index1].append(poses[cnt])
                 format_fly_type[index1].append(fly_types[cnt])
                 cnt += 1
-        
+
         result = self.simulator_tool.move_to_next_pose(poses_list=format_pose, fly_types=format_fly_type)
-        
         if not result:
             logger.error('move_to_next_pose error')
+
+        event_infos = [None for _ in range(self.batch_size)]
 
         cnt=0
         for index1, item in enumerate(self.machines_info):
             for index2 ,_ in enumerate(item['open_scenes']):
                 self.sim_states[cnt].is_collisioned = result[index1][index2]['collision']
+
+                event_info = None
+                try:
+                    event_info = result[index1][index2]['states'][0]['sensors'].get('event', None)
+                except Exception as e:
+                    event_info = None
+
+                if event_info is None:
+                    try:
+                        event_info = result[index1][index2].get('event_info', None)
+                    except Exception as e:
+                        event_info = None
+
+                event_infos[cnt] = event_info
+                cnt += 1
 
         for index, action in enumerate(action_list):
             if self.sim_states[index].is_end == True:
@@ -369,17 +382,14 @@ class AirVLNENV:
                 self.sim_states[index].is_end = True
 
             self.sim_states[index].step += 1
-            
+
             traj = self.sim_states[index].trajectory
             if len(traj) >= 1:
                 p_prev = np.array(traj[-1]['sensors']['state']['position'])
             else:
-                p_prev = np.array([poses[index].position.x_val,
-                                poses[index].position.y_val,
-                                poses[index].position.z_val])
-            p_curr = np.array([poses[index].position.x_val,
-                            poses[index].position.y_val,
-                            poses[index].position.z_val])
+                p_prev = np.array([poses[index].position.x_val, poses[index].position.y_val, poses[index].position.z_val])
+
+            p_curr = np.array([poses[index].position.x_val, poses[index].position.y_val, poses[index].position.z_val])
             step_dist = np.linalg.norm(p_curr - p_prev)
             self.sim_states[index].move_distance += step_dist
 
@@ -391,17 +401,24 @@ class AirVLNENV:
                     'state':{
                         'position' :[poses[index].position.x_val, poses[index].position.y_val, poses[index].position.z_val],
                         'quaternionr' :[poses[index].orientation.x_val, poses[index].orientation.y_val, poses[index].orientation.z_val, poses[index].orientation.w_val]
-                    }
+                    },
+                    'event': event_infos[index]
                 },
                 'move_distance': round(self.sim_states[index].move_distance, 2),
                 'distance_to_target': round(distance_to_target, 2),
             })
 
-            
+            if event_infos[index] is not None:
+                logger.info('[SimpleEventTrajectory] step={}, valid={}, count={}, strongest={}'.format(
+                    self.sim_states[index].step,
+                    event_infos[index].get('valid', False),
+                    event_infos[index].get('event_count', 0),
+                    event_infos[index].get('strongest_region', 'none')
+                ))
 
     def update_measurements(self):
         self._update_distance_to_target()
-        
+
     def _update_distance_to_target(self):
         target_positions = [item['object_position'] for item in self.batch]
 
@@ -416,4 +433,3 @@ class AirVLNENV:
                 distance = float(np.linalg.norm(curr - coords))
 
             print(f'batch[{idx}/{len(self.batch)}]| distance: {round(distance, 2)}, position: {curr[0]}, {curr[1]}, {curr[2]}, target: {coords}')
-     

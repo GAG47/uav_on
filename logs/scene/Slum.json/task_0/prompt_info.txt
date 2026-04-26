@@ -13,10 +13,10 @@
                         **Y Range**: [min_y, max_y] = [-54, 47]
 
                         # RGB Captions
-                        Front = Description time out. [ServerError]  
-                        Left = Description time out. [ServerError]  
-                        Right = Description time out. [ServerError]  
-                        Down = Description time out. [ServerError]  
+                        Front = large tree, dark bark, dense green foliage; tree branches extending over water surface; water reflecting tree and sky  
+                        Left = two trees with thick trunks, green leaves; one tree floating above water; shoreline with grass visible in distance; water surface calm and blue  
+                        Right = row of trees, green foliage, misty atmosphere; trees growing along curved shoreline; water below reflecting sky and trees; foreground tree partially framing view  
+                        Down = tree branch with green leaves, extending into frame from top right; clear blue sky in background; white cloud layer below sky  
 
                         # Depth Information  
                         FrontDepth: [[3, 2, 2], [1, 1, 1], [1, 1, 1]]  
@@ -54,6 +54,9 @@
                         - **If StepsSoFar:0 is more than 100 steps**, and the target seems to match any current caption reasonably well, you may relax your stopping condition and consider stopping based on a **single strong match**.
                         
 
+Event Camera Observation:
+No valid event camera observation is available for the previous movement.
+
 
 [STEP 1 PROMPT]
 
@@ -69,34 +72,34 @@
                         **Y Range**: [min_y, max_y] = [-54, 47]
 
                         # RGB Captions
-                        Front = Description time out. [ServerError]  
-                        Left = Description time out. [ServerError]  
-                        Right = Description time out. [ServerError]  
-                        Down = Description time out. [ServerError]  
+                        Front = large tree, dark bark, green foliage; tree rooted on a curved landmass; blue water below; distant structure visible through mist  
+                        Left = tree with dark roots, green leaves; tree positioned at edge of curved landmass; blue water extending into horizon; sky bright and hazy  
+                        Right = multiple trees, dark trunks, dense green canopies; trees growing on curved terrain; blue water beneath; misty background with soft light  
+                        Down = blue sky, gradient from dark to light; white surface below; partial dark object in upper right corner  
 
                         # Depth Information  
-                        FrontDepth: [[2, 1, 1], [2, 2, 1], [2, 2, 2]]  
-                        LeftDepth: [[3, 3, 2], [5, 5, 2], [100, 12, 2]]  
-                        RightDepth: [[2, 2, 2], [2, 2, 8], [1, 4, 7]]  
-                        DownDepth: [[2, 2, 2], [100, 4, 3], [100, 100, 100]]
+                        FrontDepth: [[1, 2, 5], [4, 4, 4], [5, 5, 5]]  
+                        LeftDepth: [[9, 3, 2], [7, 4, 3], [100, 100, 7]]  
+                        RightDepth: [[4, 5, 7], [3, 5, 11], [5, 5, 100]]  
+                        DownDepth: [[100, 100, 13], [100, 100, 100], [100, 100, 100]]
 
                         # Previous UAV Poses (last 10 steps)
                         {
     [(-72.64, -3.62, -10.0), -7.92],
-    [(-72.64, -3.62, -12.0), -7.92],
-    [(-72.64, -3.62, -12.0), -7.92],
-    [(-72.64, -3.62, -12.0), -7.92],
-    [(-72.64, -3.62, -12.0), -7.92],
-    [(-72.64, -3.62, -12.0), -7.92],
-    [(-72.64, -3.62, -12.0), -7.92],
-    [(-72.64, -3.62, -12.0), -7.92],
-    [(-72.64, -3.62, -12.0), -7.92],
-    [(-72.64, -3.62, -12.0), -7.92],
+    [(-73.33, -8.57, -10.0), -7.92],
+    [(-73.33, -8.57, -10.0), -7.92],
+    [(-73.33, -8.57, -10.0), -7.92],
+    [(-73.33, -8.57, -10.0), -7.92],
+    [(-73.33, -8.57, -10.0), -7.92],
+    [(-73.33, -8.57, -10.0), -7.92],
+    [(-73.33, -8.57, -10.0), -7.92],
+    [(-73.33, -8.57, -10.0), -7.92],
+    [(-73.33, -8.57, -10.0), -7.92],
 }
 
                         # Trajectory Summary
                         StepsSoFar = 1
-                        DistanceTraveled = 2.0
+                        DistanceTraveled = 5.0
                         AvgHeadingChange = 0.0
 
                         # Reminder  
@@ -109,4 +112,7 @@
                         - Stopping too early on a vague match is a **mission failure**. It's better to get closer and confirm than to stop prematurely.  
                         - **If StepsSoFar:1 is more than 100 steps**, and the target seems to match any current caption reasonably well, you may relax your stopping condition and consider stopping based on a **single strong match**.
                         
+
+Event Camera Observation:
+During the previous movement, the event camera observed high visual-change activity. The strongest event response appeared in the top-left region of the view. The event density was strong, based on 10 sampled frames. The polarity distribution was 704771 positive events and 599832 negative events. This information reflects motion-induced visual changes and possible object boundaries during flight, and should be used as auxiliary evidence together with RGB captions and depth.
 

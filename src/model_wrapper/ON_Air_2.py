@@ -98,6 +98,8 @@ class ONAir(BaseModelWrapper):
             previous_position = episodes[i][-1]['pre_poses']
             move_distance = episodes[i][-1]['move_distance']
             AvgHeadingChange = episodes[i][-1]['avg_heading_changes']
+            event_info = episodes[i][-1].get('event_info', None)
+            event_summary = self.format_event_summary(event_info)
 
             raw_poses = self.process_poses(poses=previous_position)
 
@@ -156,6 +158,9 @@ class ONAir(BaseModelWrapper):
                         ) 
                     }
                 ]
+
+            conversation[1]["content"] += "\n\nEvent Camera Observation:\n{}".format(event_summary)
+
             prompt_info = conversation[1]["content"]
             user_prompts.append(prompt_info)
             inputs.append(conversation)
@@ -235,6 +240,43 @@ class ONAir(BaseModelWrapper):
             pre_poses_xyzYaw.append(formatted)
 
         return pre_poses_xyzYaw
+
+    def format_event_summary(self, event_info):
+        if event_info is None:
+            return "No valid event camera observation is available for the previous movement."
+
+        if not event_info.get('valid', False):
+            return "No valid event camera observation is available for the previous movement."
+
+        activity_level = event_info.get('activity_level', 'unknown')
+        strongest_region = event_info.get('strongest_region', 'unknown')
+        event_count = event_info.get('event_count', 0)
+        positive_count = event_info.get('positive_count', 0)
+        negative_count = event_info.get('negative_count', 0)
+        sample_count = event_info.get('sample_count', 0)
+
+        if event_count < 10000:
+            density_desc = "low"
+        elif event_count < 200000:
+            density_desc = "moderate"
+        else:
+            density_desc = "strong"
+
+        return (
+            "During the previous movement, the event camera observed {} visual-change activity. "
+            "The strongest event response appeared in the {} region of the view. "
+            "The event density was {}, based on {} sampled frames. "
+            "The polarity distribution was {} positive events and {} negative events. "
+            "This information reflects motion-induced visual changes and possible object boundaries during flight, "
+            "and should be used as auxiliary evidence together with RGB captions and depth."
+        ).format(
+            activity_level,
+            strongest_region,
+            density_desc,
+            sample_count,
+            positive_count,
+            negative_count
+        )
 
     def redirect_action(self, actions, step_size, fixed):
         new_actions = [None] * len(actions)

@@ -288,6 +288,31 @@ class VectorEnvUtil:
 
         return obs, sim_states
 
+    def _get_event_info_from_trajectory(self, sim_state):
+        event_info = None
+
+        try:
+            if len(sim_state.trajectory) > 0:
+                event_info = sim_state.trajectory[-1].get('sensors', {}).get('event', None)
+        except Exception as e:
+            event_info = None
+
+        if event_info is None:
+            event_info = {
+                'valid': False,
+                'event_count': 0,
+                'positive_count': 0,
+                'negative_count': 0,
+                'activity_level': 'none',
+                'strongest_region': 'none',
+                'activity_grid': [],
+                'avg_activity': 0.0,
+                'sample_count': 0,
+                'image_shape': None,
+            }
+
+        return event_info
+
     def _format_obs_at(self, index: int, done, oracle_success):
         rgb_images, depth_images, sim_state = self.obs_states[index]
 
@@ -304,6 +329,17 @@ class VectorEnvUtil:
         observations[-1]['start_position'] = sim_state.start_pose['start_position']
         observations[-1]['start_quaternionr'] = sim_state.start_pose['start_quaternionr']
 
+        event_info = self._get_event_info_from_trajectory(sim_state)
+        observations[-1]['event_info'] = event_info
+
+        if event_info is not None:
+            logger.info('[SimpleEventObs] step={}, valid={}, count={}, strongest={}'.format(
+                sim_state.step,
+                event_info.get('valid', False),
+                event_info.get('event_count', 0),
+                event_info.get('strongest_region', 'none')
+            ))
+
         if len(sim_state.heading_changes)>0:
             avg_heading = sum(sim_state.heading_changes)/len(sim_state.heading_changes)
         else:
@@ -314,4 +350,3 @@ class VectorEnvUtil:
         collision = sim_state.is_collisioned
 
         return observations, done, collision, oracle_success
-

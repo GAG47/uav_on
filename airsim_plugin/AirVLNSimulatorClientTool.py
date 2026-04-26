@@ -15,8 +15,14 @@ import tqdm
 
 cur_path=os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, cur_path+"/..")
+sys.path.insert(0, cur_path)
 
 from utils.logger import logger
+
+try:
+    from event_simulator import EventSimulator
+except Exception:
+    from airsim_plugin.event_simulator import EventSimulator
 
 
 class BaseSensor:
@@ -25,6 +31,7 @@ class BaseSensor:
 
     def retrieve(self):
         raise NotImplementedError()
+
 
 class State(BaseSensor):
     def __init__(self, client, drone_name=''):
@@ -112,6 +119,12 @@ class AirVLNSimulatorClientTool:
         self._init_check()
         self.objects_name_cnt = [[0 for _ in list(item['open_scenes'])] for item in machines_info ]
 
+        # simple event baseline
+        self.use_event = True
+        self.event_total_frames = 150
+        self.event_interval = 15
+        self.event_camera_name = '0'
+
     def _init_check(self) -> None:
         ips = [item['MACHINE_IP'] for item in self.machines_info]
         assert len(ips) == len(set(ips)), 'MACHINE_IP repeat'
@@ -173,6 +186,183 @@ class AirVLNSimulatorClientTool:
         self.airsim_clients = [[None for _ in list(item['open_scenes'])] for item in self.machines_info]
         return
 
+    def _get_event_timestamp_us(self, airsim_client):
+        try:
+            state = airsim_client.getMultirotorState()
+            if state.timestamp > 0:
+                return float(state.timestamp) * 1e-3
+        except Exception as e:
+            pass
+        return time.time() * 1e6
+
+    def _get_event_gray_image(self, airsim_client, camera_name='0'):
+        try:
+            image_datas = airsim_client.simGetImages([
+                airsim.ImageRequest(camera_name, airsim.ImageType.Scene, pixels_as_float=False, compress=False)
+            ])
+
+            if image_datas is None or len(image_datas) == 0:
+                return None
+
+            image_data = image_datas[0]
+            if image_data.width == 0 or image_data.height == 0:
+                return None
+
+            image = np.frombuffer(image_data.image_data_uint8, dtype=np.uint8)
+            if image.size == 0:
+                return None
+
+            image = image.reshape(image_data.height, image_data.width, 3)
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            image = image.astype(np.float32)
+            image = np.clip(image, 1.0, 255.0)
+            return image
+
+        except Exception as e:
+            logger.error('[SimpleEvent] get image failed: {}'.format(e))
+            return None
+
+    def _summarize_event(self, spikes, events, image_shape):
+        h, w = image_shape[:2]
+
+        if events is None:
+            event_count = 0
+            positive_count = 0
+            negative_count = 0
+        else:
+            event_count = int(len(events))
+            if event_count > 0 and hasattr(events, 'dtype') and events.dtype.names is not None and 'polarity' in events.dtype.names:
+                positive_count = int(np.sum(events['polarity'] > 0))
+                negative_count = int(np.sum(events['polarity'] < 0))
+            else:
+                positive_count = 0
+                negative_count = 0
+
+        if spikes is None:
+            activity_map = np.zeros((h, w), dtype=np.float32)
+        else:
+            try:
+                activity_map = np.abs(spikes).reshape(h, w).astype(np.float32)
+            except Exception as e:
+                activity_map = np.zeros((h, w), dtype=np.float32)
+
+        grid_size = 3
+        cell_h = h // grid_size
+        cell_w = w // grid_size
+        activity_grid = []
+        max_value = -1.0
+        max_pos = (1, 1)
+
+        for gy in range(grid_size):
+            row = []
+            for gx in range(grid_size):
+                y1 = gy * cell_h
+                y2 = h if gy == grid_size - 1 else (gy + 1) * cell_h
+                x1 = gx * cell_w
+                x2 = w if gx == grid_size - 1 else (gx + 1) * cell_w
+                value = float(activity_map[y1:y2, x1:x2].mean())
+                row.append(round(value, 6))
+                if value > max_value:
+                    max_value = value
+                    max_pos = (gy, gx)
+            activity_grid.append(row)
+
+        region_names = [
+            ['top-left', 'top-center', 'top-right'],
+            ['middle-left', 'center', 'middle-right'],
+            ['bottom-left', 'bottom-center', 'bottom-right'],
+        ]
+        strongest_region = region_names[max_pos[0]][max_pos[1]]
+        avg_activity = float(activity_map.mean())
+
+        if event_count == 0:
+            activity_level = 'none'
+        elif avg_activity < 0.001:
+            activity_level = 'low'
+        elif avg_activity < 0.01:
+            activity_level = 'medium'
+        else:
+            activity_level = 'high'
+
+        return {
+            'valid': event_count > 0,
+            'event_count': event_count,
+            'positive_count': positive_count,
+            'negative_count': negative_count,
+            'activity_level': activity_level,
+            'strongest_region': strongest_region,
+            'activity_grid': activity_grid,
+            'avg_activity': round(avg_activity, 8),
+        }
+
+    def _collect_events_during_motion(self, airsim_client, total_frames=150, event_interval=10, camera_name='0'):
+        event_simulator = None
+        sample_count = 0
+        total_event_count = 0
+        total_positive_count = 0
+        total_negative_count = 0
+        last_summary = None
+        last_image_shape = None
+
+        loop_count = max(1, total_frames // event_interval)
+
+        for _ in range(loop_count):
+            airsim_client.simContinueForFrames(event_interval)
+
+            image = self._get_event_gray_image(airsim_client, camera_name)
+            if image is None:
+                continue
+
+            sample_count += 1
+            last_image_shape = image.shape
+            timestamp = self._get_event_timestamp_us(airsim_client)
+
+            if event_simulator is None:
+                h, w = image.shape[:2]
+                event_simulator = EventSimulator(w, h)
+                try:
+                    event_simulator.image_callback(image, timestamp)
+                except Exception as e:
+                    logger.error('[SimpleEvent] init failed: {}'.format(e))
+                    event_simulator = None
+                continue
+
+            try:
+                spikes, events = event_simulator.image_callback(image, timestamp)
+            except Exception as e:
+                logger.error('[SimpleEvent] callback failed: {}'.format(e))
+                continue
+
+            summary = self._summarize_event(spikes, events, image.shape)
+            total_event_count += summary['event_count']
+            total_positive_count += summary['positive_count']
+            total_negative_count += summary['negative_count']
+            last_summary = summary
+
+        if last_summary is None:
+            return {
+                'valid': False,
+                'event_count': 0,
+                'positive_count': 0,
+                'negative_count': 0,
+                'activity_level': 'none',
+                'strongest_region': 'none',
+                'activity_grid': [],
+                'avg_activity': 0.0,
+                'sample_count': sample_count,
+                'image_shape': list(last_image_shape) if last_image_shape is not None else None,
+            }
+
+        event_info = copy.deepcopy(last_summary)
+        event_info['event_count'] = int(total_event_count)
+        event_info['positive_count'] = int(total_positive_count)
+        event_info['negative_count'] = int(total_negative_count)
+        event_info['sample_count'] = int(sample_count)
+        event_info['image_shape'] = list(last_image_shape) if last_image_shape is not None else None
+        event_info['valid'] = event_info['event_count'] > 0
+
+        return event_info
+
     def run_call(self, airsim_timeout: int=300) -> None:
         socket_clients = []
         for index, item in enumerate(self.machines_info):
@@ -186,7 +376,6 @@ class AirVLNSimulatorClientTool:
                 raise Exception('cannot establish socket')
 
         self.socket_clients = socket_clients
-
 
         before = time.time()
         self._closeConnection()
@@ -285,8 +474,6 @@ class AirVLNSimulatorClientTool:
         except Exception as e:
             logger.error(e)
 
-
-
     def move_to_next_pose(self, poses_list: list, fly_types: list):
         def _move(airsim_client: airsim.VehicleClient, pose: airsim.Pose, fly_type: str):
             if airsim_client is None:
@@ -297,7 +484,6 @@ class AirVLNSimulatorClientTool:
             imu_sensor = Imu(airsim_client,imu_name="Imu")
             airsim_client.simPause(False)
             
-            # airsim_client.armDisarm(True)
             if fly_type == 'move':
                 drivetrain = airsim.DrivetrainType.MaxDegreeOfFreedom
                 
@@ -308,9 +494,41 @@ class AirVLNSimulatorClientTool:
             elif fly_type == 'rotate':
                 (pitch, roll, yaw) = airsim.to_eularian_angles(pose.orientation)
                 airsim_client.rotateToYawAsync(math.degrees(yaw))
-                
-            airsim_client.simContinueForFrames(150)
+            
+            if self.use_event:
+                event_info = self._collect_events_during_motion(
+                    airsim_client,
+                    total_frames=self.event_total_frames,
+                    event_interval=self.event_interval,
+                    camera_name=self.event_camera_name
+                )
+            else:
+                airsim_client.simContinueForFrames(150)
+                event_info = {
+                    'valid': False,
+                    'event_count': 0,
+                    'positive_count': 0,
+                    'negative_count': 0,
+                    'activity_level': 'disabled',
+                    'strongest_region': 'none',
+                    'activity_grid': [],
+                    'avg_activity': 0.0,
+                    'sample_count': 0,
+                    'image_shape': None,
+                }
+
             airsim_client.simPause(True)
+
+            logger.info('[SimpleEvent] valid={}, count={}, pos={}, neg={}, level={}, strongest={}, samples={}, shape={}'.format(
+                event_info['valid'],
+                event_info['event_count'],
+                event_info['positive_count'],
+                event_info['negative_count'],
+                event_info['activity_level'],
+                event_info['strongest_region'],
+                event_info['sample_count'],
+                event_info['image_shape']
+            ))
             
             state_info = copy.deepcopy(state_sensor.retrieve())
             imu_info = copy.deepcopy(imu_sensor.retrieve())
@@ -320,8 +538,8 @@ class AirVLNSimulatorClientTool:
             collision = False
             if state_info['collision']['has_collided']:
                 collision = True
-            results.append({'sensors':{'state':state_info,'imu':imu_info}})
-            return {'states': results,'collision':collision}
+            results.append({'sensors':{'state':state_info,'imu':imu_info,'event':event_info}})
+            return {'states': results,'collision':collision,'event_info':event_info}
 
 
         threads = []
@@ -369,7 +587,6 @@ class AirVLNSimulatorClientTool:
             airsim_client.simSetVehiclePose(pose=pose, ignore_collision=True)
             vehicles=airsim_client.listVehicles()
             airsim_client.simSetObjectScale(vehicles[0],airsim.Vector3r(0.5,0.5,0.5))
-            #print("当前的pose：",airsim_client.simGetVehiclePose())
             airsim_client.simContinueForFrames(50)
             airsim_client.simPause(True)
             return
@@ -379,7 +596,6 @@ class AirVLNSimulatorClientTool:
         for index_1 in range(len(self.airsim_clients)):
             threads.append([])
             for index_2 in range(len(self.airsim_clients[index_1])):
-                #print("index_1,index_2: ", str(index_1),str(index_2))
                 threads[index_1].append(
                     MyThread(_setPoses, (self.airsim_clients[index_1][index_2], poses[index_1][index_2]))
                 )
@@ -498,4 +714,4 @@ class AirVLNSimulatorClientTool:
         if not (np.array(thread_results) == True).all():
             logger.error('getSensorInfo failed.')
             return None
-        return results 
+        return results
