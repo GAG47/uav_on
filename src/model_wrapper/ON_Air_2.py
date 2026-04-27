@@ -1,7 +1,7 @@
 from model_wrapper.base_model import BaseModelWrapper
 from airsim_plugin.airsim_settings import AirsimActionSettings
 #from model_wrapper.Qwen_api_captions_2 import generate_caption, encode_image
-from model_wrapper.Qwen_api_captions import generate_caption, encode_image
+from model_wrapper.Qwen_api_captions import generate_caption, generate_event_caption, encode_image
 from openai import AsyncClient
 from io import BytesIO
 from src.common.param import args
@@ -36,9 +36,30 @@ class ONAir(BaseModelWrapper):
         user_prompts = []
         images = []
         depth_images = []
+        event_images = []
+        event_image_valid = []
 
         for i in range(len(episodes)):
             sources = episodes[i]
+
+            event_path = None
+            try:
+                event_path = sources[-1].get('event_image_path', None)
+            except Exception as e:
+                event_path = None
+
+            if event_path is not None and os.path.exists(event_path):
+                try:
+                    with open(event_path, 'rb') as f:
+                        event_images.append(f.read())
+                    event_image_valid.append(True)
+                except Exception as e:
+                    event_images.append(None)
+                    event_image_valid.append(False)
+            else:
+                event_images.append(None)
+                event_image_valid.append(False)
+
             for src in sources[::-1]:
                 if 'rgb' in src and 'depth' in src:
                     for img in src['rgb']:
@@ -62,6 +83,7 @@ class ONAir(BaseModelWrapper):
 
             if tail:                               # 处理最后不足 8 张
                 yield img_list[-tail:] 
+
         captions = []
         print("start generate caption")
         start=time.time()
@@ -74,6 +96,33 @@ class ONAir(BaseModelWrapper):
             captions.extend(raw)
 
         print("generation captions time:", time.time()-start)
+
+        event_captions = ["No event accumulation image is available."] * len(episodes)
+        valid_event_images = []
+        valid_event_indices = []
+
+        for index, img in enumerate(event_images):
+            if img is not None and event_image_valid[index]:
+                valid_event_images.append(img)
+                valid_event_indices.append(index)
+
+        if len(valid_event_images) > 0:
+            print("start generate event caption")
+            start_event = time.time()
+
+            b64_event_imgs = encode_image(valid_event_images)
+            raw_event_captions = []
+
+            for imgs in iterate_batches(b64_event_imgs):
+                raw = generate_event_caption(imgs)
+                if len(raw) != len(imgs):
+                    raise ValueError(f"Expected {len(imgs)} event captions, got {len(raw)}")
+                raw_event_captions.extend(raw)
+
+            for index, caption in zip(valid_event_indices, raw_event_captions):
+                event_captions[index] = caption
+
+            print("generation event captions time:", time.time()-start_event)
       
 
         for i in range(len(episodes)):
@@ -99,7 +148,8 @@ class ONAir(BaseModelWrapper):
             move_distance = episodes[i][-1]['move_distance']
             AvgHeadingChange = episodes[i][-1]['avg_heading_changes']
             event_info = episodes[i][-1].get('event_info', None)
-            event_summary = self.format_event_summary(event_info)
+            event_caption = event_captions[i]
+            event_summary = self.format_event_accumulation_summary(event_info, event_caption)
 
             raw_poses = self.process_poses(poses=previous_position)
 
@@ -159,7 +209,11 @@ class ONAir(BaseModelWrapper):
                     }
                 ]
 
-            conversation[1]["content"] += "\n\nEvent Camera Observation:\n{}".format(event_summary)
+            conversation[1]["content"] += "\n\nEvent Camera Visual Observation:\n{}".format(event_summary)
+
+            if step_num <= 2:
+                print("[EventCaptionCheck]")
+                print(event_summary)
 
             prompt_info = conversation[1]["content"]
             user_prompts.append(prompt_info)
@@ -272,6 +326,59 @@ class ONAir(BaseModelWrapper):
         ).format(
             activity_level,
             strongest_region,
+            density_desc,
+            sample_count,
+            positive_count,
+            negative_count
+        )
+
+    def format_event_accumulation_summary(self, event_info, event_caption):
+        if event_info is None:
+            return "No valid event accumulation image is available for the previous movement."
+
+        if not event_info.get('valid', False):
+            return "No valid event accumulation image is available for the previous movement."
+
+        event_count = event_info.get('event_count', 0)
+        positive_count = event_info.get('positive_count', 0)
+        negative_count = event_info.get('negative_count', 0)
+        sample_count = event_info.get('sample_count', 0)
+        event_image_type = event_info.get('event_image_type', 'recent_accumulation')
+        event_recent_window = event_info.get('event_recent_window', None)
+        event_image_path = event_info.get('event_image_path', None)
+
+        if event_caption is None or event_caption.strip() == "":
+            event_caption = "No reliable event accumulation image caption is available."
+
+        if event_count < 10000:
+            density_desc = "low"
+        elif event_count < 200000:
+            density_desc = "moderate"
+        else:
+            density_desc = "strong"
+
+        if event_recent_window is None:
+            window_desc = "recent event windows"
+        else:
+            window_desc = "the latest {} event windows".format(event_recent_window)
+
+        if event_image_path is None:
+            image_desc = "No event image path is available."
+        else:
+            image_desc = "The event image was generated from {}.".format(event_image_type)
+
+        return (
+            "The following description is generated from a recent-window event accumulation image of the previous UAV movement. "
+            "{} "
+            "The event image summarizes {} and reflects motion-induced brightness changes, rather than ordinary RGB appearance. "
+            "Event image caption: {} "
+            "The event density was {}, based on {} sampled frames, with {} positive events and {} negative events. "
+            "Use this information only as auxiliary motion-boundary evidence. "
+            "Do not treat the event-active region as the target object unless it is also supported by RGB captions, depth, and navigation history."
+        ).format(
+            image_desc,
+            window_desc,
+            event_caption,
             density_desc,
             sample_count,
             positive_count,

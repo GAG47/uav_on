@@ -309,7 +309,17 @@ class VectorEnvUtil:
                 'avg_activity': 0.0,
                 'sample_count': 0,
                 'image_shape': None,
+                'event_image_path': None,
+                'event_image_type': None,
+                'event_recent_window': None,
             }
+
+        if 'event_image_path' not in event_info:
+            event_info['event_image_path'] = None
+        if 'event_image_type' not in event_info:
+            event_info['event_image_type'] = None
+        if 'event_recent_window' not in event_info:
+            event_info['event_recent_window'] = None
 
         return event_info
 
@@ -331,13 +341,16 @@ class VectorEnvUtil:
 
         event_info = self._get_event_info_from_trajectory(sim_state)
         observations[-1]['event_info'] = event_info
+        observations[-1]['event_image_path'] = event_info.get('event_image_path', None)
+        observations[-1]['event_image_type'] = event_info.get('event_image_type', None)
 
         if event_info is not None:
-            logger.info('[SimpleEventObs] step={}, valid={}, count={}, strongest={}'.format(
+            logger.info('[SimpleEventObs] step={}, valid={}, count={}, strongest={}, image={}'.format(
                 sim_state.step,
                 event_info.get('valid', False),
                 event_info.get('event_count', 0),
-                event_info.get('strongest_region', 'none')
+                event_info.get('strongest_region', 'none'),
+                event_info.get('event_image_path', None)
             ))
 
         if len(sim_state.heading_changes)>0:

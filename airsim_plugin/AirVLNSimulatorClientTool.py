@@ -125,6 +125,14 @@ class AirVLNSimulatorClientTool:
         self.event_interval = 15
         self.event_camera_name = '0'
 
+        # event accumulation image
+        self.save_event_image = True
+        self.event_recent_window = 3
+        self.event_time_decay = True
+        self.event_percentile = 99.5
+        self.event_image_dir = os.path.join(os.getcwd(), 'logs/event_accumulation')
+        os.makedirs(self.event_image_dir, exist_ok=True)
+
     def _init_check(self) -> None:
         ips = [item['MACHINE_IP'] for item in self.machines_info]
         assert len(ips) == len(set(ips)), 'MACHINE_IP repeat'
@@ -142,6 +150,7 @@ class AirVLNSimulatorClientTool:
             return False
 
     def _confirmConnection(self) -> bool:
+        confirmed = False
         for index_1, _ in enumerate(self.airsim_clients):
             for index_2, _ in enumerate(self.airsim_clients[index_1]):
                 if self.airsim_clients[index_1][index_2] is not None:
@@ -295,6 +304,115 @@ class AirVLNSimulatorClientTool:
             'avg_activity': round(avg_activity, 8),
         }
 
+    def _update_event_accumulation_map(self, events, pos_map, neg_map, image_shape):
+        if events is None or len(events) == 0:
+            return pos_map, neg_map
+
+        if not hasattr(events, 'dtype') or events.dtype.names is None:
+            return pos_map, neg_map
+
+        if 'x' not in events.dtype.names or 'y' not in events.dtype.names or 'polarity' not in events.dtype.names:
+            return pos_map, neg_map
+
+        h, w = image_shape[:2]
+
+        try:
+            xs = events['x'].astype(np.int32)
+            ys = events['y'].astype(np.int32)
+            ps = events['polarity']
+
+            valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            xs = xs[valid]
+            ys = ys[valid]
+            ps = ps[valid]
+
+            pos_mask = ps > 0
+            neg_mask = ps < 0
+
+            np.add.at(pos_map, (ys[pos_mask], xs[pos_mask]), 1)
+            np.add.at(neg_map, (ys[neg_mask], xs[neg_mask]), 1)
+
+        except Exception as e:
+            logger.error('[EventAccumulation] update map failed: {}'.format(e))
+
+        return pos_map, neg_map
+
+    def _merge_recent_event_maps(self, recent_event_maps, image_shape):
+        h, w = image_shape[:2]
+        pos_map = np.zeros((h, w), dtype=np.float32)
+        neg_map = np.zeros((h, w), dtype=np.float32)
+
+        if recent_event_maps is None or len(recent_event_maps) == 0:
+            return pos_map, neg_map
+
+        recent_num = len(recent_event_maps)
+
+        for index, item in enumerate(recent_event_maps):
+            step_pos_map, step_neg_map = item
+
+            if self.event_time_decay:
+                if recent_num <= 1:
+                    weight = 1.0
+                else:
+                    weight = float(index + 1) / float(recent_num)
+            else:
+                weight = 1.0
+
+            pos_map += step_pos_map * weight
+            neg_map += step_neg_map * weight
+
+        return pos_map, neg_map
+
+    def _events_to_accumulation_image(self, pos_map, neg_map):
+        def _norm_map(x):
+            if x is None:
+                return None
+
+            if x.max() <= 0:
+                return np.zeros_like(x, dtype=np.uint8)
+
+            x = np.log1p(x)
+
+            if np.any(x > 0):
+                max_value = np.percentile(x[x > 0], self.event_percentile)
+            else:
+                max_value = 1.0
+
+            if max_value <= 0:
+                max_value = 1.0
+
+            x = np.clip(x / max_value, 0, 1)
+            return (x * 255).astype(np.uint8)
+
+        pos_img = _norm_map(pos_map)
+        neg_img = _norm_map(neg_map)
+
+        h, w = pos_img.shape
+        event_img = np.zeros((h, w, 3), dtype=np.uint8)
+
+        event_img[:, :, 0] = pos_img
+        event_img[:, :, 2] = neg_img
+        event_img[:, :, 1] = np.maximum(pos_img, neg_img) // 4
+
+        return event_img
+
+    def _save_event_accumulation_image(self, event_img):
+        try:
+            filename = '{}_{}.png'.format(
+                int(time.time() * 1000),
+                random.randint(0, 1000000)
+            )
+            save_path = os.path.join(self.event_image_dir, filename)
+
+            event_img_bgr = cv2.cvtColor(event_img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(save_path, event_img_bgr)
+
+            return save_path
+
+        except Exception as e:
+            logger.error('[EventAccumulation] save image failed: {}'.format(e))
+            return None
+
     def _collect_events_during_motion(self, airsim_client, total_frames=150, event_interval=10, camera_name='0'):
         event_simulator = None
         sample_count = 0
@@ -303,6 +421,8 @@ class AirVLNSimulatorClientTool:
         total_negative_count = 0
         last_summary = None
         last_image_shape = None
+
+        recent_event_maps = deque(maxlen=self.event_recent_window)
 
         loop_count = max(1, total_frames // event_interval)
 
@@ -339,6 +459,18 @@ class AirVLNSimulatorClientTool:
             total_negative_count += summary['negative_count']
             last_summary = summary
 
+            h, w = image.shape[:2]
+            step_pos_map = np.zeros((h, w), dtype=np.float32)
+            step_neg_map = np.zeros((h, w), dtype=np.float32)
+            step_pos_map, step_neg_map = self._update_event_accumulation_map(events, step_pos_map, step_neg_map, image.shape)
+            recent_event_maps.append((step_pos_map, step_neg_map))
+
+        event_image_path = None
+        if self.save_event_image and last_image_shape is not None and len(recent_event_maps) > 0:
+            pos_map, neg_map = self._merge_recent_event_maps(recent_event_maps, last_image_shape)
+            event_img = self._events_to_accumulation_image(pos_map, neg_map)
+            event_image_path = self._save_event_accumulation_image(event_img)
+
         if last_summary is None:
             return {
                 'valid': False,
@@ -351,6 +483,9 @@ class AirVLNSimulatorClientTool:
                 'avg_activity': 0.0,
                 'sample_count': sample_count,
                 'image_shape': list(last_image_shape) if last_image_shape is not None else None,
+                'event_image_path': event_image_path,
+                'event_image_type': 'recent_accumulation',
+                'event_recent_window': self.event_recent_window,
             }
 
         event_info = copy.deepcopy(last_summary)
@@ -360,6 +495,9 @@ class AirVLNSimulatorClientTool:
         event_info['sample_count'] = int(sample_count)
         event_info['image_shape'] = list(last_image_shape) if last_image_shape is not None else None
         event_info['valid'] = event_info['event_count'] > 0
+        event_info['event_image_path'] = event_image_path
+        event_info['event_image_type'] = 'recent_accumulation'
+        event_info['event_recent_window'] = self.event_recent_window
 
         return event_info
 
@@ -515,11 +653,14 @@ class AirVLNSimulatorClientTool:
                     'avg_activity': 0.0,
                     'sample_count': 0,
                     'image_shape': None,
+                    'event_image_path': None,
+                    'event_image_type': 'recent_accumulation',
+                    'event_recent_window': self.event_recent_window,
                 }
 
             airsim_client.simPause(True)
 
-            logger.info('[SimpleEvent] valid={}, count={}, pos={}, neg={}, level={}, strongest={}, samples={}, shape={}'.format(
+            logger.info('[SimpleEvent] valid={}, count={}, pos={}, neg={}, level={}, strongest={}, samples={}, shape={}, image={}'.format(
                 event_info['valid'],
                 event_info['event_count'],
                 event_info['positive_count'],
@@ -527,7 +668,8 @@ class AirVLNSimulatorClientTool:
                 event_info['activity_level'],
                 event_info['strongest_region'],
                 event_info['sample_count'],
-                event_info['image_shape']
+                event_info['image_shape'],
+                event_info.get('event_image_path', None)
             ))
             
             state_info = copy.deepcopy(state_sensor.retrieve())

@@ -13,15 +13,15 @@
                         **Y Range**: [min_y, max_y] = [-54, 47]
 
                         # RGB Captions
-                        Front = large tree, dark bark, dense green foliage; tree branches extending over water surface; water reflecting tree and sky  
-                        Left = two trees with thick trunks, green leaves; one tree floating above water; shoreline with grass visible in distance; water surface calm and blue  
-                        Right = row of trees, green foliage, misty atmosphere; trees growing along curved shoreline; water below reflecting sky and trees; foreground tree partially framing view  
-                        Down = tree branch with green leaves, extending into frame from top right; clear blue sky in background; white cloud layer below sky  
+                        Front = large tree, thick trunk, green foliage; tree extends over water surface; water reflects blue sky and tree branches  
+                        Left = three trees, rooted in landmass, green leaves; one tree floating above water; landmass curves into water; background shows bright sky and distant horizon  
+                        Right = cluster of trees, dense green foliage; trees growing on elevated landform; landform slopes downward into water; misty atmosphere surrounds trees  
+                        Down = tree branch, green leaves, extending from top right corner; clear blue sky in background; white ground below; no visible objects beneath branch  
 
                         # Depth Information  
                         FrontDepth: [[3, 2, 2], [1, 1, 1], [1, 1, 1]]  
-                        LeftDepth: [[9, 5, 5], [13, 5, 6], [100, 100, 8]]  
-                        RightDepth: [[2, 3, 4], [2, 3, 7], [2, 3, 16]]  
+                        LeftDepth: [[9, 5, 5], [13, 5, 5], [100, 100, 8]]  
+                        RightDepth: [[2, 3, 4], [2, 3, 12], [2, 3, 16]]  
                         DownDepth: [[100, 2, 2], [100, 100, 2], [100, 100, 100]]
 
                         # Previous UAV Poses (last 10 steps)
@@ -54,8 +54,8 @@
                         - **If StepsSoFar:0 is more than 100 steps**, and the target seems to match any current caption reasonably well, you may relax your stopping condition and consider stopping based on a **single strong match**.
                         
 
-Event Camera Observation:
-No valid event camera observation is available for the previous movement.
+Event Camera Visual Observation:
+No valid event accumulation image is available for the previous movement.
 
 
 [STEP 1 PROMPT]
@@ -72,14 +72,14 @@ No valid event camera observation is available for the previous movement.
                         **Y Range**: [min_y, max_y] = [-54, 47]
 
                         # RGB Captions
-                        Front = large tree, dark bark, green foliage; tree rooted on a curved landmass; blue water below; distant structure visible through mist  
-                        Left = tree with dark roots, green leaves; tree positioned at edge of curved landmass; blue water extending into horizon; sky bright and hazy  
-                        Right = multiple trees, dark trunks, dense green canopies; trees growing on curved terrain; blue water beneath; misty background with soft light  
-                        Down = blue sky, gradient from dark to light; white surface below; partial dark object in upper right corner  
+                        Front = large tree, dark bark, green foliage; tree stands on edge of curved landmass; blue water below; distant trees in background  
+                        Left = tree branches, green leaves; tree roots extending over water; curved shoreline; light sky above  
+                        Right = multiple trees, thick trunks, green canopies; trees positioned along curved landform; blue water beneath; foggy atmosphere  
+                        Down = blue sky, white clouds; partial view of dark object in upper right corner; no visible land or trees  
 
                         # Depth Information  
-                        FrontDepth: [[1, 2, 5], [4, 4, 4], [5, 5, 5]]  
-                        LeftDepth: [[9, 3, 2], [7, 4, 3], [100, 100, 7]]  
+                        FrontDepth: [[2, 2, 5], [4, 4, 4], [5, 5, 5]]  
+                        LeftDepth: [[9, 3, 2], [9, 4, 3], [100, 100, 7]]  
                         RightDepth: [[4, 5, 7], [3, 5, 11], [5, 5, 100]]  
                         DownDepth: [[100, 100, 13], [100, 100, 100], [100, 100, 100]]
 
@@ -113,6 +113,6 @@ No valid event camera observation is available for the previous movement.
                         - **If StepsSoFar:1 is more than 100 steps**, and the target seems to match any current caption reasonably well, you may relax your stopping condition and consider stopping based on a **single strong match**.
                         
 
-Event Camera Observation:
-During the previous movement, the event camera observed high visual-change activity. The strongest event response appeared in the top-left region of the view. The event density was strong, based on 10 sampled frames. The polarity distribution was 704771 positive events and 599832 negative events. This information reflects motion-induced visual changes and possible object boundaries during flight, and should be used as auxiliary evidence together with RGB captions and depth.
+Event Camera Visual Observation:
+The following description is generated from a recent-window event accumulation image of the previous UAV movement. The event image was generated from recent_accumulation. The event image summarizes the latest 3 event windows and reflects motion-induced brightness changes, rather than ordinary RGB appearance. Event image caption: strong event activity is concentrated in the upper-left and lower-right regions, forming tree-like edge structures with dense red and blue patterns; the center remains dark, indicating minimal motion or brightness change; these active regions likely correspond to nearby vegetation boundaries during UAV movement The event density was strong, based on 10 sampled frames, with 577735 positive events and 492879 negative events. Use this information only as auxiliary motion-boundary evidence. Do not treat the event-active region as the target object unless it is also supported by RGB captions, depth, and navigation history.
 
