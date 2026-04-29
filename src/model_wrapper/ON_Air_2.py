@@ -635,6 +635,8 @@ class ONAir(BaseModelWrapper):
         print(
             "[Memory Target] "
             f"Episode {index}: "
+            f"type={memory_target.get('target_type', 'unknown')}, "
+            f"cluster={memory_target.get('cluster_size', 0)}, "
             f"pos={memory_target['position']}, "
             f"score={memory_target['score']:.3f}, "
             f"sem={memory_target['semantic_value']:.2f}, "
