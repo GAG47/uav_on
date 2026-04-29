@@ -36,6 +36,7 @@ class ONAir(BaseModelWrapper):
         self.semantic_results = [{} for _ in range(batch_size)]
         self.semantic_memories = [None for _ in range(batch_size)]
         self.memory_update_infos = [{} for _ in range(batch_size)]
+        self.memory_targets = [{} for _ in range(batch_size)]
 
         self.unfixed_system_prompt = unfixed_system_prompt
         self.fixed_system_prompt = fixed_system_prompt
@@ -219,10 +220,15 @@ class ONAir(BaseModelWrapper):
         semantic_result = self.parse_semantic_result(text)
 
         memory_summary = self.update_semantic_memory(index, semantic_result)
-        action, value, done = self.semantic_to_legacy_action(semantic_result, fixed=False)
+        action, value, done, memory_target = self.memory_to_legacy_action(
+            index=index,
+            semantic_result=semantic_result,
+            fixed=False
+        )
 
         self.print_semantic_result(semantic_result, action, value)
         self.print_memory_summary(index, memory_summary)
+        self.print_memory_target(index, memory_target)
 
         return action, value, done, semantic_result 
     
@@ -237,10 +243,15 @@ class ONAir(BaseModelWrapper):
         semantic_result = self.parse_semantic_result(text)
 
         memory_summary = self.update_semantic_memory(index, semantic_result)
-        action, value, done = self.semantic_to_legacy_action(semantic_result, fixed=True)
+        action, value, done, memory_target = self.memory_to_legacy_action(
+            index=index,
+            semantic_result=semantic_result,
+            fixed=True
+        )
 
         self.print_semantic_result(semantic_result, action, value)
         self.print_memory_summary(index, memory_summary)
+        self.print_memory_target(index, memory_target)
 
         return action, value, done, semantic_result              
 
@@ -430,6 +441,97 @@ class ONAir(BaseModelWrapper):
         return semantic_result
 
 
+    def memory_to_legacy_action(self, index, semantic_result, fixed):
+        target_visible = semantic_result["target_visible"]
+        target_confidence = semantic_result["target_confidence"]
+
+        if target_visible and target_confidence >= 0.75:
+            return "stop", 0, True, self.default_memory_target()
+
+        try:
+            memory = self.semantic_memories[index]
+            current_pose = self.current_poses[index]
+
+            memory_target = memory.get_best_memory_target(
+                current_pose=current_pose,
+                min_confidence=0.05,
+                min_distance=3.0,
+                max_distance=45.0
+            )
+            self.memory_targets[index] = memory_target
+
+            if memory_target.get("valid", False):
+                action, value, done = self.memory_target_to_legacy_action(
+                    memory_target=memory_target,
+                    semantic_result=semantic_result,
+                    fixed=fixed
+                )
+                return action, value, done, memory_target
+
+        except Exception as e:
+            print(f"[WARNING] failed to use semantic memory for episode {index}: {e}")
+
+        action, value, done = self.semantic_to_legacy_action(semantic_result, fixed)
+        return action, value, done, self.default_memory_target()
+
+
+    def memory_target_to_legacy_action(self, memory_target, semantic_result, fixed):
+        relative_region = memory_target.get("relative_region", "front")
+        relative_angle = memory_target.get("relative_angle", 0.0)
+        safety_value = memory_target.get("safety_value", 0.5)
+        target_score = memory_target.get("score", 0.0)
+
+        if safety_value < 0.20:
+            if fixed:
+                return "rotl", 0, False
+            else:
+                return "rotl", 30, False
+
+        if relative_region == "front":
+            action = "forward"
+        elif relative_region == "left":
+            action = "left"
+        elif relative_region == "right":
+            action = "right"
+        elif relative_region == "back_left":
+            action = "rotl"
+        elif relative_region == "back_right":
+            action = "rotr"
+        else:
+            action = "forward"
+
+        if fixed:
+            value = 0
+        else:
+            if action in ["rotl", "rotr"]:
+                value = min(60, max(15, abs(relative_angle)))
+            else:
+                value = self.estimate_unfixed_step_size(
+                    region_score=target_score,
+                    safety_score=safety_value,
+                    target_visible=semantic_result["target_visible"],
+                    target_confidence=semantic_result["target_confidence"]
+                )
+
+        done = (action == "stop")
+        return action, value, done
+
+
+    def default_memory_target(self):
+        return {
+            "valid": False,
+            "position": None,
+            "score": 0.0,
+            "semantic_value": 0.0,
+            "confidence": 0.0,
+            "safety_value": 0.0,
+            "novelty_value": 0.0,
+            "distance": 0.0,
+            "relative_angle": 0.0,
+            "relative_region": "front"
+        }
+
+
     def semantic_to_legacy_action(self, semantic_result, fixed):
         region_scores = semantic_result["region_scores"]
         safety_scores = semantic_result["safety_scores"]
@@ -519,6 +621,29 @@ class ONAir(BaseModelWrapper):
             f"max_value={memory_summary['max_value']:.2f}, "
             f"max_conf={memory_summary['max_confidence']:.2f}, "
             f"max_pos={memory_summary['max_position']}"
+        )
+
+
+    def print_memory_target(self, index, memory_target):
+        if memory_target is None:
+            return
+
+        if not memory_target.get("valid", False):
+            print(f"[Memory Target] Episode {index}: no valid target, fallback to current semantic result")
+            return
+
+        print(
+            "[Memory Target] "
+            f"Episode {index}: "
+            f"pos={memory_target['position']}, "
+            f"score={memory_target['score']:.3f}, "
+            f"sem={memory_target['semantic_value']:.2f}, "
+            f"conf={memory_target['confidence']:.2f}, "
+            f"safety={memory_target['safety_value']:.2f}, "
+            f"novelty={memory_target['novelty_value']:.2f}, "
+            f"dist={memory_target['distance']}, "
+            f"rel_angle={memory_target['relative_angle']}, "
+            f"rel_region={memory_target['relative_region']}"
         )
 
 

@@ -261,6 +261,140 @@ class SemanticMemory:
             return None
 
 
+    def get_best_memory_target(
+        self,
+        current_pose,
+        min_confidence=0.05,
+        min_distance=3.0,
+        max_distance=None,
+    ):
+        if max_distance is None:
+            max_distance = self.map_size / 2.0
+
+        observed_mask = self.confidence >= min_confidence
+
+        if not np.any(observed_mask):
+            return self.default_memory_target()
+
+        x, y, z, yaw = current_pose
+
+        score_map = self.compute_planning_score_map()
+        score_map = np.where(observed_mask, score_map, -1.0)
+
+        current_grid = self.world_to_grid(x, y)
+        if current_grid is not None:
+            self.suppress_nearby_cells(
+                score_map=score_map,
+                current_pose=current_pose,
+                min_distance=min_distance,
+                max_distance=max_distance
+            )
+
+        if np.max(score_map) <= 0.0:
+            return self.default_memory_target()
+
+        max_index = np.unravel_index(np.argmax(score_map), score_map.shape)
+        gx, gy = int(max_index[0]), int(max_index[1])
+        wx, wy = self.grid_to_world(gx, gy)
+
+        dx = wx - x
+        dy = wy - y
+        distance = math.hypot(dx, dy)
+
+        target_yaw = math.degrees(math.atan2(dy, dx))
+        relative_angle = self.normalize_angle(target_yaw - yaw)
+        relative_region = self.get_relative_region(relative_angle)
+
+        target = {
+            "valid": True,
+            "grid": (gx, gy),
+            "position": (round(wx, 2), round(wy, 2)),
+            "score": float(score_map[gx, gy]),
+            "semantic_value": float(self.semantic_value[gx, gy]),
+            "confidence": float(self.confidence[gx, gy]),
+            "safety_value": float(self.safety_value[gx, gy]),
+            "novelty_value": float(self.novelty_value[gx, gy]),
+            "visited": bool(self.visited[gx, gy]),
+            "observe_count": int(self.observe_count[gx, gy]),
+            "distance": round(distance, 2),
+            "target_yaw": round(target_yaw, 2),
+            "relative_angle": round(relative_angle, 2),
+            "relative_region": relative_region
+        }
+
+        return target
+
+
+    def compute_planning_score_map(self):
+        semantic_score = np.clip(self.semantic_value, 0.0, 1.0)
+        confidence_score = np.clip(self.confidence, 0.0, 1.0)
+        safety_score = np.clip(self.safety_value, 0.0, 1.0)
+        novelty_score = np.clip(self.novelty_value, 0.0, 1.0)
+
+        # 语义是主项；安全、新颖性、置信度作为调制项，避免单帧低置信噪声主导规划。
+        score_map = semantic_score
+        score_map = score_map * (0.4 + 0.6 * confidence_score)
+        score_map = score_map * (0.5 + 0.5 * safety_score)
+        score_map = score_map * (0.5 + 0.5 * novelty_score)
+
+        visited_penalty = np.where(self.visited, 0.55, 1.0)
+        score_map = score_map * visited_penalty
+
+        return score_map
+
+
+    def suppress_nearby_cells(self, score_map, current_pose, min_distance, max_distance):
+        x, y, z, yaw = current_pose
+
+        for gx in range(self.grid_size):
+            for gy in range(self.grid_size):
+                if score_map[gx, gy] < 0.0:
+                    continue
+
+                wx, wy = self.grid_to_world(gx, gy)
+                dist = math.hypot(wx - x, wy - y)
+
+                if dist < min_distance or dist > max_distance:
+                    score_map[gx, gy] = -1.0
+
+
+    def get_relative_region(self, relative_angle):
+        if abs(relative_angle) <= 35.0:
+            return "front"
+
+        if relative_angle > 35.0 and relative_angle <= 135.0:
+            return "right"
+
+        if relative_angle < -35.0 and relative_angle >= -135.0:
+            return "left"
+
+        if relative_angle > 135.0:
+            return "back_right"
+
+        return "back_left"
+
+
+    def default_memory_target(self):
+        target = {
+            "valid": False,
+            "grid": None,
+            "position": None,
+            "score": 0.0,
+            "semantic_value": 0.0,
+            "confidence": 0.0,
+            "safety_value": 0.0,
+            "novelty_value": 0.0,
+            "visited": False,
+            "observe_count": 0,
+            "distance": 0.0,
+            "target_yaw": 0.0,
+            "relative_angle": 0.0,
+            "relative_region": "front"
+        }
+
+        return target
+
+
     def world_to_grid(self, x, y):
         gx = int(round((x - self.origin[0]) / self.resolution + self.center_idx))
         gy = int(round((y - self.origin[1]) / self.resolution + self.center_idx))
