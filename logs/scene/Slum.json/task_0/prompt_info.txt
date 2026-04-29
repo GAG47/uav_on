@@ -13,15 +13,15 @@
                         **Y Range**: [min_y, max_y] = [-54, 47]
 
                         # RGB Captions
-                        Front = large tree, dark bark, dense green foliage; tree branches extending over water; water surface reflecting blue sky and trees
-                        Left = two trees, thick trunks, green leaves; one tree growing on land, another floating above water; water surface calm, blue; distant shoreline visible
-                        Right = forest scene, multiple trees with green leaves; trees growing along curved edge of water; water surface reflective, blue; misty atmosphere in background
-                        Down = tree branch, green leaves, hanging from top right corner; clear blue sky in upper portion; white cloud-like area below; no visible ground
+                        Front = large tree, dark bark, dense green foliage; tree extends over blue water surface; branches hanging downward
+                        Left = two trees, thick trunks, green leaves; one tree floating above water; trees rooted on grassy edge of water; sky visible in background
+                        Right = cluster of trees, green canopies, spreading branches; trees growing along curved shoreline; water below reflecting sky; mist near horizon
+                        Down = green tree branch, leafy, extending from top-right corner; clear blue sky in background; white cloud layer below
 
                         # Depth Information
                         FrontDepth: [[3, 2, 2], [1, 1, 1], [1, 1, 1]]
-                        LeftDepth: [[9, 5, 5], [13, 5, 5], [100, 100, 8]]
-                        RightDepth: [[2, 3, 4], [2, 3, 12], [2, 3, 16]]
+                        LeftDepth: [[9, 5, 5], [13, 5, 6], [100, 100, 8]]
+                        RightDepth: [[2, 3, 4], [2, 3, 7], [2, 3, 16]]
                         DownDepth: [[100, 2, 2], [100, 100, 2], [100, 100, 100]]
 
                         # Previous UAV Poses (last 10 steps)
@@ -54,6 +54,67 @@
                         - Set target_visible to true only when the target object itself is likely visible in the current observations.
                         - A contextual cue is useful for region scoring, but it is not enough to confirm target visibility.
                         - If StepsSoFar:0 is more than 100, strong contextual cues can increase region scores, but target_visible still requires likely direct target evidence.
+
+                        # Output Requirement
+                        Return exactly one valid JSON object following the schema defined in the system prompt.
+                        
+
+
+[STEP 1 PROMPT]
+
+                        # Target Information 
+                        Target = [Name: WoodenBox,
+                        Size: mid(2.5*2.5=6.25 squares),
+                        Description: Geometric cubic stack, weathered light brown wood with blue metal corner reinforcements, four stacked crates with rope handles, used for storage or transport of goods.]
+
+                        # Search Area
+                        All positions are represented as 3D coordinates in the format: **(x, y, z)**
+                        You must strictly stay within the following 2D navigation boundary (horizontal plane):
+                        **X Range**: [min_x, max_x] = [-123, -22]
+                        **Y Range**: [min_y, max_y] = [-54, 47]
+
+                        # RGB Captions
+                        Front = large tree, dark brown trunk, dense green foliage; branches extending overhead; forest floor visible below with dappled sunlight
+                        Left = two trees, thick trunks, extensive root systems; roots extending into air; background sky gradient from white to blue
+                        Right = forest canopy, lush green leaves, multiple tree trunks; view looking upward through foliage; distant trees partially obscured by mist
+                        Down = cluster of green leaves, detailed texture; plant in foreground; background gradient from blue to white
+
+                        # Depth Information
+                        FrontDepth: [[1, 0, 1], [2, 0, 1], [2, 1, 1]]
+                        LeftDepth: [[4, 4, 4], [4, 4, 4], [100, 6, 6]]
+                        RightDepth: [[1, 2, 3], [0, 0, 1], [0, 0, 0]]
+                        DownDepth: [[100, 0, 0], [100, 0, 0], [100, 0, 0]]
+
+                        # Previous UAV Poses (last 10 steps)
+                        {
+    [(-72.64, -3.62, -10.0), -7.92],
+    [(-70.64, -5.62, -10.0), -7.92],
+    [(-70.64, -5.62, -10.0), -7.92],
+    [(-70.64, -5.62, -10.0), -7.92],
+    [(-70.64, -5.62, -10.0), -7.92],
+    [(-70.64, -5.62, -10.0), -7.92],
+    [(-70.64, -5.62, -10.0), -7.92],
+    [(-70.64, -5.62, -10.0), -7.92],
+    [(-70.64, -5.62, -10.0), -7.92],
+    [(-70.64, -5.62, -10.0), -7.92],
+}
+
+                        # Trajectory Summary
+                        StepsSoFar = 1
+                        DistanceTraveled = 2.830776022359907
+                        AvgHeadingChange = 0.0
+
+                        # Evaluation Instructions
+                        - The target is ** WoodenBox**, described as:  Geometric cubic stack, weathered light brown wood with blue metal corner reinforcements, four stacked crates with rope handles, used for storage or transport of goods.
+                        - Compare the target description with all RGB captions: Front, Left, Right, and Down.
+                        - Evaluate the target-finding potential of the Front, Left, and Right regions.
+                        - Use Down caption and DownDepth only for altitude, ground context, and local environment understanding.
+                        - Consider target name, target size, description, semantic context, depth safety, boundary constraint, and recent pose history.
+                        - Assign lower novelty to repeatedly explored or stagnant regions.
+                        - Assign higher novelty to less explored regions that also provide useful semantic or spatial information.
+                        - Set target_visible to true only when the target object itself is likely visible in the current observations.
+                        - A contextual cue is useful for region scoring, but it is not enough to confirm target visibility.
+                        - If StepsSoFar:1 is more than 100, strong contextual cues can increase region scores, but target_visible still requires likely direct target evidence.
 
                         # Output Requirement
                         Return exactly one valid JSON object following the schema defined in the system prompt.
