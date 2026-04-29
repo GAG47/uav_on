@@ -58,6 +58,11 @@ class AirVLNENV:
         self.one_scene_could_use_num = 5e3
         self.this_scene_used_cnt = 0
 
+        # 连续执行时的最大单步移动距离。
+        # planned_path 可以很长，但每次只执行一小段，然后重新感知和重新规划。
+        self.max_continuous_step = 5.0
+        self.min_continuous_advance = 0.5
+
         self.init_VectorEnvUtil()
 
 
@@ -340,6 +345,7 @@ class AirVLNENV:
         poses = []
         fly_types = []
         executed_actions = []
+        execute_infos = []
 
         for index, action in enumerate(action_list):
             if self.sim_states[index].is_end == True:
@@ -370,12 +376,13 @@ class AirVLNENV:
             )
 
             if use_continuous and action != 'stop' and self.sim_states[index].is_end == False:
-                new_pose, fly_type = self.get_continuous_next_pose(
+                new_pose, fly_type, execute_info = self.get_continuous_next_pose(
                     airsim_pose=airsim_pose,
                     planned_path=planned_path,
                     index=index
                 )
                 executed_actions.append('continuous')
+                execute_infos.append(execute_info)
             else:
                 new_pose, fly_type = getNextPosition(
                     airsim_pose,
@@ -384,6 +391,15 @@ class AirVLNENV:
                     is_fixed
                 )
                 executed_actions.append(action)
+                execute_infos.append({
+                    "execute_type": "legacy",
+                    "next_waypoint": None,
+                    "step_distance": 0.0,
+                    "max_continuous_step": self.max_continuous_step,
+                    "is_step_limited": False,
+                    "planned_path_len": 0,
+                    "planned_path_length": 0.0
+                })
 
             prev_pitch, prev_roll, prev_yaw = airsim.to_eularian_angles(airsim_pose.orientation)
             curr_pitch, curr_roll, curr_yaw = airsim.to_eularian_angles(new_pose.orientation)
@@ -466,7 +482,7 @@ class AirVLNENV:
             target = np.array(self.sim_states[index].target_position)
             distance_to_target = float(np.linalg.norm(p_curr - target))
 
-            self.sim_states[index].trajectory.append({
+            trajectory_info = {
                 'sensors': {
                     'state': {
                         'position': [
@@ -485,7 +501,10 @@ class AirVLNENV:
                 'move_distance': round(self.sim_states[index].move_distance, 2),
                 'distance_to_target': round(distance_to_target, 2),
                 'execute_type': executed_actions[index],
-            })
+            }
+
+            trajectory_info.update(execute_infos[index])
+            self.sim_states[index].trajectory.append(trajectory_info)
 
 
     def get_planned_path_for_episode(self, planned_paths, index):
@@ -527,18 +546,20 @@ class AirVLNENV:
             airsim_pose.position.x_val,
             airsim_pose.position.y_val,
             airsim_pose.position.z_val
-        ])
+        ], dtype=float)
 
-        waypoint = self.select_next_waypoint(
+        waypoint, step_distance, is_step_limited = self.select_next_waypoint(
             current_position=current_position,
-            path=path
+            path=path,
+            max_step_distance=self.max_continuous_step,
+            min_advance_distance=self.min_continuous_advance
         )
 
         target_position = np.array([
             waypoint[0],
             waypoint[1],
             waypoint[2]
-        ])
+        ], dtype=float)
 
         current_orientation = airsim_pose.orientation
 
@@ -562,32 +583,129 @@ class AirVLNENV:
             f"next_waypoint=({round(float(target_position[0]), 2)}, "
             f"{round(float(target_position[1]), 2)}, "
             f"{round(float(target_position[2]), 2)}), "
+            f"step_distance={round(float(step_distance), 2)}, "
+            f"max_step={self.max_continuous_step}, "
+            f"limited={is_step_limited}, "
             f"path_len={planned_path.get('path_len', len(path))}, "
             f"path_length={planned_path.get('path_length', 0.0)}"
         )
 
-        return new_pose, "move"
+        execute_info = {
+            "execute_type": "continuous",
+            "next_waypoint": [
+                round(float(target_position[0]), 2),
+                round(float(target_position[1]), 2),
+                round(float(target_position[2]), 2)
+            ],
+            "step_distance": round(float(step_distance), 2),
+            "max_continuous_step": self.max_continuous_step,
+            "is_step_limited": bool(is_step_limited),
+            "planned_path_len": int(planned_path.get('path_len', len(path))),
+            "planned_path_length": float(planned_path.get('path_length', 0.0))
+        }
+
+        return new_pose, "move", execute_info
 
 
-    def select_next_waypoint(self, current_position, path, min_advance_distance=0.5):
+    def select_next_waypoint(
+        self,
+        current_position,
+        path,
+        max_step_distance=5.0,
+        min_advance_distance=0.5
+    ):
         if len(path) == 0:
-            return (
+            waypoint = (
                 float(current_position[0]),
                 float(current_position[1]),
                 float(current_position[2])
             )
+            return waypoint, 0.0, False
 
         if len(path) == 1:
-            return path[0]
+            waypoint_np = np.array(path[0], dtype=float)
+            dist = np.linalg.norm(waypoint_np[:3] - current_position[:3])
+
+            if dist <= max_step_distance:
+                return path[0], float(dist), False
+
+            direction = (waypoint_np[:3] - current_position[:3]) / max(dist, 1e-6)
+            bounded_waypoint = current_position[:3] + direction * max_step_distance
+
+            return (
+                float(bounded_waypoint[0]),
+                float(bounded_waypoint[1]),
+                float(bounded_waypoint[2])
+            ), float(max_step_distance), True
+
+        current = current_position[:3].astype(float)
+        remain_distance = float(max_step_distance)
+        total_advance = 0.0
 
         for waypoint in path[1:]:
             waypoint_np = np.array(waypoint, dtype=float)
-            dist = np.linalg.norm(waypoint_np[:3] - current_position[:3])
+            segment = waypoint_np[:3] - current[:3]
+            segment_length = float(np.linalg.norm(segment))
 
-            if dist >= min_advance_distance:
-                return waypoint
+            if segment_length < 1e-6:
+                continue
 
-        return path[-1]
+            if segment_length <= remain_distance:
+                current = waypoint_np[:3]
+                remain_distance -= segment_length
+                total_advance += segment_length
+
+                if remain_distance <= 1e-6:
+                    return (
+                        float(current[0]),
+                        float(current[1]),
+                        float(current[2])
+                    ), float(total_advance), True
+
+                continue
+
+            direction = segment / max(segment_length, 1e-6)
+            bounded_waypoint = current[:3] + direction * remain_distance
+            total_advance += remain_distance
+
+            return (
+                float(bounded_waypoint[0]),
+                float(bounded_waypoint[1]),
+                float(bounded_waypoint[2])
+            ), float(total_advance), True
+
+        final_waypoint = np.array(path[-1], dtype=float)
+        final_dist = float(np.linalg.norm(final_waypoint[:3] - current_position[:3]))
+
+        if final_dist < min_advance_distance and len(path) >= 2:
+            fallback_waypoint = np.array(path[1], dtype=float)
+            fallback_dist = float(np.linalg.norm(fallback_waypoint[:3] - current_position[:3]))
+
+            if fallback_dist > max_step_distance:
+                direction = (fallback_waypoint[:3] - current_position[:3]) / max(fallback_dist, 1e-6)
+                bounded_waypoint = current_position[:3] + direction * max_step_distance
+
+                return (
+                    float(bounded_waypoint[0]),
+                    float(bounded_waypoint[1]),
+                    float(bounded_waypoint[2])
+                ), float(max_step_distance), True
+
+            return path[1], float(fallback_dist), False
+
+        is_step_limited = final_dist > max_step_distance
+
+        if is_step_limited:
+            direction = (final_waypoint[:3] - current_position[:3]) / max(final_dist, 1e-6)
+            bounded_waypoint = current_position[:3] + direction * max_step_distance
+
+            return (
+                float(bounded_waypoint[0]),
+                float(bounded_waypoint[1]),
+                float(bounded_waypoint[2])
+            ), float(max_step_distance), True
+
+        return path[-1], float(final_dist), False
 
 
     def update_measurements(self):

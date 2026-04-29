@@ -115,6 +115,8 @@ class SGCPPlanner:
         safety_score = self.normalize_score(frontier.get("safety_value", 0.5))
         novelty_score = self.normalize_score(frontier.get("novelty_value", 0.5))
         viewpoint_score = self.normalize_score(frontier.get("viewpoint_score", planning_score))
+        unknown_gain = self.normalize_score(frontier.get("unknown_gain", 0.0))
+        history_penalty = self.normalize_score(frontier.get("history_penalty", 0.0))
 
         distance_cost = self.compute_frontier_travel_cost(
             frontier=frontier,
@@ -123,13 +125,16 @@ class SGCPPlanner:
         geometry_score = 1.0 - distance_cost
 
         sgcp_score = (
-            0.30 * planning_score
-            + 0.20 * semantic_score
-            + 0.15 * safety_score
-            + 0.10 * novelty_score
+            0.26 * planning_score
+            + 0.18 * semantic_score
+            + 0.14 * safety_score
+            + 0.08 * novelty_score
             + 0.10 * viewpoint_score
-            + 0.15 * geometry_score
+            + 0.14 * geometry_score
+            + 0.10 * unknown_gain
         )
+
+        sgcp_score = sgcp_score - 0.08 * history_penalty
 
         return float(max(0.0, min(1.0, sgcp_score)))
 
@@ -156,7 +161,14 @@ class SGCPPlanner:
         if semantic_value is None:
             semantic_value = frontier.get("score", 0.0)
 
-        return self.normalize_score(semantic_value)
+        unknown_gain = frontier.get("unknown_gain", 0.0)
+
+        semantic_priority = (
+            0.85 * self.normalize_score(semantic_value)
+            + 0.15 * self.normalize_score(unknown_gain)
+        )
+
+        return semantic_priority
 
 
     def normalize_score(self, score):

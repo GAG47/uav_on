@@ -43,6 +43,11 @@ class SemanticMemory:
         self.last_region_update = {}
         self.last_frontiers = []
 
+        self.last_selected_frontier = None
+        self.frontier_selection_count = {}
+        self.frontier_switch_margin = 0.08
+        self.frontier_match_distance = 6.0
+
         self.frontier_builder = SemanticFrontierBuilder(self)
         self.viewpoint_planner = ViewpointPlanner(self)
         self.sgcp_planner = SGCPPlanner(self)
@@ -62,6 +67,9 @@ class SemanticMemory:
 
         self.last_region_update = {}
         self.last_frontiers = []
+
+        self.last_selected_frontier = None
+        self.frontier_selection_count = {}
 
 
     def same_origin(self, origin, threshold=1e-3):
@@ -311,7 +319,12 @@ class SemanticMemory:
             )
 
             if target is not None:
+                target = self.apply_frontier_hysteresis(
+                    selected_target=target,
+                    frontiers=frontiers
+                )
                 target = self.add_relative_info_to_target(target, current_pose)
+                self.update_frontier_selection_history(target)
                 return target
 
         return self.get_best_memory_cell_target(
@@ -320,6 +333,123 @@ class SemanticMemory:
             min_distance=min_distance,
             max_distance=max_distance
         )
+
+
+    def apply_frontier_hysteresis(self, selected_target, frontiers):
+        if selected_target is None or not selected_target.get("valid", False):
+            return selected_target
+
+        if self.last_selected_frontier is None:
+            selected_target["hysteresis_kept"] = False
+            selected_target["hysteresis_reason"] = "no previous frontier"
+            return selected_target
+
+        matched_frontier = self.find_matching_frontier(
+            frontiers=frontiers,
+            last_frontier=self.last_selected_frontier
+        )
+
+        if matched_frontier is None:
+            selected_target["hysteresis_kept"] = False
+            selected_target["hysteresis_reason"] = "previous frontier disappeared"
+            return selected_target
+
+        selected_score = float(selected_target.get("score", 0.0))
+        matched_score = float(matched_frontier.get("score", 0.0))
+
+        if selected_score <= matched_score + self.frontier_switch_margin:
+            target = dict(matched_frontier)
+            target["target_type"] = selected_target.get("target_type", "sgcp_frontier")
+            target["sgcp_score"] = selected_target.get("sgcp_score", selected_score)
+            target["sgcp_candidate_count"] = selected_target.get("sgcp_candidate_count", 0)
+            target["sgcp_total_frontier_count"] = selected_target.get("sgcp_total_frontier_count", len(frontiers))
+            target["sgcp_constraint_count"] = selected_target.get("sgcp_constraint_count", 0)
+            target["semantic_gap_rho"] = selected_target.get("semantic_gap_rho", 0.0)
+            target["hysteresis_kept"] = True
+            target["hysteresis_reason"] = "keep previous frontier"
+            return target
+
+        selected_target["hysteresis_kept"] = False
+        selected_target["hysteresis_reason"] = "new frontier is significantly better"
+        return selected_target
+
+
+    def find_matching_frontier(self, frontiers, last_frontier):
+        if last_frontier is None:
+            return None
+
+        last_pos = last_frontier.get("frontier_position", None)
+        if last_pos is None:
+            last_pos = last_frontier.get("position", None)
+
+        if last_pos is None:
+            return None
+
+        best_frontier = None
+        best_dist = None
+
+        for frontier in frontiers:
+            pos = frontier.get("frontier_position", None)
+            if pos is None:
+                pos = frontier.get("position", None)
+
+            if pos is None:
+                continue
+
+            dist = math.hypot(pos[0] - last_pos[0], pos[1] - last_pos[1])
+
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_frontier = frontier
+
+        if best_frontier is None:
+            return None
+
+        if best_dist is not None and best_dist <= self.frontier_match_distance:
+            return best_frontier
+
+        return None
+
+
+    def update_frontier_selection_history(self, target):
+        if target is None or not target.get("valid", False):
+            return
+
+        self.last_selected_frontier = dict(target)
+
+        key = self.get_frontier_key(
+            target.get("frontier_position", target.get("position", None))
+        )
+
+        if key is None:
+            return
+
+        if key not in self.frontier_selection_count:
+            self.frontier_selection_count[key] = 0
+
+        self.frontier_selection_count[key] += 1
+
+
+    def get_frontier_selection_count(self, position):
+        key = self.get_frontier_key(position)
+
+        if key is None:
+            return 0
+
+        return int(self.frontier_selection_count.get(key, 0))
+
+
+    def get_frontier_key(self, position):
+        if position is None:
+            return None
+
+        x, y = position
+        cell_size = max(self.resolution * 2.0, 1e-6)
+
+        key_x = int(round(float(x) / cell_size))
+        key_y = int(round(float(y) / cell_size))
+
+        return f"{key_x}_{key_y}"
 
 
     def get_best_memory_cell_target(
@@ -367,6 +497,10 @@ class SemanticMemory:
             "confidence": float(self.confidence[gx, gy]),
             "safety_value": float(self.safety_value[gx, gy]),
             "novelty_value": float(self.novelty_value[gx, gy]),
+            "unknown_gain": 0.0,
+            "boundary_ratio": 0.0,
+            "history_penalty": 0.0,
+            "hysteresis_kept": False,
             "visited": bool(self.visited[gx, gy]),
             "observe_count": int(self.observe_count[gx, gy]),
             "cluster_size": 1,
@@ -474,6 +608,10 @@ class SemanticMemory:
             "confidence": 0.0,
             "safety_value": 0.0,
             "novelty_value": 0.0,
+            "unknown_gain": 0.0,
+            "boundary_ratio": 0.0,
+            "history_penalty": 0.0,
+            "hysteresis_kept": False,
             "visited": False,
             "observe_count": 0,
             "cluster_size": 0,

@@ -10,9 +10,11 @@ from common.prompts import fixed_system_prompt, fixed_user_prompt_template, unfi
 try:
     from src.planner.semantic_memory import SemanticMemory
     from src.planner.local_planner import LocalPlanner
+    from src.model_wrapper.grounding_dino_client import GroundingDINOClient
 except Exception:
     from planner.semantic_memory import SemanticMemory
     from planner.local_planner import LocalPlanner
+    from model_wrapper.grounding_dino_client import GroundingDINOClient
 
 import numpy as np
 import asyncio
@@ -43,6 +45,17 @@ class ONAir(BaseModelWrapper):
         self.local_planners = [None for _ in range(batch_size)]
         self.planned_paths = [{} for _ in range(batch_size)]
 
+        self.target_confirm_counts = [0 for _ in range(batch_size)]
+        self.target_confirmation_infos = [{} for _ in range(batch_size)]
+
+        self.grounding_dino_client = GroundingDINOClient()
+        self.grounding_dino_results = [{} for _ in range(batch_size)]
+
+        self.target_stop_confidence = 0.75
+        self.target_confirm_confidence = 0.60
+        self.target_candidate_confidence = 0.45
+        self.target_confirm_required_count = 2
+
         self.unfixed_system_prompt = unfixed_system_prompt
         self.fixed_system_prompt = fixed_system_prompt
 
@@ -52,15 +65,22 @@ class ONAir(BaseModelWrapper):
         user_prompts = []
         images = []
         depth_images = []
+        episode_rgb_images = []
 
         for i in range(len(episodes)):
             sources = episodes[i]
+            latest_rgb_images = []
+
             for src in sources[::-1]:
                 if 'rgb' in src and 'depth' in src:
+                    latest_rgb_images = src['rgb']
+
                     for img in src['rgb']:
                         images.append(img)
                     depth_images.extend(src['depth'])
                     break
+
+            episode_rgb_images.append(latest_rgb_images)
   
         b64_imgs = encode_image(images)
 
@@ -153,6 +173,16 @@ class ONAir(BaseModelWrapper):
                 "start_position": self.start_position[i]
             }
 
+            grounding_result = self.run_grounding_dino_detection(
+                index=i,
+                rgb_images=episode_rgb_images[i],
+                object_name=object_name,
+                description=description,
+                step_num=step_num
+            )
+            self.grounding_dino_results[i] = grounding_result
+            self.print_grounding_dino_result(i, grounding_result)
+
             x_min = int(math.floor(self.start_position[i][0] - 50))
             x_max = int(math.ceil(self.start_position[i][0] + 50))
             y_min = int(math.floor(self.start_position[i][1] - 50))
@@ -192,6 +222,48 @@ class ONAir(BaseModelWrapper):
             inputs.append((i, conversation))
 
         return inputs, user_prompts
+
+
+    def run_grounding_dino_detection(self, index, rgb_images, object_name, description, step_num):
+        try:
+            if self.grounding_dino_client is None:
+                return {
+                    "available": False,
+                    "error": "grounding dino client is None"
+                }
+
+            result = self.grounding_dino_client.detect_episode(
+                rgb_images=rgb_images,
+                object_name=object_name,
+                description=description,
+                episode_index=index,
+                step_num=step_num
+            )
+
+            return result
+
+        except Exception as e:
+            print(f"[GroundingDINO] Episode {index}: detection failed: {e}")
+            return {
+                "available": False,
+                "error": str(e)
+            }
+
+
+    def print_grounding_dino_result(self, index, grounding_result):
+        try:
+            if grounding_result is None:
+                return
+
+            summary = self.grounding_dino_client.summarize_result(grounding_result)
+
+            print(
+                "[GroundingDINO] "
+                f"Episode {index}: {summary}"
+            )
+
+        except Exception as e:
+            print(f"[GroundingDINO] Episode {index}: failed to print result: {e}")
     
 
     def init_semantic_memory(self, index, step_num):
@@ -219,6 +291,9 @@ class ONAir(BaseModelWrapper):
             )
 
             self.planned_paths[index] = {}
+            self.target_confirm_counts[index] = 0
+            self.target_confirmation_infos[index] = {}
+            self.grounding_dino_results[index] = {}
 
             print(f"[Semantic Memory] Episode {index}: initialized")
 
@@ -241,6 +316,7 @@ class ONAir(BaseModelWrapper):
         planned_path = self.plan_local_path(index, memory_target)
 
         self.print_semantic_result(semantic_result, action, value)
+        self.print_target_confirmation(index)
         self.print_memory_summary(index, memory_summary)
         self.print_memory_target(index, memory_target)
         self.print_local_plan(index, planned_path)
@@ -267,6 +343,7 @@ class ONAir(BaseModelWrapper):
         planned_path = self.plan_local_path(index, memory_target)
 
         self.print_semantic_result(semantic_result, action, value)
+        self.print_target_confirmation(index)
         self.print_memory_summary(index, memory_summary)
         self.print_memory_target(index, memory_target)
         self.print_local_plan(index, planned_path)
@@ -494,11 +571,18 @@ class ONAir(BaseModelWrapper):
 
 
     def memory_to_legacy_action(self, index, semantic_result, fixed):
-        target_visible = semantic_result["target_visible"]
-        target_confidence = semantic_result["target_confidence"]
+        stop_confirmed, confirm_info = self.update_target_confirmation(
+            index=index,
+            semantic_result=semantic_result
+        )
+        self.target_confirmation_infos[index] = confirm_info
 
-        if target_visible and target_confidence >= 0.75:
-            return "stop", 0, True, self.default_memory_target()
+        if stop_confirmed:
+            stop_target = self.default_memory_target()
+            stop_target["target_type"] = "target_confirm_stop"
+            stop_target["stop_reason"] = confirm_info.get("reason", "target confirmed")
+            self.memory_targets[index] = stop_target
+            return "stop", 0, True, stop_target
 
         try:
             memory = self.semantic_memories[index]
@@ -525,6 +609,56 @@ class ONAir(BaseModelWrapper):
 
         action, value, done = self.semantic_to_legacy_action(semantic_result, fixed)
         return action, value, done, self.default_memory_target()
+
+
+    def update_target_confirmation(self, index, semantic_result):
+        target_visible = semantic_result.get("target_visible", False)
+        target_confidence = semantic_result.get("target_confidence", 0.0)
+
+        target_visible = self.normalize_bool(target_visible)
+        target_confidence = self.normalize_score(target_confidence, 0.0)
+
+        stop_confirmed = False
+        mode = "none"
+        reason = "target not visible"
+
+        if target_visible and target_confidence >= self.target_stop_confidence:
+            self.target_confirm_counts[index] = self.target_confirm_required_count
+            stop_confirmed = True
+            mode = "confirmed"
+            reason = "high confidence target visible"
+
+        elif target_visible and target_confidence >= self.target_confirm_confidence:
+            self.target_confirm_counts[index] += 1
+            mode = "confirming"
+            reason = "target visible with medium confidence"
+
+            if self.target_confirm_counts[index] >= self.target_confirm_required_count:
+                stop_confirmed = True
+                mode = "confirmed"
+                reason = "target confirmed by consecutive observations"
+
+        elif target_visible and target_confidence >= self.target_candidate_confidence:
+            self.target_confirm_counts[index] = 0
+            mode = "candidate"
+            reason = "target candidate visible but confidence is not enough"
+
+        else:
+            self.target_confirm_counts[index] = 0
+            mode = "none"
+            reason = "target not confirmed"
+
+        confirm_info = {
+            "visible": target_visible,
+            "confidence": target_confidence,
+            "count": self.target_confirm_counts[index],
+            "required_count": self.target_confirm_required_count,
+            "stop": stop_confirmed,
+            "mode": mode,
+            "reason": reason
+        }
+
+        return stop_confirmed, confirm_info
 
 
     def memory_target_to_legacy_action(self, memory_target, semantic_result, fixed):
@@ -582,10 +716,14 @@ class ONAir(BaseModelWrapper):
             "confidence": 0.0,
             "safety_value": 0.0,
             "novelty_value": 0.0,
+            "unknown_gain": 0.0,
+            "boundary_ratio": 0.0,
+            "history_penalty": 0.0,
             "distance": 0.0,
             "relative_angle": 0.0,
             "relative_region": "front",
-            "cluster_size": 0
+            "cluster_size": 0,
+            "stop_reason": ""
         }
 
 
@@ -666,6 +804,27 @@ class ONAir(BaseModelWrapper):
         )
 
 
+    def print_target_confirmation(self, index):
+        confirm_info = self.target_confirmation_infos[index]
+
+        if not isinstance(confirm_info, dict):
+            return
+
+        if not confirm_info.get("visible", False) and confirm_info.get("count", 0) <= 0:
+            return
+
+        print(
+            "[Target Confirm] "
+            f"Episode {index}: "
+            f"visible={confirm_info.get('visible', False)}, "
+            f"conf={confirm_info.get('confidence', 0.0):.2f}, "
+            f"count={confirm_info.get('count', 0)}/{confirm_info.get('required_count', self.target_confirm_required_count)}, "
+            f"mode={confirm_info.get('mode', 'none')}, "
+            f"stop={confirm_info.get('stop', False)}, "
+            f"reason={confirm_info.get('reason', '')}"
+        )
+
+
     def print_memory_summary(self, index, memory_summary):
         if memory_summary is None:
             return
@@ -686,7 +845,12 @@ class ONAir(BaseModelWrapper):
             return
 
         if not memory_target.get("valid", False):
-            print(f"[Memory Target] Episode {index}: no valid target, fallback to current semantic result")
+            print(
+                "[Memory Target] "
+                f"Episode {index}: no valid target, "
+                f"type={memory_target.get('target_type', 'none')}, "
+                f"reason={memory_target.get('stop_reason', 'fallback to current semantic result')}"
+            )
             return
 
         print(
@@ -758,12 +922,6 @@ class ONAir(BaseModelWrapper):
             yaw_degree = round(math.degrees(yaw), 2)
 
             # 结构化格式 [(x, y, z), yaw]
-            formatted = [
-                (round(pos[0], 2), round(pos[1], 2)),
-                yaw_degree
-            ]
-
-            # 保持旧数据格式 fallback 的兼容性
             formatted = [
                 (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2)),
                 yaw_degree

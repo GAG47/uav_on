@@ -22,10 +22,12 @@ class SemanticFrontierBuilder:
         if score_map is None:
             score_map = self.memory.compute_planning_score_map()
 
+        observed_mask = self.memory.confidence >= min_confidence
+
         candidate_mask = self.build_frontier_candidate_mask(
             score_map=score_map,
+            observed_mask=observed_mask,
             current_pose=current_pose,
-            min_confidence=min_confidence,
             min_distance=min_distance,
             max_distance=max_distance,
             min_frontier_score=min_frontier_score
@@ -33,7 +35,6 @@ class SemanticFrontierBuilder:
 
         clusters = self.cluster_frontier_cells(
             candidate_mask=candidate_mask,
-            score_map=score_map,
             min_cluster_size=min_cluster_size,
             semantic_similarity_threshold=semantic_similarity_threshold
         )
@@ -44,6 +45,7 @@ class SemanticFrontierBuilder:
                 frontier_id=idx,
                 cells=cluster_cells,
                 score_map=score_map,
+                observed_mask=observed_mask,
                 current_pose=current_pose
             )
             frontiers.append(frontier)
@@ -54,47 +56,56 @@ class SemanticFrontierBuilder:
     def build_frontier_candidate_mask(
         self,
         score_map,
+        observed_mask,
         current_pose,
-        min_confidence,
         min_distance,
         max_distance,
         min_frontier_score
     ):
         x, y, z, yaw = current_pose
 
-        observed_mask = self.memory.confidence >= min_confidence
         score_mask = score_map >= min_frontier_score
         unvisited_mask = np.logical_not(self.memory.visited)
         boundary_mask = self.get_observed_boundary_mask(observed_mask)
 
         candidate_mask = observed_mask & score_mask & unvisited_mask & boundary_mask
 
+        candidate_mask = self.filter_by_distance(
+            candidate_mask=candidate_mask,
+            current_pose=current_pose,
+            min_distance=min_distance,
+            max_distance=max_distance
+        )
+
+        if not np.any(candidate_mask):
+            candidate_mask = observed_mask & score_mask & unvisited_mask
+            candidate_mask = self.filter_by_distance(
+                candidate_mask=candidate_mask,
+                current_pose=current_pose,
+                min_distance=min_distance,
+                max_distance=max_distance
+            )
+
+        return candidate_mask
+
+
+    def filter_by_distance(self, candidate_mask, current_pose, min_distance, max_distance):
+        x, y, z, yaw = current_pose
+
+        new_mask = candidate_mask.copy()
+
         for gx in range(self.memory.grid_size):
             for gy in range(self.memory.grid_size):
-                if not candidate_mask[gx, gy]:
+                if not new_mask[gx, gy]:
                     continue
 
                 wx, wy = self.memory.grid_to_world(gx, gy)
                 dist = math.hypot(wx - x, wy - y)
 
                 if dist < min_distance or dist > max_distance:
-                    candidate_mask[gx, gy] = False
+                    new_mask[gx, gy] = False
 
-        if not np.any(candidate_mask):
-            candidate_mask = observed_mask & score_mask & unvisited_mask
-
-            for gx in range(self.memory.grid_size):
-                for gy in range(self.memory.grid_size):
-                    if not candidate_mask[gx, gy]:
-                        continue
-
-                    wx, wy = self.memory.grid_to_world(gx, gy)
-                    dist = math.hypot(wx - x, wy - y)
-
-                    if dist < min_distance or dist > max_distance:
-                        candidate_mask[gx, gy] = False
-
-        return candidate_mask
+        return new_mask
 
 
     def get_observed_boundary_mask(self, observed_mask):
@@ -120,7 +131,6 @@ class SemanticFrontierBuilder:
     def cluster_frontier_cells(
         self,
         candidate_mask,
-        score_map,
         min_cluster_size=2,
         semantic_similarity_threshold=0.18,
     ):
@@ -166,7 +176,7 @@ class SemanticFrontierBuilder:
         return clusters
 
 
-    def build_frontier_info(self, frontier_id, cells, score_map, current_pose):
+    def build_frontier_info(self, frontier_id, cells, score_map, observed_mask, current_pose):
         x, y, z, yaw = current_pose
 
         world_positions = []
@@ -203,13 +213,35 @@ class SemanticFrontierBuilder:
         mean_novelty = float(np.mean(novelty_values))
         mean_observe = float(np.mean(observe_counts))
 
+        unknown_gain = self.compute_unknown_gain(
+            cells=cells,
+            observed_mask=observed_mask,
+            radius=3
+        )
+        boundary_ratio = self.compute_boundary_ratio(
+            cells=cells,
+            observed_mask=observed_mask
+        )
+
         cluster_size = len(cells)
         size_bonus = min(1.0, math.log(cluster_size + 1.0) / math.log(12.0))
         distance_penalty = min(0.35, distance / max(self.memory.map_size, 1e-6))
 
-        frontier_score = 0.65 * mean_score + 0.35 * max_score
+        selected_count = self.get_selected_count(center_x, center_y)
+        history_penalty = min(0.35, 0.08 * selected_count)
+
+        frontier_score = (
+            0.42 * mean_score
+            + 0.22 * max_score
+            + 0.14 * unknown_gain
+            + 0.10 * boundary_ratio
+            + 0.08 * mean_safety
+            + 0.04 * mean_novelty
+        )
+
         frontier_score = frontier_score * (0.85 + 0.15 * size_bonus)
         frontier_score = frontier_score - distance_penalty * 0.08
+        frontier_score = frontier_score * (1.0 - history_penalty)
         frontier_score = max(0.0, frontier_score)
 
         frontier = {
@@ -229,6 +261,10 @@ class SemanticFrontierBuilder:
             "confidence": mean_confidence,
             "safety_value": mean_safety,
             "novelty_value": mean_novelty,
+            "unknown_gain": float(unknown_gain),
+            "boundary_ratio": float(boundary_ratio),
+            "history_penalty": float(history_penalty),
+            "selected_count": int(selected_count),
             "visited": False,
             "observe_count": int(round(mean_observe)),
             "cluster_size": cluster_size,
@@ -236,3 +272,51 @@ class SemanticFrontierBuilder:
         }
 
         return frontier
+
+
+    def compute_unknown_gain(self, cells, observed_mask, radius=3):
+        unknown_count = 0
+        total_count = 0
+
+        for gx, gy in cells:
+            for nx in range(gx - radius, gx + radius + 1):
+                for ny in range(gy - radius, gy + radius + 1):
+                    if not self.memory.in_bounds(nx, ny):
+                        continue
+
+                    total_count += 1
+
+                    if not observed_mask[nx, ny]:
+                        unknown_count += 1
+
+        if total_count <= 0:
+            return 0.0
+
+        return float(unknown_count / total_count)
+
+
+    def compute_boundary_ratio(self, cells, observed_mask):
+        if len(cells) == 0:
+            return 0.0
+
+        boundary_count = 0
+
+        for gx, gy in cells:
+            has_unknown_neighbor = False
+
+            for nx, ny in self.memory.get_neighbors(gx, gy, eight_connected=False):
+                if not observed_mask[nx, ny]:
+                    has_unknown_neighbor = True
+                    break
+
+            if has_unknown_neighbor:
+                boundary_count += 1
+
+        return float(boundary_count / max(len(cells), 1))
+
+
+    def get_selected_count(self, center_x, center_y):
+        try:
+            return self.memory.get_frontier_selection_count((center_x, center_y))
+        except Exception:
+            return 0
