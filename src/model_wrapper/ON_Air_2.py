@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import os
 import json
 
+
 class ONAir(BaseModelWrapper):
     def __init__(self, fixed, batch_size):
         super().__init__()
@@ -26,6 +27,7 @@ class ONAir(BaseModelWrapper):
         self.start_position = [[] for _ in range(batch_size)]
         self.start_yaw = [0 for _ in range(batch_size)]
         self.current_poses = [[] for _ in range(batch_size)]
+        self.semantic_results = [{} for _ in range(batch_size)]
 
         self.unfixed_system_prompt = unfixed_system_prompt
         self.fixed_system_prompt = fixed_system_prompt
@@ -62,9 +64,11 @@ class ONAir(BaseModelWrapper):
 
             if tail:                               # 处理最后不足 8 张
                 yield img_list[-tail:] 
+
         captions = []
         print("start generate caption")
-        start=time.time()
+        start = time.time()
+
         for imgs in iterate_batches(b64_imgs):
             # raw = generate_caption_qwen_api(imgs)
             raw = generate_caption(imgs)
@@ -73,12 +77,15 @@ class ONAir(BaseModelWrapper):
                 raise ValueError(f"Expected {len(imgs)} captions, got {len(raw)}")
             captions.extend(raw)
 
-        print("generation captions time:", time.time()-start)
+        print("generation captions time:", time.time() - start)
+
+        depth_info_all = self.process_depth(depth_images=depth_images)
       
 
         for i in range(len(episodes)):
             
             captions4 = captions[4*i:4*i+4]
+            depth_info = depth_info_all[4*i:4*i+4]
             
             self.start_position[i] = episodes[i][-1]['start_position']
             
@@ -93,7 +100,6 @@ class ONAir(BaseModelWrapper):
             description = episodes[i][-1]['description']
             object_name = episodes[i][-1]['object_name']
             object_size = episodes[i][-1]['object_size']
-            depth_info = self.process_depth(depth_images=depth_images)
             
             previous_position = episodes[i][-1]['pre_poses']
             move_distance = episodes[i][-1]['move_distance']
@@ -128,6 +134,7 @@ class ONAir(BaseModelWrapper):
             x_max = int(math.ceil(self.start_position[i][0] + 50))
             y_min = int(math.floor(self.start_position[i][1] - 50))
             y_max = int(math.ceil(self.start_position[i][1] + 50))
+
             if not fixed:
                 conversation = [
                     {"role": "system", "content": self.unfixed_system_prompt},
@@ -156,37 +163,40 @@ class ONAir(BaseModelWrapper):
                         ) 
                     }
                 ]
+
             prompt_info = conversation[1]["content"]
             user_prompts.append(prompt_info)
             inputs.append(conversation)
 
         return inputs, user_prompts
     
+
     async def unfixed_single_call(self, conversation):
         resp = await self.gpt_client.chat.completions.create(
             model='gpt-4.1-mini',
             messages=conversation
         )
         text = resp.choices[0].message.content.strip()
-        text = text.strip("[]`\"'")
-        parts = [p.strip().strip("[]`\"'") for p in text.split(",")]
-        action = parts[0].strip('\'"')
-        # 解析 value
-        value = float(parts[1]) if "." in parts[1] else int(parts[1])
-        done = (action == 'stop')
-        return action, value, done 
+        semantic_result = self.parse_semantic_result(text)
+        action, value, done = self.semantic_to_legacy_action(semantic_result, fixed=False)
+
+        self.print_semantic_result(semantic_result, action, value)
+        return action, value, done, semantic_result 
     
+
     async def fixed_single_call(self, conversation):
         
         resp = await self.gpt_client.chat.completions.create(
             model='gpt-4.1-mini',
             messages=conversation
         )
-        action = resp.choices[0].message.content.strip().strip('\'"')
-        # 解析 value
-        
-        done = (action == 'stop')
-        return action, 0, done              
+        text = resp.choices[0].message.content.strip()
+        semantic_result = self.parse_semantic_result(text)
+        action, value, done = self.semantic_to_legacy_action(semantic_result, fixed=True)
+
+        self.print_semantic_result(semantic_result, action, value)
+        return action, value, done, semantic_result              
+
 
     async def batch_calls(self, conversations, fixed):
         if fixed:
@@ -195,13 +205,257 @@ class ONAir(BaseModelWrapper):
             tasks = [self.unfixed_single_call(conv) for conv in conversations]
         return await asyncio.gather(*tasks)
 
+
     def run(self, inputs, fixed, prompt_info_list=None):
         results = asyncio.run(self.batch_calls(inputs, fixed))
-        actions, steps_size, predict_dones = zip(*results)
+        actions, steps_size, predict_dones, semantic_results = zip(*results)
 
-        new_actions, new_step_size = self.redirect_action(actions,steps_size, fixed)
+        self.semantic_results = list(semantic_results)
+
+        new_actions, new_step_size = self.redirect_action(actions, steps_size, fixed)
 
         return list(new_actions), list(new_step_size), list(predict_dones)
+
+
+    def parse_semantic_result(self, text):
+        try:
+            raw_text = text.strip()
+
+            if raw_text.startswith("```"):
+                raw_text = raw_text.strip("`")
+                raw_text = raw_text.replace("json", "", 1).strip()
+
+            start_idx = raw_text.find("{")
+            end_idx = raw_text.rfind("}")
+
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                raw_text = raw_text[start_idx:end_idx+1]
+
+            semantic_result = json.loads(raw_text)
+            semantic_result = self.normalize_semantic_result(semantic_result)
+
+            return semantic_result
+
+        except Exception as e:
+            print(f"[WARNING] failed to parse semantic JSON: {e}")
+            print(f"[WARNING] raw response: {text}")
+
+            return self.default_semantic_result()
+
+
+    def normalize_semantic_result(self, semantic_result):
+        region_scores = semantic_result.get("region_scores", {})
+        safety_scores = semantic_result.get("safety_scores", {})
+        novelty_scores = semantic_result.get("novelty_scores", {})
+
+        region_scores = self.normalize_score_dict(region_scores, default_score=0.0)
+        safety_scores = self.normalize_score_dict(safety_scores, default_score=0.5)
+        novelty_scores = self.normalize_score_dict(novelty_scores, default_score=0.5)
+
+        best_region = semantic_result.get("best_region", None)
+        if best_region not in ["front", "left", "right"]:
+            best_region = max(region_scores, key=region_scores.get)
+
+        target_visible = semantic_result.get("target_visible", False)
+        target_visible = self.normalize_bool(target_visible)
+
+        target_confidence = semantic_result.get("target_confidence", 0.0)
+        target_confidence = self.normalize_score(target_confidence, default_score=0.0)
+
+        altitude_assessment = semantic_result.get("altitude_assessment", {})
+        if not isinstance(altitude_assessment, dict):
+            altitude_assessment = {}
+
+        altitude_assessment.setdefault("target_size_level", "unknown")
+        altitude_assessment.setdefault("height_suitability", "unknown")
+        altitude_assessment.setdefault("comment", "")
+
+        reason = semantic_result.get("reason", "")
+        evidence = semantic_result.get("evidence", [])
+
+        if not isinstance(reason, str):
+            reason = str(reason)
+
+        if not isinstance(evidence, list):
+            evidence = [str(evidence)]
+
+        semantic_result = {
+            "region_scores": region_scores,
+            "safety_scores": safety_scores,
+            "novelty_scores": novelty_scores,
+            "best_region": best_region,
+            "target_visible": target_visible,
+            "target_confidence": target_confidence,
+            "altitude_assessment": altitude_assessment,
+            "reason": reason,
+            "evidence": evidence
+        }
+
+        return semantic_result
+
+
+    def normalize_score_dict(self, score_dict, default_score=0.0):
+        valid_regions = ["front", "left", "right"]
+        new_score_dict = {}
+
+        if not isinstance(score_dict, dict):
+            score_dict = {}
+
+        for region in valid_regions:
+            score = score_dict.get(region, default_score)
+            new_score_dict[region] = self.normalize_score(score, default_score)
+
+        return new_score_dict
+
+
+    def normalize_score(self, score, default_score=0.0):
+        try:
+            score = float(score)
+        except Exception:
+            score = default_score
+
+        score = max(0.0, min(1.0, score))
+        return score
+
+
+    def normalize_bool(self, value):
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, str):
+            value = value.strip().lower()
+            if value in ["true", "yes", "1"]:
+                return True
+            if value in ["false", "no", "0"]:
+                return False
+
+        return bool(value)
+
+
+    def default_semantic_result(self):
+        semantic_result = {
+            "region_scores": {
+                "front": 0.34,
+                "left": 0.33,
+                "right": 0.33
+            },
+            "safety_scores": {
+                "front": 0.5,
+                "left": 0.5,
+                "right": 0.5
+            },
+            "novelty_scores": {
+                "front": 0.5,
+                "left": 0.5,
+                "right": 0.5
+            },
+            "best_region": "front",
+            "target_visible": False,
+            "target_confidence": 0.0,
+            "altitude_assessment": {
+                "target_size_level": "unknown",
+                "height_suitability": "unknown",
+                "comment": ""
+            },
+            "reason": "fallback semantic result because JSON parsing failed",
+            "evidence": []
+        }
+
+        return semantic_result
+
+
+    def semantic_to_legacy_action(self, semantic_result, fixed):
+        region_scores = semantic_result["region_scores"]
+        safety_scores = semantic_result["safety_scores"]
+        best_region = semantic_result["best_region"]
+        target_visible = semantic_result["target_visible"]
+        target_confidence = semantic_result["target_confidence"]
+
+        if target_visible and target_confidence >= 0.75:
+            return "stop", 0, True
+
+        max_safety = max(safety_scores.values())
+        if max_safety < 0.25:
+            if fixed:
+                return "rotl", 0, False
+            else:
+                return "rotl", 30, False
+
+        if best_region not in ["front", "left", "right"]:
+            best_region = max(region_scores, key=region_scores.get)
+
+        if best_region == "front":
+            action = "forward"
+        elif best_region == "left":
+            action = "left"
+        elif best_region == "right":
+            action = "right"
+        else:
+            action = "forward"
+
+        if fixed:
+            value = 0
+        else:
+            value = self.estimate_unfixed_step_size(
+                region_score=region_scores[best_region],
+                safety_score=safety_scores[best_region],
+                target_visible=target_visible,
+                target_confidence=target_confidence
+            )
+
+        done = (action == "stop")
+        return action, value, done
+
+
+    def estimate_unfixed_step_size(self, region_score, safety_score, target_visible, target_confidence):
+        if target_visible or target_confidence >= 0.6:
+            step_size = 2.0
+        elif safety_score < 0.35:
+            step_size = 2.0
+        elif safety_score < 0.6:
+            step_size = 3.0
+        elif region_score >= 0.75 and safety_score >= 0.75:
+            step_size = 6.0
+        elif region_score >= 0.55 and safety_score >= 0.6:
+            step_size = 5.0
+        else:
+            step_size = 4.0
+
+        return step_size
+
+
+    def print_semantic_result(self, semantic_result, action, value):
+        region_scores = semantic_result["region_scores"]
+        safety_scores = semantic_result["safety_scores"]
+        novelty_scores = semantic_result["novelty_scores"]
+
+        print(
+            "[Semantic Scores] "
+            f"front={region_scores['front']:.2f}, "
+            f"left={region_scores['left']:.2f}, "
+            f"right={region_scores['right']:.2f}, "
+            f"best={semantic_result['best_region']}, "
+            f"visible={semantic_result['target_visible']}, "
+            f"conf={semantic_result['target_confidence']:.2f}"
+        )
+
+        print(
+            "[Safety Scores] "
+            f"front={safety_scores['front']:.2f}, "
+            f"left={safety_scores['left']:.2f}, "
+            f"right={safety_scores['right']:.2f}"
+        )
+
+        print(
+            "[Novelty Scores] "
+            f"front={novelty_scores['front']:.2f}, "
+            f"left={novelty_scores['left']:.2f}, "
+            f"right={novelty_scores['right']:.2f}"
+        )
+
+        print(f"[Adapter] semantic result -> legacy action: [{action}, {value}]")
+        print(f"[Reason] {semantic_result['reason']}")
+
 
     def process_depth(self, depth_images):
         depth_info = []
@@ -214,6 +468,7 @@ class ONAir(BaseModelWrapper):
             depth_info.append(y_int)
 
         return depth_info 
+
 
     def process_poses(self, poses):
         pre_poses_xyzYaw = []
@@ -236,11 +491,14 @@ class ONAir(BaseModelWrapper):
 
         return pre_poses_xyzYaw
 
+
     def redirect_action(self, actions, step_size, fixed):
         new_actions = [None] * len(actions)
         new_step_size = list(step_size)
+
         for i, action in enumerate(actions):
             new_actions[i] = action
+
             try:
                 start_position = self.start_position[i]
                 x_min = round(start_position[0] - 50, 2)
@@ -250,6 +508,8 @@ class ONAir(BaseModelWrapper):
 
                 current_pose = self.current_poses[i]
                 x, y, z, yaw = current_pose
+
+                current_step_size = new_step_size[i]
 
                 if action == 'forward':
                     dx = math.cos(math.radians(yaw))
@@ -266,7 +526,7 @@ class ONAir(BaseModelWrapper):
                     if fixed:
                         new_position = np.array([x, y, z]) + unit_vector * AirsimActionSettings.FORWARD_STEP_SIZE
                     else:
-                        new_position = np.array([x, y, z]) + unit_vector * step_size
+                        new_position = np.array([x, y, z]) + unit_vector * current_step_size
 
                     if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
                         new_actions[i] = 'rotl'
@@ -288,7 +548,7 @@ class ONAir(BaseModelWrapper):
                     if fixed:
                         new_position = np.array([x, y, z]) - unit_vector * AirsimActionSettings.LEFT_RIGHT_STEP_SIZE
                     else:
-                        new_position = np.array([x, y, z]) - unit_vector * step_size
+                        new_position = np.array([x, y, z]) - unit_vector * current_step_size
                     
                     if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
                         new_actions[i] = 'rotl'
@@ -309,7 +569,7 @@ class ONAir(BaseModelWrapper):
                     if fixed:
                         new_position = np.array([x, y, z]) + unit_vector * AirsimActionSettings.LEFT_RIGHT_STEP_SIZE
                     else:
-                        new_position = np.array([x, y, z]) + unit_vector * step_size
+                        new_position = np.array([x, y, z]) + unit_vector * current_step_size
 
                     if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
                         new_actions[i] = 'rotl'

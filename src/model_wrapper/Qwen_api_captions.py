@@ -4,6 +4,7 @@ import traceback
 from PIL import Image
 import json
 import time
+import os
 from openai import AsyncOpenAI
 from dashscope import MultiModalConversation
 import asyncio
@@ -66,7 +67,7 @@ def generate_caption(image_file, temperature=0.7):
     
     try:
         response = MultiModalConversation.call(
-            api_key="your_api_key_here",  # 替换为你的 qwen-api
+            api_key=os.getenv("DASHSCOPE_API_KEY"),  # 替换为你的 qwen-api
             model='qwen-vl-max',
             messages=messages
         )
