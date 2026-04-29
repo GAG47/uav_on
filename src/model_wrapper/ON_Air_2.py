@@ -7,6 +7,11 @@ from io import BytesIO
 from src.common.param import args
 from common.prompts import fixed_system_prompt, fixed_user_prompt_template, unfixed_system_prompt, unfixed_user_prompt_template
 
+try:
+    from src.planner.semantic_memory import SemanticMemory
+except Exception:
+    from planner.semantic_memory import SemanticMemory
+
 import numpy as np
 import asyncio
 import math
@@ -27,7 +32,10 @@ class ONAir(BaseModelWrapper):
         self.start_position = [[] for _ in range(batch_size)]
         self.start_yaw = [0 for _ in range(batch_size)]
         self.current_poses = [[] for _ in range(batch_size)]
+
         self.semantic_results = [{} for _ in range(batch_size)]
+        self.semantic_memories = [None for _ in range(batch_size)]
+        self.memory_update_infos = [{} for _ in range(batch_size)]
 
         self.unfixed_system_prompt = unfixed_system_prompt
         self.fixed_system_prompt = fixed_system_prompt
@@ -130,6 +138,15 @@ class ONAir(BaseModelWrapper):
                 self.current_poses[i] = [self.start_position[i][0], self.start_position[i][1], 
                                          self.start_position[i][2], self.start_yaw[i]]
 
+            self.init_semantic_memory(i, step_num)
+
+            self.memory_update_infos[i] = {
+                "current_pose": self.current_poses[i],
+                "depth_info": depth_info,
+                "step_num": step_num,
+                "start_position": self.start_position[i]
+            }
+
             x_min = int(math.floor(self.start_position[i][0] - 50))
             x_max = int(math.ceil(self.start_position[i][0] + 50))
             y_min = int(math.floor(self.start_position[i][1] - 50))
@@ -166,25 +183,51 @@ class ONAir(BaseModelWrapper):
 
             prompt_info = conversation[1]["content"]
             user_prompts.append(prompt_info)
-            inputs.append(conversation)
+            inputs.append((i, conversation))
 
         return inputs, user_prompts
     
 
-    async def unfixed_single_call(self, conversation):
+    def init_semantic_memory(self, index, step_num):
+        need_reset = False
+
+        if self.semantic_memories[index] is None:
+            need_reset = True
+        elif step_num == 0:
+            need_reset = True
+        elif not self.semantic_memories[index].same_origin(self.start_position[index]):
+            need_reset = True
+
+        if need_reset:
+            self.semantic_memories[index] = SemanticMemory(
+                origin=self.start_position[index],
+                resolution=2.0,
+                map_size=100.0,
+                max_sensing_range=25.0,
+                sector_angle=70.0,
+                visited_radius=3.0
+            )
+            print(f"[Semantic Memory] Episode {index}: initialized")
+
+
+    async def unfixed_single_call(self, index, conversation):
         resp = await self.gpt_client.chat.completions.create(
             model='gpt-4.1-mini',
             messages=conversation
         )
         text = resp.choices[0].message.content.strip()
         semantic_result = self.parse_semantic_result(text)
+
+        memory_summary = self.update_semantic_memory(index, semantic_result)
         action, value, done = self.semantic_to_legacy_action(semantic_result, fixed=False)
 
         self.print_semantic_result(semantic_result, action, value)
+        self.print_memory_summary(index, memory_summary)
+
         return action, value, done, semantic_result 
     
 
-    async def fixed_single_call(self, conversation):
+    async def fixed_single_call(self, index, conversation):
         
         resp = await self.gpt_client.chat.completions.create(
             model='gpt-4.1-mini',
@@ -192,17 +235,21 @@ class ONAir(BaseModelWrapper):
         )
         text = resp.choices[0].message.content.strip()
         semantic_result = self.parse_semantic_result(text)
+
+        memory_summary = self.update_semantic_memory(index, semantic_result)
         action, value, done = self.semantic_to_legacy_action(semantic_result, fixed=True)
 
         self.print_semantic_result(semantic_result, action, value)
+        self.print_memory_summary(index, memory_summary)
+
         return action, value, done, semantic_result              
 
 
     async def batch_calls(self, conversations, fixed):
         if fixed:
-            tasks = [self.fixed_single_call(conv) for conv in conversations]
+            tasks = [self.fixed_single_call(index, conv) for index, conv in conversations]
         else:
-            tasks = [self.unfixed_single_call(conv) for conv in conversations]
+            tasks = [self.unfixed_single_call(index, conv) for index, conv in conversations]
         return await asyncio.gather(*tasks)
 
 
@@ -215,6 +262,25 @@ class ONAir(BaseModelWrapper):
         new_actions, new_step_size = self.redirect_action(actions, steps_size, fixed)
 
         return list(new_actions), list(new_step_size), list(predict_dones)
+
+
+    def update_semantic_memory(self, index, semantic_result):
+        try:
+            memory = self.semantic_memories[index]
+            update_info = self.memory_update_infos[index]
+
+            memory_summary = memory.update(
+                semantic_result=semantic_result,
+                current_pose=update_info["current_pose"],
+                depth_info=update_info["depth_info"],
+                step_num=update_info["step_num"]
+            )
+
+            return memory_summary
+
+        except Exception as e:
+            print(f"[WARNING] failed to update semantic memory for episode {index}: {e}")
+            return None
 
 
     def parse_semantic_result(self, text):
@@ -430,31 +496,30 @@ class ONAir(BaseModelWrapper):
         novelty_scores = semantic_result["novelty_scores"]
 
         print(
-            "[Semantic Scores] "
-            f"front={region_scores['front']:.2f}, "
-            f"left={region_scores['left']:.2f}, "
-            f"right={region_scores['right']:.2f}, "
+            "[Semantic] "
+            f"region=({region_scores['front']:.2f}, {region_scores['left']:.2f}, {region_scores['right']:.2f}), "
+            f"safety=({safety_scores['front']:.2f}, {safety_scores['left']:.2f}, {safety_scores['right']:.2f}), "
+            f"novelty=({novelty_scores['front']:.2f}, {novelty_scores['left']:.2f}, {novelty_scores['right']:.2f}), "
             f"best={semantic_result['best_region']}, "
             f"visible={semantic_result['target_visible']}, "
-            f"conf={semantic_result['target_confidence']:.2f}"
+            f"conf={semantic_result['target_confidence']:.2f}, "
+            f"action=[{action}, {value}]"
         )
+
+
+    def print_memory_summary(self, index, memory_summary):
+        if memory_summary is None:
+            return
 
         print(
-            "[Safety Scores] "
-            f"front={safety_scores['front']:.2f}, "
-            f"left={safety_scores['left']:.2f}, "
-            f"right={safety_scores['right']:.2f}"
+            "[Semantic Memory] "
+            f"Episode {index}: "
+            f"observed={memory_summary['observed_cells']}, "
+            f"visited={memory_summary['visited_cells']}, "
+            f"max_value={memory_summary['max_value']:.2f}, "
+            f"max_conf={memory_summary['max_confidence']:.2f}, "
+            f"max_pos={memory_summary['max_position']}"
         )
-
-        print(
-            "[Novelty Scores] "
-            f"front={novelty_scores['front']:.2f}, "
-            f"left={novelty_scores['left']:.2f}, "
-            f"right={novelty_scores['right']:.2f}"
-        )
-
-        print(f"[Adapter] semantic result -> legacy action: [{action}, {value}]")
-        print(f"[Reason] {semantic_result['reason']}")
 
 
     def process_depth(self, depth_images):
