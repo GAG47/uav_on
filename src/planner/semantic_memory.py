@@ -4,9 +4,11 @@ import numpy as np
 try:
     from src.planner.semantic_frontier import SemanticFrontierBuilder
     from src.planner.viewpoint_planner import ViewpointPlanner
+    from src.planner.sgcp_planner import SGCPPlanner
 except Exception:
     from planner.semantic_frontier import SemanticFrontierBuilder
     from planner.viewpoint_planner import ViewpointPlanner
+    from planner.sgcp_planner import SGCPPlanner
 
 
 class SemanticMemory:
@@ -43,6 +45,7 @@ class SemanticMemory:
 
         self.frontier_builder = SemanticFrontierBuilder(self)
         self.viewpoint_planner = ViewpointPlanner(self)
+        self.sgcp_planner = SGCPPlanner(self)
 
 
     def reset(self, origin):
@@ -302,9 +305,14 @@ class SemanticMemory:
         self.last_frontiers = frontiers
 
         if len(frontiers) > 0:
-            target = self.select_best_frontier(frontiers)
-            target = self.add_relative_info_to_target(target, current_pose)
-            return target
+            target = self.sgcp_planner.select_next_frontier(
+                frontiers=frontiers,
+                current_pose=current_pose
+            )
+
+            if target is not None:
+                target = self.add_relative_info_to_target(target, current_pose)
+                return target
 
         return self.get_best_memory_cell_target(
             current_pose=current_pose,
