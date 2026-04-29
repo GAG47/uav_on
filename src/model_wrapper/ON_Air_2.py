@@ -9,8 +9,10 @@ from common.prompts import fixed_system_prompt, fixed_user_prompt_template, unfi
 
 try:
     from src.planner.semantic_memory import SemanticMemory
+    from src.planner.local_planner import LocalPlanner
 except Exception:
     from planner.semantic_memory import SemanticMemory
+    from planner.local_planner import LocalPlanner
 
 import numpy as np
 import asyncio
@@ -37,6 +39,9 @@ class ONAir(BaseModelWrapper):
         self.semantic_memories = [None for _ in range(batch_size)]
         self.memory_update_infos = [{} for _ in range(batch_size)]
         self.memory_targets = [{} for _ in range(batch_size)]
+
+        self.local_planners = [None for _ in range(batch_size)]
+        self.planned_paths = [{} for _ in range(batch_size)]
 
         self.unfixed_system_prompt = unfixed_system_prompt
         self.fixed_system_prompt = fixed_system_prompt
@@ -208,6 +213,13 @@ class ONAir(BaseModelWrapper):
                 sector_angle=70.0,
                 visited_radius=3.0
             )
+
+            self.local_planners[index] = LocalPlanner(
+                memory=self.semantic_memories[index]
+            )
+
+            self.planned_paths[index] = {}
+
             print(f"[Semantic Memory] Episode {index}: initialized")
 
 
@@ -226,9 +238,12 @@ class ONAir(BaseModelWrapper):
             fixed=False
         )
 
+        planned_path = self.plan_local_path(index, memory_target)
+
         self.print_semantic_result(semantic_result, action, value)
         self.print_memory_summary(index, memory_summary)
         self.print_memory_target(index, memory_target)
+        self.print_local_plan(index, planned_path)
 
         return action, value, done, semantic_result 
     
@@ -249,9 +264,12 @@ class ONAir(BaseModelWrapper):
             fixed=True
         )
 
+        planned_path = self.plan_local_path(index, memory_target)
+
         self.print_semantic_result(semantic_result, action, value)
         self.print_memory_summary(index, memory_summary)
         self.print_memory_target(index, memory_target)
+        self.print_local_plan(index, planned_path)
 
         return action, value, done, semantic_result              
 
@@ -292,6 +310,40 @@ class ONAir(BaseModelWrapper):
         except Exception as e:
             print(f"[WARNING] failed to update semantic memory for episode {index}: {e}")
             return None
+
+
+    def plan_local_path(self, index, memory_target):
+        try:
+            local_planner = self.local_planners[index]
+            current_pose = self.current_poses[index]
+
+            if local_planner is None:
+                return self.default_local_plan("local planner is None")
+
+            planned_path = local_planner.plan_path(
+                current_pose=current_pose,
+                memory_target=memory_target
+            )
+
+            self.planned_paths[index] = planned_path
+            return planned_path
+
+        except Exception as e:
+            print(f"[WARNING] failed to plan local path for episode {index}: {e}")
+            return self.default_local_plan(str(e))
+
+
+    def default_local_plan(self, reason):
+        plan = {
+            "valid": False,
+            "reason": reason,
+            "target_position": None,
+            "path": [],
+            "path_len": 0,
+            "path_length": 0.0
+        }
+
+        return plan
 
 
     def parse_semantic_result(self, text):
@@ -520,7 +572,11 @@ class ONAir(BaseModelWrapper):
     def default_memory_target(self):
         return {
             "valid": False,
+            "target_type": "none",
             "position": None,
+            "frontier_position": None,
+            "viewpoint_position": None,
+            "viewpoint_yaw": 0.0,
             "score": 0.0,
             "semantic_value": 0.0,
             "confidence": 0.0,
@@ -528,7 +584,8 @@ class ONAir(BaseModelWrapper):
             "novelty_value": 0.0,
             "distance": 0.0,
             "relative_angle": 0.0,
-            "relative_region": "front"
+            "relative_region": "front",
+            "cluster_size": 0
         }
 
 
@@ -649,6 +706,32 @@ class ONAir(BaseModelWrapper):
         )
 
 
+    def print_local_plan(self, index, planned_path):
+        if planned_path is None:
+            return
+
+        if not planned_path.get("valid", False):
+            print(
+                "[Local Planner] "
+                f"Episode {index}: invalid, "
+                f"reason={planned_path.get('reason', 'unknown')}"
+            )
+            return
+
+        path = planned_path.get("path", [])
+        preview_path = path[:3]
+
+        print(
+            "[Local Planner] "
+            f"Episode {index}: "
+            f"valid=True, "
+            f"path_len={planned_path.get('path_len', 0)}, "
+            f"path_length={planned_path.get('path_length', 0.0)}, "
+            f"target={planned_path.get('target_position', None)}, "
+            f"preview={preview_path}"
+        )
+
+
     def process_depth(self, depth_images):
         depth_info = []
         for depth_image in depth_images:
@@ -675,6 +758,12 @@ class ONAir(BaseModelWrapper):
             yaw_degree = round(math.degrees(yaw), 2)
 
             # 结构化格式 [(x, y, z), yaw]
+            formatted = [
+                (round(pos[0], 2), round(pos[1], 2)),
+                yaw_degree
+            ]
+
+            # 保持旧数据格式 fallback 的兼容性
             formatted = [
                 (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2)),
                 yaw_degree
@@ -793,10 +882,10 @@ class ONAir(BaseModelWrapper):
     #             raise ValueError("零向量没有方向")
     #         # 计算与四个方向的夹角（弧度）
     #         angles = {
-    #             '+X': math.acos( dx / L),
-    #             '-X': math.acos(-dx / L),
-    #             '+Y': math.acos( dy / L),
-    #             '-Y': math.acos(-dy / L),
+    #             '+X':   math.acos( dx / L),
+    #             '-X':   math.acos(-dx / L),
+    #             '+Y':   math.acos( dy / L),
+    #             '-Y':   math.acos(-dy / L),
     #         }
     #         # 选最小的
     #         axis, angle_rad = min(angles.items(), key=lambda kv: kv[1])
