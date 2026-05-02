@@ -24,3 +24,10 @@ method/
 # Optional: Ignore logs or temp files
 *.log
 *.jsonllogs/
+
+# evaluation logs
+logs/
+*.log
+*.jsonl
+__pycache__/
+*.pyc

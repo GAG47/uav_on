@@ -23,6 +23,10 @@ class TargetTracker:
         max_consistency_angle=45.0,
         min_navigate_steps_before_stop=1,
         history_size=5,
+        stop_evidence_threshold=3.0,
+        stop_evidence_decay=0.65,
+        verifier_bonus=1.25,
+        verifier_penalty=0.45,
     ):
         self.candidate_score = candidate_score
         self.confirm_score = confirm_score
@@ -46,9 +50,25 @@ class TargetTracker:
         self.min_navigate_steps_before_stop = min_navigate_steps_before_stop
         self.history_size = history_size
 
+        self.stop_evidence_threshold = stop_evidence_threshold
+        self.stop_evidence_decay = stop_evidence_decay
+        self.verifier_bonus = verifier_bonus
+        self.verifier_penalty = verifier_penalty
+
         self.confirm_count = 0
         self.lost_count = 0
         self.navigate_count = 0
+
+        self.stop_evidence_score = 0.0
+        self.instant_stop_evidence = 0.0
+        self.near_target_count = 0
+        self.front_stop_count = 0
+        self.down_stop_count = 0
+        self.verified_count = 0
+        self.verifier_reject_count = 0
+        self.hard_reject_count = 0
+        self.last_verified_step = -1
+        self.last_hard_reject_step = -1
 
         self.last_observation = None
         self.last_horizontal_observation = None
@@ -62,6 +82,17 @@ class TargetTracker:
         self.confirm_count = 0
         self.lost_count = 0
         self.navigate_count = 0
+
+        self.stop_evidence_score = 0.0
+        self.instant_stop_evidence = 0.0
+        self.near_target_count = 0
+        self.front_stop_count = 0
+        self.down_stop_count = 0
+        self.verified_count = 0
+        self.verifier_reject_count = 0
+        self.hard_reject_count = 0
+        self.last_verified_step = -1
+        self.last_hard_reject_step = -1
 
         self.last_observation = None
         self.last_horizontal_observation = None
@@ -110,6 +141,9 @@ class TargetTracker:
         elif down_candidate:
             self.lost_count = 0
             self.last_observation = observation
+
+            # Downward observation is useful as near-target evidence, but it
+            # should not create a horizontal target track by itself.
             self.confirm_count = max(0, self.confirm_count - 1)
 
         else:
@@ -130,10 +164,14 @@ class TargetTracker:
         else:
             self.navigate_count = 0
 
-        geometric_stop_ready = self.is_stop_ready(
+        stop_evidence = self.update_stop_evidence(
             observation=observation,
             confirmed=geometric_confirmed,
             current_pose=current_pose
+        )
+
+        geometric_stop_ready = self.is_stop_ready_from_evidence(
+            confirmed=geometric_confirmed
         )
 
         if horizontal_candidate:
@@ -154,7 +192,7 @@ class TargetTracker:
         self.last_planner_target = planner_target
 
         if geometric_stop_ready:
-            reason = "geometric target track satisfies stop condition, waiting for verification"
+            reason = "multi-evidence target stop condition satisfied"
         elif geometric_confirmed:
             reason = "stable horizontal gdino target geometrically confirmed"
         elif horizontal_candidate and consistent:
@@ -185,6 +223,15 @@ class TargetTracker:
             "navigate_count": self.navigate_count,
             "stable_target_position": self.stable_target_position,
             "stable_target_score": round(self.stable_target_score, 3),
+            "stop_evidence": stop_evidence,
+            "stop_evidence_score": round(self.stop_evidence_score, 3),
+            "instant_stop_evidence": round(self.instant_stop_evidence, 3),
+            "near_target_count": self.near_target_count,
+            "front_stop_count": self.front_stop_count,
+            "down_stop_count": self.down_stop_count,
+            "verified_count": self.verified_count,
+            "verifier_reject_count": self.verifier_reject_count,
+            "hard_reject_count": self.hard_reject_count,
             "observation": observation,
             "planner_target": planner_target,
             "reason": reason,
@@ -204,48 +251,334 @@ class TargetTracker:
 
         verification_checked = bool(verification_info.get("checked", False))
         verified = bool(verification_info.get("verified", False))
-        geometric_confirmed = bool(new_info.get("geometric_confirmed", new_info.get("confirmed", False)))
-        geometric_stop_ready = bool(new_info.get("geometric_stop_ready", new_info.get("stop_ready", False)))
+        hard_reject = bool(verification_info.get("hard_reject", False))
 
-        new_info["verified"] = verified
+        geometric_confirmed = bool(
+            new_info.get("geometric_confirmed", new_info.get("confirmed", False))
+        )
 
-        if verified and geometric_confirmed:
-            new_info["confirmed"] = True
-            new_info["stop_ready"] = geometric_stop_ready
-            new_info["reason"] = (
-                "verified target, "
-                + str(verification_info.get("reason", new_info.get("reason", "")))
-            )
-            return new_info
+        step_num = int(new_info.get("observation", {}).get("step_num", -1))
 
-        if verification_checked and geometric_confirmed and not verified:
+        if hard_reject and geometric_confirmed:
+            self.hard_reject_count += 1
+            self.last_hard_reject_step = step_num
             self.reject_current_track(
-                reason=verification_info.get("reason", "target rejected by verifier")
+                reason=verification_info.get("reason", "hard rejected by verifier")
             )
+
+            new_info["verified"] = False
             new_info["confirmed"] = False
             new_info["stop_ready"] = False
+            new_info["geometric_stop_ready"] = False
             new_info["planner_target"] = self.default_planner_target()
             new_info["candidate"] = False
+            new_info["stop_evidence_score"] = round(self.stop_evidence_score, 3)
+            new_info["instant_stop_evidence"] = round(self.instant_stop_evidence, 3)
             new_info["reason"] = (
-                "target rejected by verifier: "
+                "target hard rejected by verifier: "
                 + str(verification_info.get("reason", "not verified"))
             )
             return new_info
 
-        new_info["confirmed"] = False
-        new_info["stop_ready"] = False
+        if verification_checked and geometric_confirmed and verified:
+            self.verified_count += 1
+            self.verifier_reject_count = 0
+            self.last_verified_step = step_num
+            self.stop_evidence_score += self.verifier_bonus
+            self.stop_evidence_score = min(6.0, self.stop_evidence_score)
+
+            new_info["verified"] = True
+            new_info["reason"] = (
+                "verified target evidence added, "
+                + str(verification_info.get("reason", new_info.get("reason", "")))
+            )
+
+        elif verification_checked and geometric_confirmed and not verified:
+            # Ordinary negative verification is no longer a hard gate.
+            # It only lowers stop evidence, because crop captions can be empty
+            # and VLM verification can be overly conservative.
+            self.verifier_reject_count += 1
+            self.stop_evidence_score -= self.verifier_penalty
+            self.stop_evidence_score = max(0.0, self.stop_evidence_score)
+
+            new_info["verified"] = False
+            new_info["reason"] = (
+                "target not verified but track preserved: "
+                + str(verification_info.get("reason", "not verified"))
+            )
+
+        else:
+            new_info["verified"] = False
+
+        stop_ready = self.is_stop_ready_from_evidence(
+            confirmed=geometric_confirmed
+        )
+
+        if stop_ready:
+            new_info["planner_target"] = self.build_stop_target_from_info(new_info)
+
+        new_info["confirmed"] = geometric_confirmed
+        new_info["stop_ready"] = stop_ready
+        new_info["geometric_stop_ready"] = stop_ready
+        new_info["stop_evidence_score"] = round(self.stop_evidence_score, 3)
+        new_info["instant_stop_evidence"] = round(self.instant_stop_evidence, 3)
+        new_info["near_target_count"] = self.near_target_count
+        new_info["front_stop_count"] = self.front_stop_count
+        new_info["down_stop_count"] = self.down_stop_count
+        new_info["verified_count"] = self.verified_count
+        new_info["verifier_reject_count"] = self.verifier_reject_count
+        new_info["hard_reject_count"] = self.hard_reject_count
+
         return new_info
 
     def reject_current_track(self, reason=""):
         self.confirm_count = 0
         self.navigate_count = 0
         self.lost_count = 0
+
+        self.stop_evidence_score = 0.0
+        self.instant_stop_evidence = 0.0
+        self.near_target_count = 0
+        self.front_stop_count = 0
+        self.down_stop_count = 0
+        self.verified_count = 0
+        self.verifier_reject_count = 0
+
         self.last_observation = None
         self.last_horizontal_observation = None
         self.last_planner_target = None
+
         self.stable_target_position = None
         self.stable_target_score = 0.0
         self.horizontal_history = []
+
+    def update_stop_evidence(self, observation, confirmed, current_pose):
+        evidence = {
+            "position": 0.0,
+            "front": 0.0,
+            "down": 0.0,
+            "stability": 0.0,
+            "penalty": 0.0,
+            "total": 0.0,
+            "ready": False,
+        }
+
+        if not confirmed or self.stable_target_position is None:
+            self.instant_stop_evidence = 0.0
+            self.stop_evidence_score *= self.stop_evidence_decay
+            self.stop_evidence_score = max(0.0, self.stop_evidence_score)
+            return evidence
+
+        if self.navigate_count < self.min_navigate_steps_before_stop:
+            self.instant_stop_evidence = 0.0
+            self.stop_evidence_score *= self.stop_evidence_decay
+            self.stop_evidence_score = max(0.0, self.stop_evidence_score)
+            return evidence
+
+        current_xy = (float(current_pose[0]), float(current_pose[1]))
+        distance_to_stable_target = self.xy_distance(
+            p1=current_xy,
+            p2=self.stable_target_position
+        )
+
+        if distance_to_stable_target <= self.stop_position_distance:
+            evidence["position"] += 1.25
+            self.near_target_count += 1
+        elif distance_to_stable_target <= self.stop_position_distance * 1.5:
+            evidence["position"] += 0.65
+        else:
+            self.near_target_count = max(0, self.near_target_count - 1)
+
+        if self.is_reasonable_front_stop_observation(observation):
+            evidence["front"] += 1.0
+            self.front_stop_count += 1
+
+            if abs(observation.get("center_offset_x", 0.0)) <= 0.45:
+                evidence["front"] += 0.35
+
+            if observation.get("area_ratio", 0.0) >= self.stop_area_ratio:
+                evidence["front"] += 0.35
+
+            estimated_depth = observation.get("estimated_depth", None)
+            if estimated_depth is not None and estimated_depth <= self.stop_depth:
+                evidence["front"] += 0.75
+        else:
+            self.front_stop_count = max(0, self.front_stop_count - 1)
+
+        down_observation = self.get_best_down_observation(
+            observation.get("all_observations", [])
+        )
+
+        if down_observation is not None:
+            evidence["down"] += 0.55
+            self.down_stop_count += 1
+
+            down_depth = down_observation.get("estimated_depth", None)
+            if down_depth is not None and down_depth <= self.stop_depth:
+                evidence["down"] += 0.45
+        else:
+            self.down_stop_count = max(0, self.down_stop_count - 1)
+
+        if self.is_track_spatially_stable():
+            evidence["stability"] += 0.55
+
+        if observation.get("full_frame_like_box", False):
+            evidence["penalty"] -= 1.5
+
+        if observation.get("area_ratio", 0.0) > self.max_stop_area_ratio:
+            evidence["penalty"] -= 0.8
+
+        if self.verifier_reject_count > 0:
+            evidence["penalty"] -= min(0.8, 0.25 * self.verifier_reject_count)
+
+        instant = (
+            evidence["position"]
+            + evidence["front"]
+            + evidence["down"]
+            + evidence["stability"]
+            + evidence["penalty"]
+        )
+
+        instant = max(0.0, instant)
+
+        self.instant_stop_evidence = instant
+        self.stop_evidence_score = (
+            self.stop_evidence_score * self.stop_evidence_decay
+            + instant
+        )
+        self.stop_evidence_score = max(0.0, min(6.0, self.stop_evidence_score))
+
+        evidence["total"] = round(instant, 3)
+        evidence["ready"] = self.is_stop_ready_from_evidence(
+            confirmed=confirmed
+        )
+
+        return evidence
+
+    def is_stop_ready_from_evidence(self, confirmed):
+        if not confirmed:
+            return False
+
+        if self.stable_target_position is None:
+            return False
+
+        if self.navigate_count < self.min_navigate_steps_before_stop:
+            return False
+
+        if self.hard_reject_count > 0 and self.last_hard_reject_step >= 0:
+            return False
+
+        if self.stop_evidence_score >= self.stop_evidence_threshold:
+            return True
+
+        return False
+
+    def is_reasonable_front_stop_observation(self, observation):
+        if not observation.get("valid", False):
+            return False
+
+        if observation.get("camera_region", "unknown") != "front":
+            return False
+
+        if observation.get("score", 0.0) < self.stop_score:
+            return False
+
+        if observation.get("full_frame_like_box", False):
+            return False
+
+        if observation.get("area_ratio", 0.0) > self.max_stop_area_ratio:
+            return False
+
+        if abs(observation.get("center_offset_x", 0.0)) > 0.65:
+            return False
+
+        return True
+
+    def get_best_down_observation(self, observations):
+        if not isinstance(observations, list):
+            return None
+
+        candidates = []
+
+        for observation in observations:
+            if not observation.get("valid", False):
+                continue
+
+            if observation.get("camera_region", "unknown") != "down":
+                continue
+
+            if observation.get("score", 0.0) < self.confirm_score:
+                continue
+
+            if observation.get("full_frame_like_box", False):
+                continue
+
+            if observation.get("area_ratio", 0.0) < self.min_area_ratio:
+                continue
+
+            candidates.append(observation)
+
+        if len(candidates) == 0:
+            return None
+
+        candidates.sort(
+            key=lambda item: item.get("quality_score", 0.0),
+            reverse=True
+        )
+
+        return candidates[0]
+
+    def is_track_spatially_stable(self):
+        if len(self.horizontal_history) < 2:
+            return False
+
+        recent = self.horizontal_history[-min(3, len(self.horizontal_history)):]
+        positions = []
+
+        for item in recent:
+            position = item.get("position", None)
+            if position is not None:
+                positions.append(position)
+
+        if len(positions) < 2:
+            return False
+
+        mean_x = sum([p[0] for p in positions]) / len(positions)
+        mean_y = sum([p[1] for p in positions]) / len(positions)
+
+        max_distance = 0.0
+
+        for position in positions:
+            distance = self.xy_distance(
+                p1=position,
+                p2=(mean_x, mean_y)
+            )
+            max_distance = max(max_distance, distance)
+
+        if max_distance <= self.max_consistency_distance * 0.5:
+            return True
+
+        return False
+
+    def build_stop_target_from_info(self, tracker_info):
+        planner_target = tracker_info.get("planner_target", None)
+
+        if isinstance(planner_target, dict) and planner_target.get("valid", False):
+            stop_target = dict(planner_target)
+        else:
+            stop_target = self.default_planner_target()
+
+        stop_target["valid"] = True
+        stop_target["target_type"] = "gdino_stop"
+        stop_target["position"] = stop_target.get("position", None)
+        stop_target["viewpoint_position"] = stop_target.get("viewpoint_position", None)
+        stop_target["target_world_position"] = self.stable_target_position
+        stop_target["distance"] = 0.0
+        stop_target["relative_angle"] = 0.0
+        stop_target["relative_region"] = "front"
+        stop_target["stop_reason"] = "multi-evidence target stop"
+
+        return stop_target
 
     def parse_grounding_result(self, grounding_result, current_pose, depth_info=None, step_num=0):
         default_observation = self.default_observation(step_num=step_num)
@@ -286,6 +619,7 @@ class TargetTracker:
 
         best_observation = observations[0]
         best_observation["all_observation_count"] = len(observations)
+        best_observation["all_observations"] = observations
 
         return best_observation
 
@@ -399,6 +733,8 @@ class TargetTracker:
             "touches_border_count": touches_border_count,
             "abnormal_large_box": abnormal_large_box,
             "full_frame_like_box": full_frame_like_box,
+            "all_observation_count": 0,
+            "all_observations": [],
             "reason": "ok"
         })
 
@@ -555,47 +891,6 @@ class TargetTracker:
                 "estimated_depth": observation.get("estimated_depth", None),
             })
 
-    def is_stop_ready(self, observation, confirmed, current_pose):
-        if not confirmed:
-            return False
-
-        if self.navigate_count < self.min_navigate_steps_before_stop:
-            return False
-
-        if self.stable_target_position is None:
-            return False
-
-        if observation.get("camera_region", "unknown") != "front":
-            return False
-
-        if observation.get("score", 0.0) < self.stop_score:
-            return False
-
-        if observation.get("full_frame_like_box", False):
-            return False
-
-        if observation.get("area_ratio", 0.0) > self.max_stop_area_ratio:
-            return False
-
-        if abs(observation.get("center_offset_x", 0.0)) > 0.45:
-            return False
-
-        current_xy = (float(current_pose[0]), float(current_pose[1]))
-        distance_to_stable_target = self.xy_distance(
-            p1=current_xy,
-            p2=self.stable_target_position
-        )
-
-        if distance_to_stable_target <= self.stop_position_distance:
-            return True
-
-        estimated_depth = observation.get("estimated_depth", None)
-        if estimated_depth is not None and estimated_depth <= self.stop_depth:
-            if observation.get("area_ratio", 0.0) >= self.stop_area_ratio:
-                return True
-
-        return False
-
     def build_planner_target(self, observation, current_pose, confirmed=False, stop_ready=False):
         if not observation.get("valid", False):
             return self.default_planner_target()
@@ -622,7 +917,7 @@ class TargetTracker:
                 "bbox": observation.get("bbox", None),
                 "area_ratio": observation.get("area_ratio", 0.0),
                 "estimated_depth": observation.get("estimated_depth", None),
-                "stop_reason": "verified gdino target stop",
+                "stop_reason": "multi-evidence target stop",
             }
 
         if confirmed and self.stable_target_position is not None:
@@ -907,6 +1202,7 @@ class TargetTracker:
             "abnormal_large_box": False,
             "full_frame_like_box": False,
             "all_observation_count": 0,
+            "all_observations": [],
             "reason": "",
         }
 

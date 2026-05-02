@@ -35,27 +35,46 @@ class NavigationState:
         geometric_confirmed = bool(
             tracker_info.get("geometric_confirmed", tracker_info.get("confirmed", False))
         )
-        verified = bool(tracker_info.get("verified", False))
         confirmed = bool(tracker_info.get("confirmed", False))
+        verified = bool(tracker_info.get("verified", False))
         stop_ready = bool(tracker_info.get("stop_ready", False))
         lost_count = int(tracker_info.get("lost_count", 0))
         planner_target = tracker_info.get("planner_target", None)
+        verification = tracker_info.get("verification", {})
 
-        if stop_ready and verified:
+        verification_checked = False
+        hard_reject = False
+
+        if isinstance(verification, dict):
+            verification_checked = bool(verification.get("checked", False))
+            hard_reject = bool(verification.get("hard_reject", False))
+
+        # Stop is no longer gated by verified=True only.
+        # The stop gate is multi-evidence based and maintained by TargetTracker.
+        if stop_ready and confirmed and not hard_reject:
             self.mode = self.MODE_STOP
-            self.last_reason = tracker_info.get("reason", "verified target stop condition satisfied")
-        elif verified and confirmed and self.is_valid_planner_target(planner_target):
+            self.last_reason = tracker_info.get("reason", "multi-evidence target stop condition satisfied")
+
+        elif confirmed and self.is_valid_planner_target(planner_target) and not hard_reject:
             self.mode = self.MODE_NAVIGATE
-            self.last_reason = tracker_info.get("reason", "target verified")
-        elif geometric_confirmed and not verified:
+            self.last_reason = tracker_info.get("reason", "target geometrically confirmed")
+
+        elif geometric_confirmed and verification_checked and not verified and hard_reject:
+            self.mode = self.MODE_EXPLORE
+            self.last_reason = tracker_info.get("reason", "target hard rejected by verifier")
+
+        elif geometric_confirmed and not self.is_valid_planner_target(planner_target):
             self.mode = self.MODE_VERIFY
             self.last_reason = tracker_info.get("reason", "target candidate requires verification")
+
         elif candidate and self.is_valid_planner_target(planner_target):
             self.mode = self.MODE_CONFIRM
             self.last_reason = tracker_info.get("reason", "target candidate detected")
+
         elif self.prev_mode in [self.MODE_CONFIRM, self.MODE_VERIFY, self.MODE_NAVIGATE] and lost_count > 0 and lost_count <= self.recover_steps:
             self.mode = self.MODE_RECOVER
             self.last_reason = tracker_info.get("reason", "target temporarily lost")
+
         else:
             self.mode = self.MODE_EXPLORE
             self.last_reason = tracker_info.get("reason", "no reliable target candidate")
