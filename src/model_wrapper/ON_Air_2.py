@@ -445,18 +445,39 @@ class ONAir(BaseModelWrapper):
         mode = navigation_info.get("mode", "explore")
         planner_target = navigation_info.get("planner_target", None)
 
+        if isinstance(planner_target, dict):
+            if planner_target.get("target_type", "") in [
+                "verified_target_stop",
+                "gdino_stop",
+                "gdino_verified_stop",
+                "gdino_position_stop"
+            ]:
+                self.memory_targets[index] = planner_target
+                return "stop", 0, True, planner_target
+
         if mode == NavigationState.MODE_STOP:
             stop_target = self.default_memory_target()
-            stop_target["target_type"] = "gdino_verified_stop"
+            stop_target["target_type"] = "verified_target_stop"
             stop_target["valid"] = True
             stop_target["position"] = self.get_current_xy(index)
             stop_target["viewpoint_position"] = self.get_current_xy(index)
-            stop_target["stop_reason"] = navigation_info.get("reason", "verified gdino stop")
+            stop_target["target_world_position"] = None
+
+            tracker_info = navigation_info.get("tracker_info", {})
+            if isinstance(tracker_info, dict):
+                stop_target["target_world_position"] = tracker_info.get("verified_target_position", None)
+
+            stop_target["stop_reason"] = navigation_info.get(
+                "reason",
+                "reached verified target object position"
+            )
             self.memory_targets[index] = stop_target
             return "stop", 0, True, stop_target
 
+        # AirHunt-style rule:
+        # CONFIRM / VERIFY only collect and verify object candidates.
+        # They must not directly execute unverified GDINO targets.
         if mode in [
-            NavigationState.MODE_CONFIRM,
             NavigationState.MODE_NAVIGATE,
             NavigationState.MODE_RECOVER
         ]:
@@ -507,8 +528,29 @@ class ONAir(BaseModelWrapper):
         return action, value, done, self.default_memory_target()
 
     def target_to_legacy_action(self, target, semantic_result, fixed):
-        relative_region = target.get("relative_region", "front")
         target_type = target.get("target_type", "memory")
+
+        if target_type in [
+            "verified_target_stop",
+            "gdino_stop",
+            "gdino_verified_stop",
+            "gdino_position_stop"
+        ]:
+            return "stop", 0, True
+
+        if target.get("stop_reason", ""):
+            return "stop", 0, True
+
+        relative_region = target.get("relative_region", "front")
+        relative_angle = target.get("relative_angle", 0.0)
+        safety_value = target.get("safety_value", 0.5)
+        target_score = target.get("score", 0.0)
+
+        if safety_value < 0.20 and not target_type.startswith("gdino") and not target_type.startswith("verified"):
+            if fixed:
+                return "rotl", 0, False
+            else:
+                return "rotl", 30, False
 
         if relative_region == "front":
             action = "forward"
@@ -516,24 +558,26 @@ class ONAir(BaseModelWrapper):
             action = "left"
         elif relative_region == "right":
             action = "right"
-        elif relative_region == "back_right":
-            action = "rotr"
         elif relative_region == "back_left":
             action = "rotl"
+        elif relative_region == "back_right":
+            action = "rotr"
         else:
             action = "forward"
 
         if fixed:
             value = 0
         else:
-            if target_type.startswith("gdino"):
+            if action in ["rotl", "rotr"]:
+                value = min(60, max(15, abs(relative_angle)))
+            elif target_type.startswith("gdino") or target_type.startswith("verified"):
                 value = self.estimate_target_step_size(target)
             else:
                 value = self.estimate_unfixed_step_size(
-                    region_score=float(target.get("semantic_value", 0.4)),
-                    safety_score=float(target.get("safety_value", 0.5)),
+                    region_score=target_score,
+                    safety_score=safety_value,
                     target_visible=False,
-                    target_confidence=float(target.get("confidence", 0.0))
+                    target_confidence=0.0
                 )
 
         return action, value, False
@@ -837,20 +881,24 @@ class ONAir(BaseModelWrapper):
             "[TargetTracker] "
             f"Episode {index}: "
             f"candidate={tracker_info.get('candidate', False)}, "
-            f"geo_confirmed={tracker_info.get('geometric_confirmed', False)}, "
+            f"verify_required={tracker_info.get('verification_required', False)}, "
+            f"confirmed={tracker_info.get('confirmed', False)}, "
             f"verified={tracker_info.get('verified', False)}, "
             f"stop={tracker_info.get('stop_ready', False)}, "
             f"score={observation.get('score', 0.0):.3f}, "
             f"count={tracker_info.get('confirm_count', 0)}/{tracker_info.get('required_count', 0)}, "
             f"lost={tracker_info.get('lost_count', 0)}, "
+            f"nav_count={tracker_info.get('navigate_count', 0)}, "
             f"image={observation.get('image_index', -1)}, "
             f"region={observation.get('camera_region', 'none')}, "
             f"rel_region={observation.get('relative_region', 'front')}, "
             f"angle={observation.get('relative_angle', 0.0)}, "
             f"area={observation.get('area_ratio', 0.0)}, "
             f"depth={observation.get('estimated_depth', None)}, "
+            f"buffer={tracker_info.get('candidate_buffer_size', 0)}, "
+            f"verified_id={tracker_info.get('verified_candidate_id', None)}, "
             f"target={planner_target.get('position', None)}, "
-            f"stable={tracker_info.get('stable_target_position', None)}"
+            f"verified_pos={tracker_info.get('verified_target_position', None)}"
         )
 
     def print_target_verification(self, index, verification_info):

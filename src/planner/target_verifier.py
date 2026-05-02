@@ -8,13 +8,15 @@ class TargetVerifier:
         self,
         client=None,
         model="gpt-4.1-mini",
-        verification_threshold=0.60,
-        hard_reject_large_area=0.80,
-        small_object_large_area=0.45,
+        verification_threshold=0.58,
+        max_candidates=6,
+        hard_reject_large_area=0.85,
+        small_object_large_area=0.18,
     ):
         self.client = client
         self.model = model
         self.verification_threshold = verification_threshold
+        self.max_candidates = max_candidates
         self.hard_reject_large_area = hard_reject_large_area
         self.small_object_large_area = small_object_large_area
 
@@ -56,39 +58,34 @@ class TargetVerifier:
         encode_image_fn=None,
         generate_caption_fn=None,
     ):
-        observation = tracker_info.get("observation", {})
-        planner_target = tracker_info.get("planner_target", {})
+        if tracker_info is None:
+            tracker_info = {}
 
-        default_info = self.default_result(
-            checked=False,
-            verified=False,
-            confidence=0.0,
-            reason="verification not triggered"
+        if not tracker_info.get("verification_required", False):
+            return self.default_result(
+                checked=False,
+                verified=False,
+                reason="verification not required"
+            )
+
+        candidates = tracker_info.get("verification_candidates", [])
+        candidates = self.filter_candidates(
+            candidates=candidates,
+            object_size=object_size
         )
 
-        if not tracker_info.get("confirmed", False):
-            return default_info
-
-        if not isinstance(observation, dict) or not observation.get("valid", False):
+        if len(candidates) == 0:
             return self.default_result(
                 checked=True,
                 verified=False,
-                confidence=0.0,
-                reason="invalid detection observation",
-                hard_reject=True
+                reason="no valid task-aware object candidates"
             )
 
-        hard_reject_info = self.hard_reject(
-            object_name=object_name,
-            object_size=object_size,
-            observation=observation
-        )
-        if hard_reject_info["hard_reject"]:
-            return hard_reject_info
+        candidates = candidates[:self.max_candidates]
 
-        crop_caption = self.generate_candidate_crop_caption(
+        candidates = self.attach_crop_captions(
+            candidates=candidates,
             rgb_images=rgb_images,
-            observation=observation,
             encode_image_fn=encode_image_fn,
             generate_caption_fn=generate_caption_fn
         )
@@ -97,9 +94,8 @@ class TargetVerifier:
             return self.default_result(
                 checked=True,
                 verified=False,
-                confidence=0.0,
                 reason="target verifier client is None",
-                crop_caption=crop_caption
+                candidates=candidates
             )
 
         prompt = self.build_prompt(
@@ -107,9 +103,7 @@ class TargetVerifier:
             object_size=object_size,
             description=description,
             captions4=captions4,
-            observation=observation,
-            planner_target=planner_target,
-            crop_caption=crop_caption,
+            candidates=candidates,
             semantic_result=semantic_result
         )
 
@@ -132,124 +126,154 @@ class TargetVerifier:
             text = response.choices[0].message.content.strip()
             parsed = self.parse_json_result(text)
 
-            verified = bool(parsed.get("verified", False))
+            selected_candidate_id = parsed.get("selected_candidate_id", None)
             confidence = self.normalize_score(parsed.get("confidence", 0.0))
-            same_object = bool(parsed.get("same_object", False))
-            reject_reason = parsed.get("reject_reason", "")
             reason = parsed.get("reason", "")
+            reject_reason = parsed.get("reject_reason", "")
 
-            if confidence < self.verification_threshold:
-                verified = False
+            valid_ids = set([candidate["candidate_id"] for candidate in candidates])
 
-            if not same_object:
-                verified = False
+            verified = (
+                selected_candidate_id in valid_ids
+                and confidence >= self.verification_threshold
+            )
 
-            result = {
+            if not verified:
+                selected_candidate_id = None
+
+            selected_candidate = None
+            if selected_candidate_id is not None:
+                selected_candidate = self.find_candidate(
+                    candidates=candidates,
+                    candidate_id=selected_candidate_id
+                )
+
+            return {
                 "checked": True,
                 "verified": verified,
                 "confidence": confidence,
-                "same_object": same_object,
+                "same_object": verified,
+                "selected_candidate_id": selected_candidate_id,
+                "selected_candidate": selected_candidate,
                 "reason": reason,
                 "reject_reason": reject_reason,
-                "crop_caption": crop_caption,
-                "raw_response": text,
                 "hard_reject": False,
+                "candidate_count": len(candidates),
+                "candidates": candidates,
+                "raw_response": text,
                 "verification_threshold": self.verification_threshold,
             }
-
-            return result
 
         except Exception as e:
             return self.default_result(
                 checked=True,
                 verified=False,
-                confidence=0.0,
                 reason=f"target verification failed: {e}",
-                crop_caption=crop_caption
+                candidates=candidates
             )
 
-    def hard_reject(self, object_name, object_size, observation):
-        camera_region = observation.get("camera_region", "unknown")
-        area_ratio = float(observation.get("area_ratio", 0.0))
-        full_frame_like_box = bool(observation.get("full_frame_like_box", False))
-        abnormal_large_box = bool(observation.get("abnormal_large_box", False))
-
-        if camera_region == "down":
-            return self.default_result(
-                checked=True,
-                verified=False,
-                confidence=0.0,
-                reason="downward view detection is not accepted as verified target",
-                hard_reject=True
-            )
-
-        if full_frame_like_box:
-            return self.default_result(
-                checked=True,
-                verified=False,
-                confidence=0.0,
-                reason="full-frame-like detection is rejected",
-                hard_reject=True
-            )
-
-        if area_ratio >= self.hard_reject_large_area:
-            return self.default_result(
-                checked=True,
-                verified=False,
-                confidence=0.0,
-                reason="bbox area is too large and likely not a localized object",
-                hard_reject=True
-            )
+    def filter_candidates(self, candidates, object_size):
+        if not isinstance(candidates, list):
+            return []
 
         size_level = self.parse_size_level(object_size)
-        if size_level == "small" and area_ratio >= self.small_object_large_area:
-            return self.default_result(
-                checked=True,
-                verified=False,
-                confidence=0.0,
-                reason="small target has an unusually large bbox",
-                hard_reject=True
-            )
+        valid_candidates = []
 
-        return self.default_result(
-            checked=False,
-            verified=False,
-            confidence=0.0,
-            reason="not hard rejected",
-            hard_reject=False
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+
+            if candidate.get("target_world_position", None) is None:
+                continue
+
+            if candidate.get("camera_region", "unknown") not in ["front", "left", "right"]:
+                continue
+
+            if bool(candidate.get("full_frame_like_box", False)):
+                continue
+
+            area_ratio = float(candidate.get("area_ratio", 0.0))
+
+            if area_ratio >= self.hard_reject_large_area:
+                continue
+
+            if size_level == "small" and area_ratio >= self.small_object_large_area:
+                continue
+
+            valid_candidates.append(candidate)
+
+        valid_candidates.sort(
+            key=lambda item: item.get("candidate_quality", 0.0),
+            reverse=True
         )
 
-    def generate_candidate_crop_caption(
+        return valid_candidates
+
+    def attach_crop_captions(
         self,
+        candidates,
         rgb_images,
-        observation,
         encode_image_fn=None,
         generate_caption_fn=None
     ):
         if encode_image_fn is None or generate_caption_fn is None:
-            return ""
+            return candidates
+
+        crops = []
+        crop_indices = []
+
+        for idx, candidate in enumerate(candidates):
+            crop = self.build_candidate_crop(
+                rgb_images=rgb_images,
+                candidate=candidate
+            )
+
+            if crop is None:
+                continue
+
+            crops.append(crop)
+            crop_indices.append(idx)
+
+        if len(crops) == 0:
+            return candidates
 
         try:
-            image_index = int(observation.get("image_index", -1))
-            bbox = observation.get("bbox", None)
+            crop_b64 = encode_image_fn(crops)
+            crop_captions = generate_caption_fn(crop_b64)
+
+            if not isinstance(crop_captions, list):
+                return candidates
+
+            for idx, caption in zip(crop_indices, crop_captions):
+                candidates[idx]["crop_caption"] = str(caption)
+
+        except Exception as e:
+            for idx in crop_indices:
+                candidates[idx]["crop_caption"] = f"crop caption failed: {e}"
+
+        return candidates
+
+    def build_candidate_crop(self, rgb_images, candidate):
+        try:
+            image_index = int(candidate.get("image_index", -1))
+            bbox = candidate.get("bbox", None)
 
             if image_index < 0 or image_index >= len(rgb_images):
-                return ""
+                return None
 
             if bbox is None or len(bbox) != 4:
-                return ""
+                return None
 
-            image = rgb_images[image_index]
-            image = self.to_pil_image(image)
+            image = self.to_pil_image(rgb_images[image_index])
 
             if image is None:
-                return ""
+                return None
 
             width, height = image.size
             x1, y1, x2, y2 = [float(v) for v in bbox]
 
-            pad_x = max(4.0, (x2 - x1) * 0.10)
-            pad_y = max(4.0, (y2 - y1) * 0.10)
+            pad_x = max(6.0, (x2 - x1) * 0.20)
+            pad_y = max(6.0, (y2 - y1) * 0.20)
 
             x1 = max(0, int(x1 - pad_x))
             y1 = max(0, int(y1 - pad_y))
@@ -257,19 +281,13 @@ class TargetVerifier:
             y2 = min(height, int(y2 + pad_y))
 
             if x2 <= x1 or y2 <= y1:
-                return ""
+                return None
 
             crop = image.crop((x1, y1, x2, y2))
-            crop_b64 = encode_image_fn([crop])
-            captions = generate_caption_fn(crop_b64)
+            return crop
 
-            if isinstance(captions, list) and len(captions) > 0:
-                return str(captions[0])
-
-            return ""
-
-        except Exception as e:
-            return f"crop caption failed: {e}"
+        except Exception:
+            return None
 
     def to_pil_image(self, image):
         if isinstance(image, Image.Image):
@@ -282,11 +300,13 @@ class TargetVerifier:
 
     def system_prompt(self):
         return (
-            "You are an object verification module for UAV object navigation. "
-            "A detector has proposed a candidate object, but the detector may hallucinate, "
-            "misclassify background textures, or produce overly large boxes. "
-            "Your job is to decide whether the candidate truly matches the target instruction. "
-            "Be conservative: if the evidence is weak, ambiguous, or only the detector phrase matches, reject it."
+            "You are the object verification module for an aerial object navigation system. "
+            "The detector may hallucinate objects or misclassify background textures. "
+            "You will receive several detected object candidates with crop captions, "
+            "camera regions, bounding boxes, detector scores, and estimated 3D positions. "
+            "Your task is to select exactly one candidate only if it truly matches the target instruction. "
+            "If none of the candidates clearly match the target object, return null. "
+            "Do not decide whether the drone should stop. Only verify the target object."
         )
 
     def build_prompt(
@@ -295,9 +315,7 @@ class TargetVerifier:
         object_size,
         description,
         captions4,
-        observation,
-        planner_target,
-        crop_caption,
+        candidates,
         semantic_result=None
     ):
         if captions4 is None:
@@ -308,6 +326,25 @@ class TargetVerifier:
 
         if semantic_result is None:
             semantic_result = {}
+
+        candidate_lines = []
+
+        for candidate in candidates:
+            candidate_lines.append(
+                {
+                    "candidate_id": candidate.get("candidate_id", ""),
+                    "phrase": candidate.get("phrase", ""),
+                    "detector_score": candidate.get("score", 0.0),
+                    "camera_region": candidate.get("camera_region", "unknown"),
+                    "image_index": candidate.get("image_index", -1),
+                    "bbox": candidate.get("bbox", None),
+                    "area_ratio": candidate.get("area_ratio", 0.0),
+                    "estimated_depth": candidate.get("estimated_depth", None),
+                    "target_world_position": candidate.get("target_world_position", None),
+                    "relative_region": candidate.get("relative_region", "front"),
+                    "crop_caption": candidate.get("crop_caption", ""),
+                }
+            )
 
         prompt = f"""
 Target instruction:
@@ -321,45 +358,29 @@ Four-view scene captions:
 - Right: {captions4[2]}
 - Down: {captions4[3]}
 
-Detector candidate:
-- phrase: {observation.get("phrase", "")}
-- detector_score: {observation.get("score", 0.0)}
-- camera_region: {observation.get("camera_region", "unknown")}
-- image_index: {observation.get("image_index", -1)}
-- bbox: {observation.get("bbox", None)}
-- area_ratio: {observation.get("area_ratio", 0.0)}
-- center_offset_x: {observation.get("center_offset_x", 0.0)}
-- estimated_depth: {observation.get("estimated_depth", None)}
-- relative_region: {observation.get("relative_region", "front")}
-- target_world_position: {observation.get("target_world_position", None)}
+Candidate object list:
+{json.dumps(candidate_lines, ensure_ascii=False, indent=2)}
 
-Candidate crop caption:
-- {crop_caption}
-
-Planner target:
-- {planner_target}
-
-Current semantic reasoning result:
+Semantic reasoning result:
 - target_visible: {semantic_result.get("target_visible", False)}
 - target_confidence: {semantic_result.get("target_confidence", 0.0)}
 - reason: {semantic_result.get("reason", "")}
 - evidence: {semantic_result.get("evidence", [])}
 
-Verification rules:
-1. Verify only if the candidate appears to be the exact target described by the instruction.
-2. Reject if the detector phrase matches but the scene/crop caption does not visually support the target.
-3. Reject if the bbox seems to cover a vague region, ground, wall, shadow, clutter, or background texture.
-4. Reject if the target is small but the bbox is very large or poorly localized.
-5. For side-view candidates, verification can be true, but it only means "navigate toward it"; it does not mean immediate stop.
-6. Be conservative. Ambiguous evidence should be rejected.
+Selection rules:
+1. Select a candidate only if the crop caption and context support that it is the exact target object.
+2. Reject candidates that look like ground, wall, roof, shadow, clutter, or a vague background region.
+3. Reject candidates whose bbox is too large for the target size or poorly localized.
+4. Side-view candidates may be selected if they clearly show the target object, but this only verifies the object; it does not mean the drone should stop.
+5. If no candidate clearly matches the instruction, return selected_candidate_id as null.
+6. Be conservative, but do not reject a clear candidate merely because the global scene caption is incomplete.
 
 Output only valid JSON:
 {{
-  "same_object": true or false,
-  "verified": true or false,
+  "selected_candidate_id": "candidate id string or null",
   "confidence": a number from 0 to 1,
   "reason": "short explanation",
-  "reject_reason": "short explanation if rejected, otherwise empty"
+  "reject_reason": "short explanation if no candidate is selected, otherwise empty"
 }}
 """
         return prompt.strip()
@@ -378,16 +399,26 @@ Output only valid JSON:
             if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
                 raw_text = raw_text[start_idx:end_idx + 1]
 
-            return json.loads(raw_text)
+            parsed = json.loads(raw_text)
+
+            if parsed.get("selected_candidate_id", None) in ["", "null", "None", "none"]:
+                parsed["selected_candidate_id"] = None
+
+            return parsed
 
         except Exception:
             return {
-                "same_object": False,
-                "verified": False,
+                "selected_candidate_id": None,
                 "confidence": 0.0,
                 "reason": "failed to parse verifier JSON",
                 "reject_reason": text
             }
+
+    def find_candidate(self, candidates, candidate_id):
+        for candidate in candidates:
+            if candidate.get("candidate_id", None) == candidate_id:
+                return candidate
+        return None
 
     def parse_size_level(self, object_size):
         if object_size is None:
@@ -419,19 +450,25 @@ Output only valid JSON:
         confidence=0.0,
         reason="",
         reject_reason="",
-        crop_caption="",
+        candidates=None,
         raw_response="",
         hard_reject=False
     ):
+        if candidates is None:
+            candidates = []
+
         return {
             "checked": checked,
             "verified": verified,
             "confidence": self.normalize_score(confidence),
             "same_object": verified,
+            "selected_candidate_id": None,
+            "selected_candidate": None,
             "reason": reason,
             "reject_reason": reject_reason,
-            "crop_caption": crop_caption,
-            "raw_response": raw_response,
             "hard_reject": hard_reject,
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "raw_response": raw_response,
             "verification_threshold": self.verification_threshold,
         }

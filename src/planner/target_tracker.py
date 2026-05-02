@@ -8,231 +8,171 @@ class TargetTracker:
         candidate_score=0.30,
         confirm_score=0.40,
         stop_score=0.55,
-        confirm_required_count=2,
         max_lost_count=3,
         min_area_ratio=0.002,
         max_reasonable_area=0.65,
-        max_stop_area_ratio=0.70,
-        stop_area_ratio=0.045,
-        stop_depth=8.0,
-        stop_position_distance=8.0,
         horizontal_fov=90.0,
-        confirm_step_distance=5.0,
-        navigate_stop_distance=6.0,
-        max_consistency_distance=12.0,
-        max_consistency_angle=45.0,
+        candidate_ttl=8,
+        max_candidate_count=24,
+        max_candidates_for_verification=6,
+        verified_target_ttl=12,
+        stop_position_distance=5.0,
+        navigate_stop_distance=5.0,
         min_navigate_steps_before_stop=1,
-        history_size=5,
-        stop_evidence_threshold=3.0,
-        stop_evidence_decay=0.65,
-        verifier_bonus=1.25,
-        verifier_penalty=0.45,
+        confirm_step_distance=3.0,
+        max_association_distance=10.0,
     ):
         self.candidate_score = candidate_score
         self.confirm_score = confirm_score
         self.stop_score = stop_score
-        self.confirm_required_count = confirm_required_count
         self.max_lost_count = max_lost_count
 
         self.min_area_ratio = min_area_ratio
         self.max_reasonable_area = max_reasonable_area
-        self.max_stop_area_ratio = max_stop_area_ratio
-        self.stop_area_ratio = stop_area_ratio
-
-        self.stop_depth = stop_depth
-        self.stop_position_distance = stop_position_distance
         self.horizontal_fov = horizontal_fov
-        self.confirm_step_distance = confirm_step_distance
+
+        self.candidate_ttl = candidate_ttl
+        self.max_candidate_count = max_candidate_count
+        self.max_candidates_for_verification = max_candidates_for_verification
+
+        self.verified_target_ttl = verified_target_ttl
+        self.stop_position_distance = stop_position_distance
         self.navigate_stop_distance = navigate_stop_distance
-
-        self.max_consistency_distance = max_consistency_distance
-        self.max_consistency_angle = max_consistency_angle
         self.min_navigate_steps_before_stop = min_navigate_steps_before_stop
-        self.history_size = history_size
+        self.confirm_step_distance = confirm_step_distance
+        self.max_association_distance = max_association_distance
 
-        self.stop_evidence_threshold = stop_evidence_threshold
-        self.stop_evidence_decay = stop_evidence_decay
-        self.verifier_bonus = verifier_bonus
-        self.verifier_penalty = verifier_penalty
+        self.candidate_buffer = []
+        self.candidate_counter = 0
 
         self.confirm_count = 0
         self.lost_count = 0
         self.navigate_count = 0
 
-        self.stop_evidence_score = 0.0
-        self.instant_stop_evidence = 0.0
-        self.near_target_count = 0
-        self.front_stop_count = 0
-        self.down_stop_count = 0
-        self.verified_count = 0
-        self.verifier_reject_count = 0
-        self.hard_reject_count = 0
-        self.last_verified_step = -1
-        self.last_hard_reject_step = -1
-
         self.last_observation = None
         self.last_horizontal_observation = None
-        self.last_planner_target = None
+        self.last_planner_target = self.default_planner_target()
 
-        self.stable_target_position = None
-        self.stable_target_score = 0.0
-        self.horizontal_history = []
+        self.verified_target = None
+        self.verified_target_position = None
+        self.verified_target_score = 0.0
+        self.verified_target_step = -1
+        self.verified_candidate_id = None
 
     def reset(self):
+        self.candidate_buffer = []
+        self.candidate_counter = 0
+
         self.confirm_count = 0
         self.lost_count = 0
         self.navigate_count = 0
 
-        self.stop_evidence_score = 0.0
-        self.instant_stop_evidence = 0.0
-        self.near_target_count = 0
-        self.front_stop_count = 0
-        self.down_stop_count = 0
-        self.verified_count = 0
-        self.verifier_reject_count = 0
-        self.hard_reject_count = 0
-        self.last_verified_step = -1
-        self.last_hard_reject_step = -1
-
         self.last_observation = None
         self.last_horizontal_observation = None
-        self.last_planner_target = None
+        self.last_planner_target = self.default_planner_target()
 
-        self.stable_target_position = None
-        self.stable_target_score = 0.0
-        self.horizontal_history = []
+        self.verified_target = None
+        self.verified_target_position = None
+        self.verified_target_score = 0.0
+        self.verified_target_step = -1
+        self.verified_candidate_id = None
 
     def update(self, grounding_result, current_pose, depth_info=None, step_num=0):
-        observation = self.parse_grounding_result(
+        observations = self.parse_grounding_result(
             grounding_result=grounding_result,
             current_pose=current_pose,
             depth_info=depth_info,
             step_num=step_num
         )
 
-        horizontal_candidate = self.is_horizontal_candidate(observation)
-        down_candidate = self.is_down_candidate(observation)
-        consistent = False
+        self.prune_candidate_buffer(step_num=step_num)
 
-        if horizontal_candidate:
-            consistent = self.is_consistent_with_track(observation)
-
-            if consistent:
-                self.lost_count = 0
-                self.last_observation = observation
-                self.last_horizontal_observation = observation
-                self.update_stable_target(observation)
-
-                if observation["score"] >= self.confirm_score:
-                    self.confirm_count += 1
-                else:
-                    self.confirm_count = max(0, self.confirm_count - 1)
-            else:
-                self.lost_count = 0
-                self.last_observation = observation
-                self.last_horizontal_observation = observation
-                self.reset_stable_target(observation)
-
-                if observation["score"] >= self.confirm_score:
-                    self.confirm_count = 1
-                else:
-                    self.confirm_count = 0
-
-        elif down_candidate:
-            self.lost_count = 0
-            self.last_observation = observation
-
-            # Downward observation is useful as near-target evidence, but it
-            # should not create a horizontal target track by itself.
-            self.confirm_count = max(0, self.confirm_count - 1)
-
-        else:
-            self.lost_count += 1
-            self.confirm_count = max(0, self.confirm_count - 1)
-
-        candidate = horizontal_candidate or down_candidate
-
-        geometric_confirmed = (
-            horizontal_candidate
-            and consistent
-            and self.confirm_count >= self.confirm_required_count
-            and self.stable_target_position is not None
+        added_candidates = self.update_candidate_buffer(
+            observations=observations,
+            current_pose=current_pose,
+            step_num=step_num
         )
 
-        if geometric_confirmed:
+        best_observation = self.select_best_observation(observations)
+
+        candidate = len(self.get_recent_candidates(step_num=step_num)) > 0
+        verification_required = candidate and self.verified_target is None
+
+        confirmed = self.has_valid_verified_target(step_num=step_num)
+
+        if confirmed:
+            self.lost_count = 0
+            self.confirm_count = max(1, self.confirm_count)
             self.navigate_count += 1
+
+            planner_target = self.build_verified_target(
+                current_pose=current_pose,
+                step_num=step_num
+            )
+
+            stop_ready = self.is_stop_ready(
+                current_pose=current_pose,
+                step_num=step_num
+            )
+
+            if stop_ready:
+                planner_target = self.build_stop_target(
+                    current_pose=current_pose,
+                    step_num=step_num
+                )
+
+            reason = "verified target object is active"
+
         else:
             self.navigate_count = 0
+            stop_ready = False
 
-        stop_evidence = self.update_stop_evidence(
-            observation=observation,
-            confirmed=geometric_confirmed,
-            current_pose=current_pose
-        )
+            if candidate:
+                self.lost_count = 0
+                self.confirm_count = min(1, self.confirm_count + 1)
+                planner_target = self.default_planner_target()
+                reason = "task-aware object candidates collected, waiting for verification"
+            else:
+                self.lost_count += 1
+                self.confirm_count = 0
+                planner_target = self.default_planner_target()
+                reason = "no reliable task-aware object candidate"
 
-        geometric_stop_ready = self.is_stop_ready_from_evidence(
-            confirmed=geometric_confirmed
-        )
-
-        if horizontal_candidate:
-            planner_target = self.build_planner_target(
-                observation=observation,
-                current_pose=current_pose,
-                confirmed=geometric_confirmed,
-                stop_ready=geometric_stop_ready
-            )
-        elif self.last_horizontal_observation is not None and self.lost_count <= self.max_lost_count:
-            planner_target = self.build_recover_target(
-                observation=self.last_horizontal_observation,
-                current_pose=current_pose
-            )
-        else:
-            planner_target = self.default_planner_target()
+        self.last_observation = best_observation
+        if best_observation.get("is_horizontal", False):
+            self.last_horizontal_observation = best_observation
 
         self.last_planner_target = planner_target
 
-        if geometric_stop_ready:
-            reason = "multi-evidence target stop condition satisfied"
-        elif geometric_confirmed:
-            reason = "stable horizontal gdino target geometrically confirmed"
-        elif horizontal_candidate and consistent:
-            reason = "horizontal gdino candidate is consistent"
-        elif horizontal_candidate and not consistent:
-            reason = "horizontal gdino candidate starts a new track"
-        elif down_candidate:
-            reason = "downward gdino candidate kept as nearby evidence only"
-        elif self.last_horizontal_observation is not None and self.lost_count <= self.max_lost_count:
-            reason = "horizontal target temporarily lost, recover with last horizontal observation"
-        else:
-            reason = observation.get("reason", "no reliable gdino candidate")
+        verification_candidates = self.get_verification_candidates(
+            step_num=step_num
+        )
 
         info = {
             "candidate": candidate,
-            "horizontal_candidate": horizontal_candidate,
-            "down_candidate": down_candidate,
-            "consistent": consistent,
-            "geometric_confirmed": geometric_confirmed,
-            "confirmed": geometric_confirmed,
-            "verified": False,
+            "horizontal_candidate": self.has_horizontal_candidate(verification_candidates),
+            "down_candidate": self.has_down_candidate(observations),
+            "consistent": confirmed,
+            "geometric_confirmed": False,
+            "confirmed": confirmed,
+            "verified": confirmed,
+            "verification_required": verification_required,
             "verification": {},
-            "stop_ready": geometric_stop_ready,
-            "geometric_stop_ready": geometric_stop_ready,
+            "stop_ready": stop_ready,
+            "geometric_stop_ready": stop_ready,
             "confirm_count": self.confirm_count,
-            "required_count": self.confirm_required_count,
+            "required_count": 1,
             "lost_count": self.lost_count,
             "navigate_count": self.navigate_count,
-            "stable_target_position": self.stable_target_position,
-            "stable_target_score": round(self.stable_target_score, 3),
-            "stop_evidence": stop_evidence,
-            "stop_evidence_score": round(self.stop_evidence_score, 3),
-            "instant_stop_evidence": round(self.instant_stop_evidence, 3),
-            "near_target_count": self.near_target_count,
-            "front_stop_count": self.front_stop_count,
-            "down_stop_count": self.down_stop_count,
-            "verified_count": self.verified_count,
-            "verifier_reject_count": self.verifier_reject_count,
-            "hard_reject_count": self.hard_reject_count,
-            "observation": observation,
+            "stable_target_position": self.verified_target_position,
+            "stable_target_score": round(self.verified_target_score, 3),
+            "verified_target": self.verified_target,
+            "verified_target_position": self.verified_target_position,
+            "verified_candidate_id": self.verified_candidate_id,
+            "candidate_buffer_size": len(self.candidate_buffer),
+            "added_candidate_count": added_candidates,
+            "verification_candidates": verification_candidates,
+            "observation": best_observation,
             "planner_target": planner_target,
             "reason": reason,
         }
@@ -249,381 +189,314 @@ class TargetTracker:
         new_info = dict(tracker_info)
         new_info["verification"] = verification_info
 
-        verification_checked = bool(verification_info.get("checked", False))
+        checked = bool(verification_info.get("checked", False))
         verified = bool(verification_info.get("verified", False))
-        hard_reject = bool(verification_info.get("hard_reject", False))
+        selected_candidate_id = verification_info.get("selected_candidate_id", None)
 
-        geometric_confirmed = bool(
-            new_info.get("geometric_confirmed", new_info.get("confirmed", False))
-        )
+        current_confirmed = bool(tracker_info.get("confirmed", False))
+        current_verified = bool(tracker_info.get("verified", False))
+        current_stop_ready = bool(tracker_info.get("stop_ready", False))
+        planner_target = tracker_info.get("planner_target", None)
 
-        step_num = int(new_info.get("observation", {}).get("step_num", -1))
+        if isinstance(planner_target, dict):
+            if planner_target.get("target_type", "") in [
+                "verified_target_stop",
+                "gdino_stop"
+            ]:
+                current_stop_ready = True
 
-        if hard_reject and geometric_confirmed:
-            self.hard_reject_count += 1
-            self.last_hard_reject_step = step_num
-            self.reject_current_track(
-                reason=verification_info.get("reason", "hard rejected by verifier")
-            )
+        if checked and verified and selected_candidate_id is not None:
+            candidate = self.find_candidate(selected_candidate_id)
 
-            new_info["verified"] = False
+            if candidate is not None:
+                self.set_verified_target(
+                    candidate=candidate,
+                    verification_info=verification_info
+                )
+
+                current_pose = verification_info.get("current_pose", None)
+                if current_pose is None:
+                    current_pose = candidate.get("current_pose", None)
+
+                planner_target = self.default_planner_target()
+
+                if current_pose is not None:
+                    stop_ready = self.is_stop_ready(
+                        current_pose=current_pose,
+                        step_num=candidate.get("step_num", 0)
+                    )
+
+                    if stop_ready:
+                        planner_target = self.build_stop_target(
+                            current_pose=current_pose,
+                            step_num=candidate.get("step_num", 0)
+                        )
+                    else:
+                        planner_target = self.build_verified_target(
+                            current_pose=current_pose,
+                            step_num=candidate.get("step_num", 0)
+                        )
+                else:
+                    stop_ready = False
+
+                new_info["candidate"] = True
+                new_info["confirmed"] = True
+                new_info["verified"] = True
+                new_info["geometric_confirmed"] = False
+                new_info["stop_ready"] = stop_ready
+                new_info["geometric_stop_ready"] = stop_ready
+                new_info["planner_target"] = planner_target
+                new_info["stable_target_position"] = self.verified_target_position
+                new_info["stable_target_score"] = round(self.verified_target_score, 3)
+                new_info["verified_target"] = self.verified_target
+                new_info["verified_target_position"] = self.verified_target_position
+                new_info["verified_candidate_id"] = self.verified_candidate_id
+                new_info["reason"] = (
+                    "target object verified by task-aware candidate selection: "
+                    + str(verification_info.get("reason", ""))
+                )
+
+                return new_info
+
+        if checked and not verified:
+            self.clear_unverified_state()
+
             new_info["confirmed"] = False
+            new_info["verified"] = False
             new_info["stop_ready"] = False
             new_info["geometric_stop_ready"] = False
             new_info["planner_target"] = self.default_planner_target()
-            new_info["candidate"] = False
-            new_info["stop_evidence_score"] = round(self.stop_evidence_score, 3)
-            new_info["instant_stop_evidence"] = round(self.instant_stop_evidence, 3)
+            new_info["stable_target_position"] = self.verified_target_position
+            new_info["verified_target"] = self.verified_target
+            new_info["verified_target_position"] = self.verified_target_position
+            new_info["verified_candidate_id"] = self.verified_candidate_id
             new_info["reason"] = (
-                "target hard rejected by verifier: "
-                + str(verification_info.get("reason", "not verified"))
+                "no target object selected by verifier: "
+                + str(verification_info.get("reason", ""))
             )
+
             return new_info
 
-        if verification_checked and geometric_confirmed and verified:
-            self.verified_count += 1
-            self.verifier_reject_count = 0
-            self.last_verified_step = step_num
-            self.stop_evidence_score += self.verifier_bonus
-            self.stop_evidence_score = min(6.0, self.stop_evidence_score)
+        # Important:
+        # When verification is not required, preserve the stop decision
+        # already made by update(). Otherwise a verified_target_stop target
+        # can be kept while stop_ready is overwritten to False, causing
+        # the agent to keep moving forward instead of stopping.
+        new_info["confirmed"] = current_confirmed or self.verified_target is not None
+        new_info["verified"] = current_verified or self.verified_target is not None
+        new_info["stop_ready"] = current_stop_ready
+        new_info["geometric_stop_ready"] = current_stop_ready
 
-            new_info["verified"] = True
-            new_info["reason"] = (
-                "verified target evidence added, "
-                + str(verification_info.get("reason", new_info.get("reason", "")))
-            )
-
-        elif verification_checked and geometric_confirmed and not verified:
-            # Ordinary negative verification is no longer a hard gate.
-            # It only lowers stop evidence, because crop captions can be empty
-            # and VLM verification can be overly conservative.
-            self.verifier_reject_count += 1
-            self.stop_evidence_score -= self.verifier_penalty
-            self.stop_evidence_score = max(0.0, self.stop_evidence_score)
-
-            new_info["verified"] = False
-            new_info["reason"] = (
-                "target not verified but track preserved: "
-                + str(verification_info.get("reason", "not verified"))
-            )
-
-        else:
-            new_info["verified"] = False
-
-        stop_ready = self.is_stop_ready_from_evidence(
-            confirmed=geometric_confirmed
-        )
-
-        if stop_ready:
-            new_info["planner_target"] = self.build_stop_target_from_info(new_info)
-
-        new_info["confirmed"] = geometric_confirmed
-        new_info["stop_ready"] = stop_ready
-        new_info["geometric_stop_ready"] = stop_ready
-        new_info["stop_evidence_score"] = round(self.stop_evidence_score, 3)
-        new_info["instant_stop_evidence"] = round(self.instant_stop_evidence, 3)
-        new_info["near_target_count"] = self.near_target_count
-        new_info["front_stop_count"] = self.front_stop_count
-        new_info["down_stop_count"] = self.down_stop_count
-        new_info["verified_count"] = self.verified_count
-        new_info["verifier_reject_count"] = self.verifier_reject_count
-        new_info["hard_reject_count"] = self.hard_reject_count
+        if current_stop_ready:
+            new_info["reason"] = "reached verified target object position"
 
         return new_info
 
-    def reject_current_track(self, reason=""):
+    def set_verified_target(self, candidate, verification_info):
+        candidate_position = candidate.get("target_world_position", None)
+
+        if candidate_position is None:
+            return
+
+        confidence = float(verification_info.get("confidence", candidate.get("score", 0.0)))
+
+        if self.verified_target_position is None:
+            verified_position = candidate_position
+        else:
+            distance = self.xy_distance(
+                p1=self.verified_target_position,
+                p2=candidate_position
+            )
+
+            if distance <= self.max_association_distance:
+                alpha = max(0.30, min(0.70, confidence))
+                vx, vy = self.verified_target_position
+                cx, cy = candidate_position
+
+                verified_position = (
+                    round(vx * (1.0 - alpha) + cx * alpha, 2),
+                    round(vy * (1.0 - alpha) + cy * alpha, 2)
+                )
+            else:
+                verified_position = candidate_position
+
+        self.verified_target_position = verified_position
+        self.verified_target_score = max(
+            self.verified_target_score * 0.85,
+            confidence
+        )
+        self.verified_target_step = int(candidate.get("step_num", 0))
+        self.verified_candidate_id = candidate.get("candidate_id", None)
+
+        self.verified_target = dict(candidate)
+        self.verified_target["target_world_position"] = self.verified_target_position
+        self.verified_target["verification_confidence"] = confidence
+        self.verified_target["verification_reason"] = verification_info.get("reason", "")
+
+        self.confirm_count = 1
+        self.lost_count = 0
+        self.navigate_count = 0
+
+    def clear_unverified_state(self):
         self.confirm_count = 0
         self.navigate_count = 0
-        self.lost_count = 0
+        self.last_planner_target = self.default_planner_target()
 
-        self.stop_evidence_score = 0.0
-        self.instant_stop_evidence = 0.0
-        self.near_target_count = 0
-        self.front_stop_count = 0
-        self.down_stop_count = 0
-        self.verified_count = 0
-        self.verifier_reject_count = 0
-
-        self.last_observation = None
-        self.last_horizontal_observation = None
-        self.last_planner_target = None
-
-        self.stable_target_position = None
-        self.stable_target_score = 0.0
-        self.horizontal_history = []
-
-    def update_stop_evidence(self, observation, confirmed, current_pose):
-        evidence = {
-            "position": 0.0,
-            "front": 0.0,
-            "down": 0.0,
-            "stability": 0.0,
-            "penalty": 0.0,
-            "total": 0.0,
-            "ready": False,
-        }
-
-        if not confirmed or self.stable_target_position is None:
-            self.instant_stop_evidence = 0.0
-            self.stop_evidence_score *= self.stop_evidence_decay
-            self.stop_evidence_score = max(0.0, self.stop_evidence_score)
-            return evidence
-
-        if self.navigate_count < self.min_navigate_steps_before_stop:
-            self.instant_stop_evidence = 0.0
-            self.stop_evidence_score *= self.stop_evidence_decay
-            self.stop_evidence_score = max(0.0, self.stop_evidence_score)
-            return evidence
-
-        current_xy = (float(current_pose[0]), float(current_pose[1]))
-        distance_to_stable_target = self.xy_distance(
-            p1=current_xy,
-            p2=self.stable_target_position
-        )
-
-        if distance_to_stable_target <= self.stop_position_distance:
-            evidence["position"] += 1.25
-            self.near_target_count += 1
-        elif distance_to_stable_target <= self.stop_position_distance * 1.5:
-            evidence["position"] += 0.65
-        else:
-            self.near_target_count = max(0, self.near_target_count - 1)
-
-        if self.is_reasonable_front_stop_observation(observation):
-            evidence["front"] += 1.0
-            self.front_stop_count += 1
-
-            if abs(observation.get("center_offset_x", 0.0)) <= 0.45:
-                evidence["front"] += 0.35
-
-            if observation.get("area_ratio", 0.0) >= self.stop_area_ratio:
-                evidence["front"] += 0.35
-
-            estimated_depth = observation.get("estimated_depth", None)
-            if estimated_depth is not None and estimated_depth <= self.stop_depth:
-                evidence["front"] += 0.75
-        else:
-            self.front_stop_count = max(0, self.front_stop_count - 1)
-
-        down_observation = self.get_best_down_observation(
-            observation.get("all_observations", [])
-        )
-
-        if down_observation is not None:
-            evidence["down"] += 0.55
-            self.down_stop_count += 1
-
-            down_depth = down_observation.get("estimated_depth", None)
-            if down_depth is not None and down_depth <= self.stop_depth:
-                evidence["down"] += 0.45
-        else:
-            self.down_stop_count = max(0, self.down_stop_count - 1)
-
-        if self.is_track_spatially_stable():
-            evidence["stability"] += 0.55
-
-        if observation.get("full_frame_like_box", False):
-            evidence["penalty"] -= 1.5
-
-        if observation.get("area_ratio", 0.0) > self.max_stop_area_ratio:
-            evidence["penalty"] -= 0.8
-
-        if self.verifier_reject_count > 0:
-            evidence["penalty"] -= min(0.8, 0.25 * self.verifier_reject_count)
-
-        instant = (
-            evidence["position"]
-            + evidence["front"]
-            + evidence["down"]
-            + evidence["stability"]
-            + evidence["penalty"]
-        )
-
-        instant = max(0.0, instant)
-
-        self.instant_stop_evidence = instant
-        self.stop_evidence_score = (
-            self.stop_evidence_score * self.stop_evidence_decay
-            + instant
-        )
-        self.stop_evidence_score = max(0.0, min(6.0, self.stop_evidence_score))
-
-        evidence["total"] = round(instant, 3)
-        evidence["ready"] = self.is_stop_ready_from_evidence(
-            confirmed=confirmed
-        )
-
-        return evidence
-
-    def is_stop_ready_from_evidence(self, confirmed):
-        if not confirmed:
+    def has_valid_verified_target(self, step_num):
+        if self.verified_target is None:
             return False
 
-        if self.stable_target_position is None:
+        if self.verified_target_position is None:
             return False
 
-        if self.navigate_count < self.min_navigate_steps_before_stop:
+        if self.verified_target_step < 0:
             return False
 
-        if self.hard_reject_count > 0 and self.last_hard_reject_step >= 0:
-            return False
-
-        if self.stop_evidence_score >= self.stop_evidence_threshold:
-            return True
-
-        return False
-
-    def is_reasonable_front_stop_observation(self, observation):
-        if not observation.get("valid", False):
-            return False
-
-        if observation.get("camera_region", "unknown") != "front":
-            return False
-
-        if observation.get("score", 0.0) < self.stop_score:
-            return False
-
-        if observation.get("full_frame_like_box", False):
-            return False
-
-        if observation.get("area_ratio", 0.0) > self.max_stop_area_ratio:
-            return False
-
-        if abs(observation.get("center_offset_x", 0.0)) > 0.65:
+        if step_num - self.verified_target_step > self.verified_target_ttl:
+            self.clear_verified_target()
             return False
 
         return True
 
-    def get_best_down_observation(self, observations):
-        if not isinstance(observations, list):
-            return None
+    def clear_verified_target(self):
+        self.verified_target = None
+        self.verified_target_position = None
+        self.verified_target_score = 0.0
+        self.verified_target_step = -1
+        self.verified_candidate_id = None
+        self.navigate_count = 0
 
-        candidates = []
+    def is_stop_ready(self, current_pose, step_num):
+        if not self.has_valid_verified_target(step_num=step_num):
+            return False
 
-        for observation in observations:
-            if not observation.get("valid", False):
-                continue
+        if self.navigate_count < self.min_navigate_steps_before_stop:
+            return False
 
-            if observation.get("camera_region", "unknown") != "down":
-                continue
-
-            if observation.get("score", 0.0) < self.confirm_score:
-                continue
-
-            if observation.get("full_frame_like_box", False):
-                continue
-
-            if observation.get("area_ratio", 0.0) < self.min_area_ratio:
-                continue
-
-            candidates.append(observation)
-
-        if len(candidates) == 0:
-            return None
-
-        candidates.sort(
-            key=lambda item: item.get("quality_score", 0.0),
-            reverse=True
+        current_xy = (float(current_pose[0]), float(current_pose[1]))
+        distance = self.xy_distance(
+            p1=current_xy,
+            p2=self.verified_target_position
         )
 
-        return candidates[0]
-
-    def is_track_spatially_stable(self):
-        if len(self.horizontal_history) < 2:
-            return False
-
-        recent = self.horizontal_history[-min(3, len(self.horizontal_history)):]
-        positions = []
-
-        for item in recent:
-            position = item.get("position", None)
-            if position is not None:
-                positions.append(position)
-
-        if len(positions) < 2:
-            return False
-
-        mean_x = sum([p[0] for p in positions]) / len(positions)
-        mean_y = sum([p[1] for p in positions]) / len(positions)
-
-        max_distance = 0.0
-
-        for position in positions:
-            distance = self.xy_distance(
-                p1=position,
-                p2=(mean_x, mean_y)
-            )
-            max_distance = max(max_distance, distance)
-
-        if max_distance <= self.max_consistency_distance * 0.5:
+        if distance <= self.stop_position_distance:
             return True
 
         return False
 
-    def build_stop_target_from_info(self, tracker_info):
-        planner_target = tracker_info.get("planner_target", None)
+    def build_verified_target(self, current_pose, step_num=0):
+        if self.verified_target_position is None:
+            return self.default_planner_target()
 
-        if isinstance(planner_target, dict) and planner_target.get("valid", False):
-            stop_target = dict(planner_target)
-        else:
-            stop_target = self.default_planner_target()
+        current_xy = (float(current_pose[0]), float(current_pose[1]))
+        target_xy = self.verified_target_position
 
-        stop_target["valid"] = True
-        stop_target["target_type"] = "gdino_stop"
-        stop_target["position"] = stop_target.get("position", None)
-        stop_target["viewpoint_position"] = stop_target.get("viewpoint_position", None)
-        stop_target["target_world_position"] = self.stable_target_position
-        stop_target["distance"] = 0.0
-        stop_target["relative_angle"] = 0.0
-        stop_target["relative_region"] = "front"
-        stop_target["stop_reason"] = "multi-evidence target stop"
+        distance = self.xy_distance(
+            p1=current_xy,
+            p2=target_xy
+        )
 
-        return stop_target
+        target_angle_world = math.degrees(
+            math.atan2(target_xy[1] - current_xy[1], target_xy[0] - current_xy[0])
+        )
+        relative_angle = self.normalize_angle(target_angle_world - float(current_pose[3]))
+
+        move_distance = max(
+            2.0,
+            min(8.0, distance - self.navigate_stop_distance)
+        )
+
+        if distance <= self.navigate_stop_distance:
+            move_distance = 2.0
+
+        target_position = self.forward_position(
+            current_pose=current_pose,
+            target_yaw=target_angle_world,
+            move_distance=move_distance
+        )
+
+        return {
+            "valid": True,
+            "target_type": "verified_target_navigate",
+            "position": target_position,
+            "viewpoint_position": target_position,
+            "target_world_position": target_xy,
+            "score": float(self.verified_target_score),
+            "semantic_value": float(self.verified_target_score),
+            "confidence": float(self.verified_target_score),
+            "safety_value": 0.8,
+            "novelty_value": 0.5,
+            "distance": round(move_distance, 2),
+            "relative_angle": round(relative_angle, 2),
+            "relative_region": self.get_relative_region(relative_angle),
+            "bbox": self.verified_target.get("bbox", None) if self.verified_target else None,
+            "area_ratio": self.verified_target.get("area_ratio", 0.0) if self.verified_target else 0.0,
+            "estimated_depth": self.verified_target.get("estimated_depth", None) if self.verified_target else None,
+            "candidate_id": self.verified_candidate_id,
+            "stop_reason": "",
+        }
+
+    def build_stop_target(self, current_pose, step_num=0):
+        current_xy = (round(float(current_pose[0]), 2), round(float(current_pose[1]), 2))
+
+        return {
+            "valid": True,
+            "target_type": "verified_target_stop",
+            "position": current_xy,
+            "viewpoint_position": current_xy,
+            "target_world_position": self.verified_target_position,
+            "score": float(self.verified_target_score),
+            "semantic_value": float(self.verified_target_score),
+            "confidence": float(self.verified_target_score),
+            "safety_value": 0.8,
+            "novelty_value": 0.5,
+            "distance": 0.0,
+            "relative_angle": 0.0,
+            "relative_region": "front",
+            "bbox": self.verified_target.get("bbox", None) if self.verified_target else None,
+            "area_ratio": self.verified_target.get("area_ratio", 0.0) if self.verified_target else 0.0,
+            "estimated_depth": self.verified_target.get("estimated_depth", None) if self.verified_target else None,
+            "candidate_id": self.verified_candidate_id,
+            "stop_reason": "reached verified target object position",
+        }
 
     def parse_grounding_result(self, grounding_result, current_pose, depth_info=None, step_num=0):
-        default_observation = self.default_observation(step_num=step_num)
-
         if grounding_result is None:
-            default_observation["reason"] = "grounding result is None"
-            return default_observation
+            return []
 
         if not grounding_result.get("available", False):
-            default_observation["reason"] = grounding_result.get("error", "grounding dino not available")
-            return default_observation
+            return []
 
         detections = grounding_result.get("detections", [])
         if not isinstance(detections, list) or len(detections) == 0:
-            default_observation["reason"] = "no detection"
-            return default_observation
+            best_detection = grounding_result.get("best_detection", None)
+            if best_detection is not None:
+                detections = [best_detection]
+
+        if not isinstance(detections, list) or len(detections) == 0:
+            return []
 
         observations = []
 
-        for detection in detections:
+        for detection_index, detection in enumerate(detections):
             observation = self.parse_detection(
                 detection=detection,
                 current_pose=current_pose,
                 depth_info=depth_info,
-                step_num=step_num
+                step_num=step_num,
+                detection_index=detection_index
             )
             if observation.get("valid", False):
                 observations.append(observation)
-
-        if len(observations) == 0:
-            default_observation["reason"] = "no valid detection after parsing"
-            return default_observation
 
         observations.sort(
             key=lambda item: item.get("quality_score", 0.0),
             reverse=True
         )
 
-        best_observation = observations[0]
-        best_observation["all_observation_count"] = len(observations)
-        best_observation["all_observations"] = observations
+        return observations
 
-        return best_observation
-
-    def parse_detection(self, detection, current_pose, depth_info=None, step_num=0):
+    def parse_detection(self, detection, current_pose, depth_info=None, step_num=0, detection_index=0):
         observation = self.default_observation(step_num=step_num)
 
         if detection is None:
@@ -675,8 +548,7 @@ class TargetTracker:
 
         estimated_depth = self.estimate_depth(
             depth_info=depth_info,
-            image_index=image_index,
-            center_offset_y=center_offset_y
+            image_index=image_index
         )
 
         if is_horizontal:
@@ -709,6 +581,7 @@ class TargetTracker:
         observation.update({
             "valid": True,
             "step_num": step_num,
+            "detection_index": detection_index,
             "score": score,
             "phrase": detection.get("phrase", ""),
             "bbox": [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
@@ -733,12 +606,166 @@ class TargetTracker:
             "touches_border_count": touches_border_count,
             "abnormal_large_box": abnormal_large_box,
             "full_frame_like_box": full_frame_like_box,
-            "all_observation_count": 0,
-            "all_observations": [],
             "reason": "ok"
         })
 
         return observation
+
+    def update_candidate_buffer(self, observations, current_pose, step_num):
+        added_count = 0
+
+        for observation in observations:
+            if not self.is_task_aware_candidate(observation):
+                continue
+
+            candidate = self.build_candidate_from_observation(
+                observation=observation,
+                current_pose=current_pose
+            )
+
+            self.candidate_buffer.append(candidate)
+            added_count += 1
+
+        self.candidate_buffer.sort(
+            key=lambda item: item.get("candidate_quality", 0.0),
+            reverse=True
+        )
+
+        if len(self.candidate_buffer) > self.max_candidate_count:
+            self.candidate_buffer = self.candidate_buffer[:self.max_candidate_count]
+
+        return added_count
+
+    def is_task_aware_candidate(self, observation):
+        if not observation.get("valid", False):
+            return False
+
+        if not observation.get("is_horizontal", False):
+            return False
+
+        if observation.get("score", 0.0) < self.candidate_score:
+            return False
+
+        if observation.get("area_ratio", 0.0) < self.min_area_ratio:
+            return False
+
+        if observation.get("target_world_position", None) is None:
+            return False
+
+        if observation.get("full_frame_like_box", False):
+            return False
+
+        return True
+
+    def build_candidate_from_observation(self, observation, current_pose):
+        self.candidate_counter += 1
+
+        candidate_id = "cand_{:06d}".format(self.candidate_counter)
+
+        candidate = {
+            "candidate_id": candidate_id,
+            "step_num": int(observation.get("step_num", 0)),
+            "detection_index": int(observation.get("detection_index", 0)),
+            "image_index": int(observation.get("image_index", -1)),
+            "camera_region": observation.get("camera_region", "unknown"),
+            "phrase": observation.get("phrase", ""),
+            "score": float(observation.get("score", 0.0)),
+            "bbox": observation.get("bbox", None),
+            "bbox_norm_cxcywh": observation.get("bbox_norm_cxcywh", None),
+            "image_width": int(observation.get("image_width", 0)),
+            "image_height": int(observation.get("image_height", 0)),
+            "area_ratio": float(observation.get("area_ratio", 0.0)),
+            "center": observation.get("center", None),
+            "center_offset_x": float(observation.get("center_offset_x", 0.0)),
+            "center_offset_y": float(observation.get("center_offset_y", 0.0)),
+            "estimated_depth": observation.get("estimated_depth", None),
+            "target_world_position": observation.get("target_world_position", None),
+            "relative_angle": float(observation.get("relative_angle", 0.0)),
+            "relative_region": observation.get("relative_region", "front"),
+            "quality_score": float(observation.get("quality_score", 0.0)),
+            "candidate_quality": self.compute_candidate_quality(observation),
+            "full_frame_like_box": bool(observation.get("full_frame_like_box", False)),
+            "abnormal_large_box": bool(observation.get("abnormal_large_box", False)),
+            "current_pose": list(current_pose),
+            "crop_caption": "",
+        }
+
+        return candidate
+
+    def compute_candidate_quality(self, observation):
+        quality = float(observation.get("quality_score", 0.0))
+        score = float(observation.get("score", 0.0))
+        area_ratio = float(observation.get("area_ratio", 0.0))
+
+        if observation.get("camera_region", "unknown") == "front":
+            quality += 0.10
+
+        if abs(observation.get("center_offset_x", 0.0)) <= 0.50:
+            quality += 0.05
+
+        if area_ratio > 0.25 and score < 0.60:
+            quality *= 0.55
+
+        return round(max(0.0, quality), 4)
+
+    def get_recent_candidates(self, step_num):
+        candidates = []
+
+        for candidate in self.candidate_buffer:
+            if step_num - int(candidate.get("step_num", 0)) <= self.candidate_ttl:
+                candidates.append(candidate)
+
+        return candidates
+
+    def get_verification_candidates(self, step_num):
+        candidates = self.get_recent_candidates(step_num=step_num)
+
+        candidates.sort(
+            key=lambda item: item.get("candidate_quality", 0.0),
+            reverse=True
+        )
+
+        return candidates[:self.max_candidates_for_verification]
+
+    def prune_candidate_buffer(self, step_num):
+        new_buffer = []
+
+        for candidate in self.candidate_buffer:
+            age = step_num - int(candidate.get("step_num", 0))
+            if age <= self.candidate_ttl:
+                new_buffer.append(candidate)
+
+        self.candidate_buffer = new_buffer
+
+    def find_candidate(self, candidate_id):
+        for candidate in self.candidate_buffer:
+            if candidate.get("candidate_id", None) == candidate_id:
+                return candidate
+
+        if self.verified_target is not None:
+            if self.verified_target.get("candidate_id", None) == candidate_id:
+                return self.verified_target
+
+        return None
+
+    def has_horizontal_candidate(self, candidates):
+        for candidate in candidates:
+            if candidate.get("camera_region", "unknown") in ["front", "left", "right"]:
+                return True
+        return False
+
+    def has_down_candidate(self, observations):
+        for observation in observations:
+            if observation.get("camera_region", "unknown") == "down":
+                if observation.get("score", 0.0) >= self.confirm_score:
+                    return True
+        return False
+
+    def select_best_observation(self, observations):
+        if len(observations) == 0:
+            return self.default_observation()
+
+        return observations[0]
 
     def compute_detection_quality(
         self,
@@ -755,317 +782,18 @@ class TargetTracker:
             quality *= 0.1
 
         if abnormal_large_box:
-            quality *= 0.35
+            quality *= 0.55
 
         if full_frame_like_box:
-            quality *= 0.15
+            quality *= 0.10
 
         if is_downward:
-            quality *= 0.45
+            quality *= 0.30
 
         if not is_horizontal and not is_downward:
             quality *= 0.2
 
         return quality
-
-    def is_horizontal_candidate(self, observation):
-        if not observation.get("valid", False):
-            return False
-
-        if not observation.get("is_horizontal", False):
-            return False
-
-        if observation.get("score", 0.0) < self.candidate_score:
-            return False
-
-        if observation.get("area_ratio", 0.0) < self.min_area_ratio:
-            return False
-
-        if observation.get("full_frame_like_box", False):
-            return False
-
-        if observation.get("abnormal_large_box", False) and observation.get("score", 0.0) < 0.75:
-            return False
-
-        if observation.get("target_world_position", None) is None:
-            return False
-
-        return True
-
-    def is_down_candidate(self, observation):
-        if not observation.get("valid", False):
-            return False
-
-        if not observation.get("is_downward", False):
-            return False
-
-        if observation.get("score", 0.0) < self.confirm_score:
-            return False
-
-        if observation.get("area_ratio", 0.0) < self.min_area_ratio:
-            return False
-
-        if observation.get("full_frame_like_box", False):
-            return False
-
-        return True
-
-    def is_consistent_with_track(self, observation):
-        if self.stable_target_position is None:
-            return True
-
-        current_position = observation.get("target_world_position", None)
-        if current_position is None:
-            return False
-
-        position_distance = self.xy_distance(
-            p1=current_position,
-            p2=self.stable_target_position
-        )
-
-        last_angle = 0.0
-        if self.last_horizontal_observation is not None:
-            last_angle = float(self.last_horizontal_observation.get("relative_angle", 0.0))
-
-        current_angle = float(observation.get("relative_angle", 0.0))
-        angle_diff = abs(self.normalize_angle(current_angle - last_angle))
-
-        if position_distance > self.max_consistency_distance:
-            return False
-
-        if angle_diff > self.max_consistency_angle and self.confirm_count > 0:
-            return False
-
-        return True
-
-    def update_stable_target(self, observation):
-        position = observation.get("target_world_position", None)
-        if position is None:
-            return
-
-        score = float(observation.get("score", 0.0))
-
-        if self.stable_target_position is None:
-            self.stable_target_position = position
-            self.stable_target_score = score
-        else:
-            alpha = max(0.25, min(0.75, score))
-            sx, sy = self.stable_target_position
-            px, py = position
-
-            new_x = sx * (1.0 - alpha) + px * alpha
-            new_y = sy * (1.0 - alpha) + py * alpha
-
-            self.stable_target_position = (round(new_x, 2), round(new_y, 2))
-            self.stable_target_score = max(self.stable_target_score * 0.9, score)
-
-        self.horizontal_history.append({
-            "position": position,
-            "score": score,
-            "camera_region": observation.get("camera_region", "front"),
-            "relative_angle": observation.get("relative_angle", 0.0),
-            "step_num": observation.get("step_num", 0),
-            "area_ratio": observation.get("area_ratio", 0.0),
-            "estimated_depth": observation.get("estimated_depth", None),
-        })
-
-        if len(self.horizontal_history) > self.history_size:
-            self.horizontal_history = self.horizontal_history[-self.history_size:]
-
-    def reset_stable_target(self, observation):
-        position = observation.get("target_world_position", None)
-        score = float(observation.get("score", 0.0))
-
-        self.stable_target_position = position
-        self.stable_target_score = score
-        self.horizontal_history = []
-
-        if position is not None:
-            self.horizontal_history.append({
-                "position": position,
-                "score": score,
-                "camera_region": observation.get("camera_region", "front"),
-                "relative_angle": observation.get("relative_angle", 0.0),
-                "step_num": observation.get("step_num", 0),
-                "area_ratio": observation.get("area_ratio", 0.0),
-                "estimated_depth": observation.get("estimated_depth", None),
-            })
-
-    def build_planner_target(self, observation, current_pose, confirmed=False, stop_ready=False):
-        if not observation.get("valid", False):
-            return self.default_planner_target()
-
-        if not observation.get("is_horizontal", False):
-            return self.default_planner_target()
-
-        if stop_ready:
-            current_xy = (round(float(current_pose[0]), 2), round(float(current_pose[1]), 2))
-            return {
-                "valid": True,
-                "target_type": "gdino_stop",
-                "position": current_xy,
-                "viewpoint_position": current_xy,
-                "target_world_position": self.stable_target_position,
-                "score": float(observation.get("score", 0.0)),
-                "semantic_value": float(observation.get("score", 0.0)),
-                "confidence": float(observation.get("score", 0.0)),
-                "safety_value": 0.8,
-                "novelty_value": 0.8,
-                "distance": 0.0,
-                "relative_angle": 0.0,
-                "relative_region": "front",
-                "bbox": observation.get("bbox", None),
-                "area_ratio": observation.get("area_ratio", 0.0),
-                "estimated_depth": observation.get("estimated_depth", None),
-                "stop_reason": "multi-evidence target stop",
-            }
-
-        if confirmed and self.stable_target_position is not None:
-            planner_target = self.build_target_from_stable_position(
-                observation=observation,
-                current_pose=current_pose,
-                target_type="gdino_navigate"
-            )
-        else:
-            planner_target = self.build_target_from_observation(
-                observation=observation,
-                current_pose=current_pose,
-                target_type="gdino_confirm"
-            )
-
-        return planner_target
-
-    def build_target_from_observation(self, observation, current_pose, target_type):
-        relative_angle = float(observation.get("relative_angle", 0.0))
-        target_yaw = float(current_pose[3]) + relative_angle
-
-        estimated_depth = observation.get("estimated_depth", None)
-        if estimated_depth is None:
-            move_distance = self.confirm_step_distance
-        else:
-            move_distance = max(2.0, min(self.confirm_step_distance, float(estimated_depth) * 0.45))
-
-        target_position = self.forward_position(
-            current_pose=current_pose,
-            target_yaw=target_yaw,
-            move_distance=move_distance
-        )
-
-        return {
-            "valid": True,
-            "target_type": target_type,
-            "position": target_position,
-            "viewpoint_position": target_position,
-            "target_world_position": observation.get("target_world_position", None),
-            "score": float(observation.get("score", 0.0)),
-            "semantic_value": float(observation.get("score", 0.0)),
-            "confidence": float(observation.get("score", 0.0)),
-            "safety_value": 0.8,
-            "novelty_value": 0.8,
-            "distance": round(move_distance, 2),
-            "relative_angle": round(relative_angle, 2),
-            "relative_region": observation.get("relative_region", "front"),
-            "bbox": observation.get("bbox", None),
-            "area_ratio": observation.get("area_ratio", 0.0),
-            "estimated_depth": observation.get("estimated_depth", None),
-            "stop_reason": "",
-        }
-
-    def build_target_from_stable_position(self, observation, current_pose, target_type):
-        current_xy = (float(current_pose[0]), float(current_pose[1]))
-        target_xy = self.stable_target_position
-
-        distance = self.xy_distance(
-            p1=current_xy,
-            p2=target_xy
-        )
-
-        target_angle_world = math.degrees(
-            math.atan2(target_xy[1] - current_xy[1], target_xy[0] - current_xy[0])
-        )
-        relative_angle = self.normalize_angle(target_angle_world - float(current_pose[3]))
-
-        move_distance = max(
-            2.0,
-            min(8.0, distance - self.navigate_stop_distance)
-        )
-
-        if distance <= self.navigate_stop_distance:
-            move_distance = 2.0
-
-        target_position = self.forward_position(
-            current_pose=current_pose,
-            target_yaw=target_angle_world,
-            move_distance=move_distance
-        )
-
-        return {
-            "valid": True,
-            "target_type": target_type,
-            "position": target_position,
-            "viewpoint_position": target_position,
-            "target_world_position": target_xy,
-            "score": float(observation.get("score", 0.0)),
-            "semantic_value": float(observation.get("score", 0.0)),
-            "confidence": float(observation.get("score", 0.0)),
-            "safety_value": 0.8,
-            "novelty_value": 0.8,
-            "distance": round(move_distance, 2),
-            "relative_angle": round(relative_angle, 2),
-            "relative_region": self.get_relative_region(relative_angle),
-            "bbox": observation.get("bbox", None),
-            "area_ratio": observation.get("area_ratio", 0.0),
-            "estimated_depth": observation.get("estimated_depth", None),
-            "stop_reason": "",
-        }
-
-    def build_recover_target(self, observation, current_pose):
-        if observation is None:
-            return self.default_planner_target()
-
-        if self.stable_target_position is not None:
-            current_xy = (float(current_pose[0]), float(current_pose[1]))
-            target_xy = self.stable_target_position
-
-            target_angle_world = math.degrees(
-                math.atan2(target_xy[1] - current_xy[1], target_xy[0] - current_xy[0])
-            )
-            relative_angle = self.normalize_angle(target_angle_world - float(current_pose[3]))
-
-            target_position = self.forward_position(
-                current_pose=current_pose,
-                target_yaw=target_angle_world,
-                move_distance=4.0
-            )
-        else:
-            relative_angle = float(observation.get("relative_angle", 0.0))
-            target_yaw = float(current_pose[3]) + relative_angle
-
-            target_position = self.forward_position(
-                current_pose=current_pose,
-                target_yaw=target_yaw,
-                move_distance=4.0
-            )
-
-        return {
-            "valid": True,
-            "target_type": "gdino_recover",
-            "position": target_position,
-            "viewpoint_position": target_position,
-            "target_world_position": self.stable_target_position,
-            "score": float(observation.get("score", 0.0)),
-            "semantic_value": float(observation.get("score", 0.0)),
-            "confidence": max(0.1, float(observation.get("score", 0.0)) * 0.6),
-            "safety_value": 0.6,
-            "novelty_value": 0.5,
-            "distance": 4.0,
-            "relative_angle": round(relative_angle, 2),
-            "relative_region": self.get_relative_region(relative_angle),
-            "bbox": observation.get("bbox", None),
-            "area_ratio": observation.get("area_ratio", 0.0),
-            "estimated_depth": observation.get("estimated_depth", None),
-            "stop_reason": "",
-        }
 
     def forward_position(self, current_pose, target_yaw, move_distance):
         x, y, z, yaw = current_pose
@@ -1083,7 +811,7 @@ class TargetTracker:
         ty = y + math.sin(math.radians(target_yaw)) * estimated_depth
         return (round(tx, 2), round(ty, 2))
 
-    def estimate_depth(self, depth_info, image_index, center_offset_y=0.0):
+    def estimate_depth(self, depth_info, image_index):
         if depth_info is None:
             return None
 
@@ -1177,6 +905,7 @@ class TargetTracker:
         return {
             "valid": False,
             "step_num": step_num,
+            "detection_index": -1,
             "score": 0.0,
             "phrase": "",
             "bbox": None,
@@ -1201,8 +930,6 @@ class TargetTracker:
             "touches_border_count": 0,
             "abnormal_large_box": False,
             "full_frame_like_box": False,
-            "all_observation_count": 0,
-            "all_observations": [],
             "reason": "",
         }
 
@@ -1224,5 +951,6 @@ class TargetTracker:
             "bbox": None,
             "area_ratio": 0.0,
             "estimated_depth": None,
+            "candidate_id": None,
             "stop_reason": "",
         }
