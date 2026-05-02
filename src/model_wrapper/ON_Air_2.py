@@ -10,10 +10,16 @@ from common.prompts import fixed_system_prompt, fixed_user_prompt_template, unfi
 try:
     from src.planner.semantic_memory import SemanticMemory
     from src.planner.local_planner import LocalPlanner
+    from src.planner.navigation_state import NavigationState
+    from src.planner.target_tracker import TargetTracker
+    from src.planner.target_verifier import TargetVerifier
     from src.model_wrapper.grounding_dino_client import GroundingDINOClient
 except Exception:
     from planner.semantic_memory import SemanticMemory
     from planner.local_planner import LocalPlanner
+    from planner.navigation_state import NavigationState
+    from planner.target_tracker import TargetTracker
+    from planner.target_verifier import TargetVerifier
     from model_wrapper.grounding_dino_client import GroundingDINOClient
 
 import numpy as np
@@ -31,8 +37,10 @@ import json
 class ONAir(BaseModelWrapper):
     def __init__(self, fixed, batch_size):
         super().__init__()
+
         self.fixed = fixed
         self.gpt_client = AsyncClient()
+
         self.start_position = [[] for _ in range(batch_size)]
         self.start_yaw = [0 for _ in range(batch_size)]
         self.current_poses = [[] for _ in range(batch_size)]
@@ -45,20 +53,20 @@ class ONAir(BaseModelWrapper):
         self.local_planners = [None for _ in range(batch_size)]
         self.planned_paths = [{} for _ in range(batch_size)]
 
-        self.target_confirm_counts = [0 for _ in range(batch_size)]
-        self.target_confirmation_infos = [{} for _ in range(batch_size)]
-
         self.grounding_dino_client = GroundingDINOClient()
         self.grounding_dino_results = [{} for _ in range(batch_size)]
 
-        self.target_stop_confidence = 0.75
-        self.target_confirm_confidence = 0.60
-        self.target_candidate_confidence = 0.45
-        self.target_confirm_required_count = 2
+        self.target_trackers = [TargetTracker() for _ in range(batch_size)]
+        self.target_tracker_infos = [{} for _ in range(batch_size)]
+
+        self.target_verifier = TargetVerifier(client=self.gpt_client)
+        self.target_verification_infos = [{} for _ in range(batch_size)]
+
+        self.navigation_states = [NavigationState() for _ in range(batch_size)]
+        self.navigation_infos = [{} for _ in range(batch_size)]
 
         self.unfixed_system_prompt = unfixed_system_prompt
         self.fixed_system_prompt = fixed_system_prompt
-
 
     def prepare_inputs(self, episodes, fixed):
         inputs = []
@@ -74,97 +82,97 @@ class ONAir(BaseModelWrapper):
             for src in sources[::-1]:
                 if 'rgb' in src and 'depth' in src:
                     latest_rgb_images = src['rgb']
-
                     for img in src['rgb']:
                         images.append(img)
                     depth_images.extend(src['depth'])
                     break
 
             episode_rgb_images.append(latest_rgb_images)
-  
+
         b64_imgs = encode_image(images)
 
         GROUP = 4
-        GROUP_PER_BATCH = 2 
+        GROUP_PER_BATCH = 2
         BATCH_IMG = GROUP * GROUP_PER_BATCH
-        
+
         def iterate_batches(img_list):
             n = len(img_list)
-            full_batches = n // BATCH_IMG          # 完整批次数
-            tail        = n %  BATCH_IMG           # 残余张数
+            full_batches = n // BATCH_IMG
+            tail = n % BATCH_IMG
 
             for b in range(full_batches):
                 yield img_list[b*BATCH_IMG : (b+1)*BATCH_IMG]
 
-            if tail:                               # 处理最后不足 8 张
-                yield img_list[-tail:] 
+            if tail:
+                yield img_list[-tail:]
 
         captions = []
         print("start generate caption")
         start = time.time()
 
         for imgs in iterate_batches(b64_imgs):
-            # raw = generate_caption_qwen_api(imgs)
             raw = generate_caption(imgs)
-            
+
             if len(raw) != len(imgs):
                 raise ValueError(f"Expected {len(imgs)} captions, got {len(raw)}")
+
             captions.extend(raw)
 
         print("generation captions time:", time.time() - start)
 
         depth_info_all = self.process_depth(depth_images=depth_images)
-      
 
         for i in range(len(episodes)):
-            
             captions4 = captions[4*i:4*i+4]
             depth_info = depth_info_all[4*i:4*i+4]
-            
+
             self.start_position[i] = episodes[i][-1]['start_position']
-            
-            quaternionr = airsim.Quaternionr(x_val=episodes[i][-1]['start_quaternionr'][0],
-                                             y_val=episodes[i][-1]['start_quaternionr'][1],
-                                             z_val=episodes[i][-1]['start_quaternionr'][2],
-                                             w_val=episodes[i][-1]['start_quaternionr'][3])
+
+            quaternionr = airsim.Quaternionr(
+                x_val=episodes[i][-1]['start_quaternionr'][0],
+                y_val=episodes[i][-1]['start_quaternionr'][1],
+                z_val=episodes[i][-1]['start_quaternionr'][2],
+                w_val=episodes[i][-1]['start_quaternionr'][3]
+            )
             pitch, roll, yaw = airsim.to_eularian_angles(quaternionr)
             self.start_yaw[i] = math.degrees(yaw)
-            
+
             step_num = episodes[i][-1]['step']
             description = episodes[i][-1]['description']
             object_name = episodes[i][-1]['object_name']
             object_size = episodes[i][-1]['object_size']
-            
+
             previous_position = episodes[i][-1]['pre_poses']
             move_distance = episodes[i][-1]['move_distance']
             AvgHeadingChange = episodes[i][-1]['avg_heading_changes']
-
             raw_poses = self.process_poses(poses=previous_position)
 
-            
             if len(raw_poses) < 10 and len(raw_poses) > 0:
                 last_pose = raw_poses[-1]
                 raw_poses += [last_pose] * (10 - len(raw_poses))
-
             elif len(raw_poses) == 0:
-                last_pose = [(self.start_position[i][0], self.start_position[i][1], self.start_position[i][2]), self.start_yaw[i]]
+                last_pose = [
+                    (self.start_position[i][0], self.start_position[i][1], self.start_position[i][2]),
+                    self.start_yaw[i]
+                ]
                 raw_poses = [last_pose] * 10
 
-            # 格式化为 prompt 字符串
             format_previous_position = "{\n" + "\n".join([f"    {p}," for p in raw_poses]) + "\n}"
-            
-            # 提取最后一个 pose 并存为结构化数据，便于后续使用
+
             if len(raw_poses) > 0:
                 last_pose = raw_poses[-1]
-                xyz = last_pose[0]  # (x, y, z)
+                xyz = last_pose[0]
                 yaw = last_pose[1]
                 self.current_poses[i] = [xyz[0], xyz[1], xyz[2], yaw]
             else:
-                # fallback
-                self.current_poses[i] = [self.start_position[i][0], self.start_position[i][1], 
-                                         self.start_position[i][2], self.start_yaw[i]]
+                self.current_poses[i] = [
+                    self.start_position[i][0],
+                    self.start_position[i][1],
+                    self.start_position[i][2],
+                    self.start_yaw[i]
+                ]
 
-            self.init_semantic_memory(i, step_num)
+            self.init_planning_modules(i, step_num)
 
             self.memory_update_infos[i] = {
                 "current_pose": self.current_poses[i],
@@ -183,6 +191,43 @@ class ONAir(BaseModelWrapper):
             self.grounding_dino_results[i] = grounding_result
             self.print_grounding_dino_result(i, grounding_result)
 
+            tracker_info = self.target_trackers[i].update(
+                grounding_result=grounding_result,
+                current_pose=self.current_poses[i],
+                depth_info=depth_info,
+                step_num=step_num
+            )
+
+            verification_info = self.target_verifier.verify_sync(
+                object_name=object_name,
+                object_size=object_size,
+                description=description,
+                captions4=captions4,
+                rgb_images=episode_rgb_images[i],
+                tracker_info=tracker_info,
+                semantic_result=None,
+                encode_image_fn=encode_image,
+                generate_caption_fn=generate_caption
+            )
+
+            tracker_info = self.target_trackers[i].apply_verification(
+                tracker_info=tracker_info,
+                verification_info=verification_info
+            )
+
+            self.target_tracker_infos[i] = tracker_info
+            self.target_verification_infos[i] = verification_info
+
+            navigation_info = self.navigation_states[i].update(
+                tracker_info=tracker_info,
+                step_num=step_num
+            )
+            self.navigation_infos[i] = navigation_info
+
+            self.print_target_tracker(i, tracker_info)
+            self.print_target_verification(i, verification_info)
+            self.print_navigation_state(i, navigation_info)
+
             x_min = int(math.floor(self.start_position[i][0] - 50))
             x_max = int(math.ceil(self.start_position[i][0] + 50))
             y_min = int(math.floor(self.start_position[i][1] - 50))
@@ -192,13 +237,21 @@ class ONAir(BaseModelWrapper):
                 conversation = [
                     {"role": "system", "content": self.unfixed_system_prompt},
                     {
-                        "role": "user", 
+                        "role": "user",
                         "content": unfixed_user_prompt_template.format(
-                            object_name=object_name, object_size=object_size, description=description,
-                            x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max,
-                            captions4=captions4, depth_info=depth_info,
-                            format_previous_position=format_previous_position, step_num=step_num,
-                            move_distance=move_distance, AvgHeadingChange=AvgHeadingChange
+                            object_name=object_name,
+                            object_size=object_size,
+                            description=description,
+                            x_min=x_min,
+                            x_max=x_max,
+                            y_min=y_min,
+                            y_max=y_max,
+                            captions4=captions4,
+                            depth_info=depth_info,
+                            format_previous_position=format_previous_position,
+                            step_num=step_num,
+                            move_distance=move_distance,
+                            AvgHeadingChange=AvgHeadingChange
                         )
                     }
                 ]
@@ -206,14 +259,22 @@ class ONAir(BaseModelWrapper):
                 conversation = [
                     {"role": "system", "content": self.fixed_system_prompt},
                     {
-                        "role": "user", 
+                        "role": "user",
                         "content": fixed_user_prompt_template.format(
-                            object_name=object_name, object_size=object_size, description=description,
-                            x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max,
-                            captions4=captions4, depth_info=depth_info,
-                            format_previous_position=format_previous_position, step_num=step_num,
-                            move_distance=move_distance, AvgHeadingChange=AvgHeadingChange
-                        ) 
+                            object_name=object_name,
+                            object_size=object_size,
+                            description=description,
+                            x_min=x_min,
+                            x_max=x_max,
+                            y_min=y_min,
+                            y_max=y_max,
+                            captions4=captions4,
+                            depth_info=depth_info,
+                            format_previous_position=format_previous_position,
+                            step_num=step_num,
+                            move_distance=move_distance,
+                            AvgHeadingChange=AvgHeadingChange
+                        )
                     }
                 ]
 
@@ -223,50 +284,7 @@ class ONAir(BaseModelWrapper):
 
         return inputs, user_prompts
 
-
-    def run_grounding_dino_detection(self, index, rgb_images, object_name, description, step_num):
-        try:
-            if self.grounding_dino_client is None:
-                return {
-                    "available": False,
-                    "error": "grounding dino client is None"
-                }
-
-            result = self.grounding_dino_client.detect_episode(
-                rgb_images=rgb_images,
-                object_name=object_name,
-                description=description,
-                episode_index=index,
-                step_num=step_num
-            )
-
-            return result
-
-        except Exception as e:
-            print(f"[GroundingDINO] Episode {index}: detection failed: {e}")
-            return {
-                "available": False,
-                "error": str(e)
-            }
-
-
-    def print_grounding_dino_result(self, index, grounding_result):
-        try:
-            if grounding_result is None:
-                return
-
-            summary = self.grounding_dino_client.summarize_result(grounding_result)
-
-            print(
-                "[GroundingDINO] "
-                f"Episode {index}: {summary}"
-            )
-
-        except Exception as e:
-            print(f"[GroundingDINO] Episode {index}: failed to print result: {e}")
-    
-
-    def init_semantic_memory(self, index, step_num):
+    def init_planning_modules(self, index, step_num):
         need_reset = False
 
         if self.semantic_memories[index] is None:
@@ -291,12 +309,50 @@ class ONAir(BaseModelWrapper):
             )
 
             self.planned_paths[index] = {}
-            self.target_confirm_counts[index] = 0
-            self.target_confirmation_infos[index] = {}
+            self.memory_targets[index] = {}
+
+            self.target_trackers[index].reset()
+            self.target_tracker_infos[index] = {}
+            self.target_verification_infos[index] = {}
+
+            self.navigation_states[index].reset()
+            self.navigation_infos[index] = {}
+
             self.grounding_dino_results[index] = {}
 
             print(f"[Semantic Memory] Episode {index}: initialized")
 
+    def run_grounding_dino_detection(self, index, rgb_images, object_name, description, step_num):
+        try:
+            if self.grounding_dino_client is None:
+                return {
+                    "available": False,
+                    "error": "grounding dino client is None",
+                    "detections": [],
+                    "best_detection": None,
+                    "best_score": 0.0,
+                    "num_detections": 0
+                }
+
+            result = self.grounding_dino_client.detect_episode(
+                rgb_images=rgb_images,
+                object_name=object_name,
+                description=description,
+                episode_index=index,
+                step_num=step_num
+            )
+            return result
+
+        except Exception as e:
+            print(f"[GroundingDINO] Episode {index}: detection failed: {e}")
+            return {
+                "available": False,
+                "error": str(e),
+                "detections": [],
+                "best_detection": None,
+                "best_score": 0.0,
+                "num_detections": 0
+            }
 
     async def unfixed_single_call(self, index, conversation):
         resp = await self.gpt_client.chat.completions.create(
@@ -304,60 +360,57 @@ class ONAir(BaseModelWrapper):
             messages=conversation
         )
         text = resp.choices[0].message.content.strip()
-        semantic_result = self.parse_semantic_result(text)
 
+        semantic_result = self.parse_semantic_result(text)
         memory_summary = self.update_semantic_memory(index, semantic_result)
-        action, value, done, memory_target = self.memory_to_legacy_action(
+
+        action, value, done, selected_target = self.select_navigation_action(
             index=index,
             semantic_result=semantic_result,
             fixed=False
         )
 
-        planned_path = self.plan_local_path(index, memory_target)
+        planned_path = self.plan_local_path(index, selected_target)
 
         self.print_semantic_result(semantic_result, action, value)
-        self.print_target_confirmation(index)
+        self.print_selected_target(index, selected_target)
         self.print_memory_summary(index, memory_summary)
-        self.print_memory_target(index, memory_target)
         self.print_local_plan(index, planned_path)
 
-        return action, value, done, semantic_result 
-    
+        return action, value, done, semantic_result
 
     async def fixed_single_call(self, index, conversation):
-        
         resp = await self.gpt_client.chat.completions.create(
             model='gpt-4.1-mini',
             messages=conversation
         )
         text = resp.choices[0].message.content.strip()
-        semantic_result = self.parse_semantic_result(text)
 
+        semantic_result = self.parse_semantic_result(text)
         memory_summary = self.update_semantic_memory(index, semantic_result)
-        action, value, done, memory_target = self.memory_to_legacy_action(
+
+        action, value, done, selected_target = self.select_navigation_action(
             index=index,
             semantic_result=semantic_result,
             fixed=True
         )
 
-        planned_path = self.plan_local_path(index, memory_target)
+        planned_path = self.plan_local_path(index, selected_target)
 
         self.print_semantic_result(semantic_result, action, value)
-        self.print_target_confirmation(index)
+        self.print_selected_target(index, selected_target)
         self.print_memory_summary(index, memory_summary)
-        self.print_memory_target(index, memory_target)
         self.print_local_plan(index, planned_path)
 
-        return action, value, done, semantic_result              
-
+        return action, value, done, semantic_result
 
     async def batch_calls(self, conversations, fixed):
         if fixed:
             tasks = [self.fixed_single_call(index, conv) for index, conv in conversations]
         else:
             tasks = [self.unfixed_single_call(index, conv) for index, conv in conversations]
-        return await asyncio.gather(*tasks)
 
+        return await asyncio.gather(*tasks)
 
     def run(self, inputs, fixed, prompt_info_list=None):
         results = asyncio.run(self.batch_calls(inputs, fixed))
@@ -368,7 +421,6 @@ class ONAir(BaseModelWrapper):
         new_actions, new_step_size = self.redirect_action(actions, steps_size, fixed)
 
         return list(new_actions), list(new_step_size), list(predict_dones)
-
 
     def update_semantic_memory(self, index, semantic_result):
         try:
@@ -388,8 +440,126 @@ class ONAir(BaseModelWrapper):
             print(f"[WARNING] failed to update semantic memory for episode {index}: {e}")
             return None
 
+    def select_navigation_action(self, index, semantic_result, fixed):
+        navigation_info = self.navigation_infos[index]
+        mode = navigation_info.get("mode", "explore")
+        planner_target = navigation_info.get("planner_target", None)
 
-    def plan_local_path(self, index, memory_target):
+        if mode == NavigationState.MODE_STOP:
+            stop_target = self.default_memory_target()
+            stop_target["target_type"] = "gdino_verified_stop"
+            stop_target["valid"] = True
+            stop_target["position"] = self.get_current_xy(index)
+            stop_target["viewpoint_position"] = self.get_current_xy(index)
+            stop_target["stop_reason"] = navigation_info.get("reason", "verified gdino stop")
+            self.memory_targets[index] = stop_target
+            return "stop", 0, True, stop_target
+
+        if mode in [
+            NavigationState.MODE_CONFIRM,
+            NavigationState.MODE_NAVIGATE,
+            NavigationState.MODE_RECOVER
+        ]:
+            if isinstance(planner_target, dict) and planner_target.get("valid", False):
+                action, value, done = self.target_to_legacy_action(
+                    target=planner_target,
+                    semantic_result=semantic_result,
+                    fixed=fixed
+                )
+                self.memory_targets[index] = planner_target
+                return action, value, done, planner_target
+
+        return self.memory_to_legacy_action(
+            index=index,
+            semantic_result=semantic_result,
+            fixed=fixed
+        )
+
+    def memory_to_legacy_action(self, index, semantic_result, fixed):
+        try:
+            memory = self.semantic_memories[index]
+            current_pose = self.current_poses[index]
+
+            memory_target = memory.get_best_memory_target(
+                current_pose=current_pose,
+                min_confidence=0.05,
+                min_distance=3.0,
+                max_distance=45.0
+            )
+
+            self.memory_targets[index] = memory_target
+
+            if memory_target.get("valid", False):
+                action, value, done = self.target_to_legacy_action(
+                    target=memory_target,
+                    semantic_result=semantic_result,
+                    fixed=fixed
+                )
+                return action, value, done, memory_target
+
+        except Exception as e:
+            print(f"[WARNING] failed to use semantic memory for episode {index}: {e}")
+
+        action, value, done = self.semantic_to_legacy_action(
+            semantic_result=semantic_result,
+            fixed=fixed
+        )
+        return action, value, done, self.default_memory_target()
+
+    def target_to_legacy_action(self, target, semantic_result, fixed):
+        relative_region = target.get("relative_region", "front")
+        target_type = target.get("target_type", "memory")
+
+        if relative_region == "front":
+            action = "forward"
+        elif relative_region == "left":
+            action = "left"
+        elif relative_region == "right":
+            action = "right"
+        elif relative_region == "back_right":
+            action = "rotr"
+        elif relative_region == "back_left":
+            action = "rotl"
+        else:
+            action = "forward"
+
+        if fixed:
+            value = 0
+        else:
+            if target_type.startswith("gdino"):
+                value = self.estimate_target_step_size(target)
+            else:
+                value = self.estimate_unfixed_step_size(
+                    region_score=float(target.get("semantic_value", 0.4)),
+                    safety_score=float(target.get("safety_value", 0.5)),
+                    target_visible=False,
+                    target_confidence=float(target.get("confidence", 0.0))
+                )
+
+        return action, value, False
+
+    def estimate_target_step_size(self, target):
+        distance = target.get("distance", 4.0)
+        confidence = target.get("confidence", 0.0)
+
+        try:
+            distance = float(distance)
+        except Exception:
+            distance = 4.0
+
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.0
+
+        if confidence >= 0.55:
+            step_size = max(2.0, min(5.0, distance))
+        else:
+            step_size = max(2.0, min(4.0, distance))
+
+        return step_size
+
+    def plan_local_path(self, index, selected_target):
         try:
             local_planner = self.local_planners[index]
             current_pose = self.current_poses[index]
@@ -399,7 +569,7 @@ class ONAir(BaseModelWrapper):
 
             planned_path = local_planner.plan_path(
                 current_pose=current_pose,
-                memory_target=memory_target
+                memory_target=selected_target
             )
 
             self.planned_paths[index] = planned_path
@@ -408,20 +578,6 @@ class ONAir(BaseModelWrapper):
         except Exception as e:
             print(f"[WARNING] failed to plan local path for episode {index}: {e}")
             return self.default_local_plan(str(e))
-
-
-    def default_local_plan(self, reason):
-        plan = {
-            "valid": False,
-            "reason": reason,
-            "target_position": None,
-            "path": [],
-            "path_len": 0,
-            "path_length": 0.0
-        }
-
-        return plan
-
 
     def parse_semantic_result(self, text):
         try:
@@ -445,9 +601,7 @@ class ONAir(BaseModelWrapper):
         except Exception as e:
             print(f"[WARNING] failed to parse semantic JSON: {e}")
             print(f"[WARNING] raw response: {text}")
-
             return self.default_semantic_result()
-
 
     def normalize_semantic_result(self, semantic_result):
         region_scores = semantic_result.get("region_scores", {})
@@ -499,7 +653,6 @@ class ONAir(BaseModelWrapper):
 
         return semantic_result
 
-
     def normalize_score_dict(self, score_dict, default_score=0.0):
         valid_regions = ["front", "left", "right"]
         new_score_dict = {}
@@ -513,7 +666,6 @@ class ONAir(BaseModelWrapper):
 
         return new_score_dict
 
-
     def normalize_score(self, score, default_score=0.0):
         try:
             score = float(score)
@@ -522,7 +674,6 @@ class ONAir(BaseModelWrapper):
 
         score = max(0.0, min(1.0, score))
         return score
-
 
     def normalize_bool(self, value):
         if isinstance(value, bool):
@@ -536,7 +687,6 @@ class ONAir(BaseModelWrapper):
                 return False
 
         return bool(value)
-
 
     def default_semantic_result(self):
         semantic_result = {
@@ -569,175 +719,13 @@ class ONAir(BaseModelWrapper):
 
         return semantic_result
 
-
-    def memory_to_legacy_action(self, index, semantic_result, fixed):
-        stop_confirmed, confirm_info = self.update_target_confirmation(
-            index=index,
-            semantic_result=semantic_result
-        )
-        self.target_confirmation_infos[index] = confirm_info
-
-        if stop_confirmed:
-            stop_target = self.default_memory_target()
-            stop_target["target_type"] = "target_confirm_stop"
-            stop_target["stop_reason"] = confirm_info.get("reason", "target confirmed")
-            self.memory_targets[index] = stop_target
-            return "stop", 0, True, stop_target
-
-        try:
-            memory = self.semantic_memories[index]
-            current_pose = self.current_poses[index]
-
-            memory_target = memory.get_best_memory_target(
-                current_pose=current_pose,
-                min_confidence=0.05,
-                min_distance=3.0,
-                max_distance=45.0
-            )
-            self.memory_targets[index] = memory_target
-
-            if memory_target.get("valid", False):
-                action, value, done = self.memory_target_to_legacy_action(
-                    memory_target=memory_target,
-                    semantic_result=semantic_result,
-                    fixed=fixed
-                )
-                return action, value, done, memory_target
-
-        except Exception as e:
-            print(f"[WARNING] failed to use semantic memory for episode {index}: {e}")
-
-        action, value, done = self.semantic_to_legacy_action(semantic_result, fixed)
-        return action, value, done, self.default_memory_target()
-
-
-    def update_target_confirmation(self, index, semantic_result):
-        target_visible = semantic_result.get("target_visible", False)
-        target_confidence = semantic_result.get("target_confidence", 0.0)
-
-        target_visible = self.normalize_bool(target_visible)
-        target_confidence = self.normalize_score(target_confidence, 0.0)
-
-        stop_confirmed = False
-        mode = "none"
-        reason = "target not visible"
-
-        if target_visible and target_confidence >= self.target_stop_confidence:
-            self.target_confirm_counts[index] = self.target_confirm_required_count
-            stop_confirmed = True
-            mode = "confirmed"
-            reason = "high confidence target visible"
-
-        elif target_visible and target_confidence >= self.target_confirm_confidence:
-            self.target_confirm_counts[index] += 1
-            mode = "confirming"
-            reason = "target visible with medium confidence"
-
-            if self.target_confirm_counts[index] >= self.target_confirm_required_count:
-                stop_confirmed = True
-                mode = "confirmed"
-                reason = "target confirmed by consecutive observations"
-
-        elif target_visible and target_confidence >= self.target_candidate_confidence:
-            self.target_confirm_counts[index] = 0
-            mode = "candidate"
-            reason = "target candidate visible but confidence is not enough"
-
-        else:
-            self.target_confirm_counts[index] = 0
-            mode = "none"
-            reason = "target not confirmed"
-
-        confirm_info = {
-            "visible": target_visible,
-            "confidence": target_confidence,
-            "count": self.target_confirm_counts[index],
-            "required_count": self.target_confirm_required_count,
-            "stop": stop_confirmed,
-            "mode": mode,
-            "reason": reason
-        }
-
-        return stop_confirmed, confirm_info
-
-
-    def memory_target_to_legacy_action(self, memory_target, semantic_result, fixed):
-        relative_region = memory_target.get("relative_region", "front")
-        relative_angle = memory_target.get("relative_angle", 0.0)
-        safety_value = memory_target.get("safety_value", 0.5)
-        target_score = memory_target.get("score", 0.0)
-
-        if safety_value < 0.20:
-            if fixed:
-                return "rotl", 0, False
-            else:
-                return "rotl", 30, False
-
-        if relative_region == "front":
-            action = "forward"
-        elif relative_region == "left":
-            action = "left"
-        elif relative_region == "right":
-            action = "right"
-        elif relative_region == "back_left":
-            action = "rotl"
-        elif relative_region == "back_right":
-            action = "rotr"
-        else:
-            action = "forward"
-
-        if fixed:
-            value = 0
-        else:
-            if action in ["rotl", "rotr"]:
-                value = min(60, max(15, abs(relative_angle)))
-            else:
-                value = self.estimate_unfixed_step_size(
-                    region_score=target_score,
-                    safety_score=safety_value,
-                    target_visible=semantic_result["target_visible"],
-                    target_confidence=semantic_result["target_confidence"]
-                )
-
-        done = (action == "stop")
-        return action, value, done
-
-
-    def default_memory_target(self):
-        return {
-            "valid": False,
-            "target_type": "none",
-            "position": None,
-            "frontier_position": None,
-            "viewpoint_position": None,
-            "viewpoint_yaw": 0.0,
-            "score": 0.0,
-            "semantic_value": 0.0,
-            "confidence": 0.0,
-            "safety_value": 0.0,
-            "novelty_value": 0.0,
-            "unknown_gain": 0.0,
-            "boundary_ratio": 0.0,
-            "history_penalty": 0.0,
-            "distance": 0.0,
-            "relative_angle": 0.0,
-            "relative_region": "front",
-            "cluster_size": 0,
-            "stop_reason": ""
-        }
-
-
     def semantic_to_legacy_action(self, semantic_result, fixed):
         region_scores = semantic_result["region_scores"]
         safety_scores = semantic_result["safety_scores"]
         best_region = semantic_result["best_region"]
-        target_visible = semantic_result["target_visible"]
-        target_confidence = semantic_result["target_confidence"]
-
-        if target_visible and target_confidence >= 0.75:
-            return "stop", 0, True
 
         max_safety = max(safety_scores.values())
+
         if max_safety < 0.25:
             if fixed:
                 return "rotl", 0, False
@@ -762,13 +750,12 @@ class ONAir(BaseModelWrapper):
             value = self.estimate_unfixed_step_size(
                 region_score=region_scores[best_region],
                 safety_score=safety_scores[best_region],
-                target_visible=target_visible,
-                target_confidence=target_confidence
+                target_visible=False,
+                target_confidence=0.0
             )
 
-        done = (action == "stop")
+        done = False
         return action, value, done
-
 
     def estimate_unfixed_step_size(self, region_score, safety_score, target_visible, target_confidence):
         if target_visible or target_confidence >= 0.6:
@@ -786,6 +773,141 @@ class ONAir(BaseModelWrapper):
 
         return step_size
 
+    def default_memory_target(self):
+        return {
+            "valid": False,
+            "target_type": "none",
+            "grid": None,
+            "position": None,
+            "viewpoint_position": None,
+            "frontier_position": None,
+            "score": 0.0,
+            "semantic_value": 0.0,
+            "confidence": 0.0,
+            "safety_value": 0.0,
+            "novelty_value": 0.0,
+            "visited": False,
+            "observe_count": 0,
+            "distance": 0.0,
+            "target_yaw": 0.0,
+            "relative_angle": 0.0,
+            "relative_region": "front",
+            "stop_reason": ""
+        }
+
+    def default_local_plan(self, reason):
+        plan = {
+            "valid": False,
+            "reason": reason,
+            "target_position": None,
+            "path": [],
+            "path_len": 0,
+            "path_length": 0.0
+        }
+        return plan
+
+    def get_current_xy(self, index):
+        try:
+            current_pose = self.current_poses[index]
+            return (round(current_pose[0], 2), round(current_pose[1], 2))
+        except Exception:
+            return None
+
+    def print_grounding_dino_result(self, index, grounding_result):
+        try:
+            if grounding_result is None:
+                return
+
+            summary = self.grounding_dino_client.summarize_result(grounding_result)
+            print(
+                "[GroundingDINO] "
+                f"Episode {index}: {summary}"
+            )
+        except Exception as e:
+            print(f"[GroundingDINO] Episode {index}: failed to print result: {e}")
+
+    def print_target_tracker(self, index, tracker_info):
+        if tracker_info is None:
+            return
+
+        observation = tracker_info.get("observation", {})
+        planner_target = tracker_info.get("planner_target", {})
+
+        print(
+            "[TargetTracker] "
+            f"Episode {index}: "
+            f"candidate={tracker_info.get('candidate', False)}, "
+            f"geo_confirmed={tracker_info.get('geometric_confirmed', False)}, "
+            f"verified={tracker_info.get('verified', False)}, "
+            f"stop={tracker_info.get('stop_ready', False)}, "
+            f"score={observation.get('score', 0.0):.3f}, "
+            f"count={tracker_info.get('confirm_count', 0)}/{tracker_info.get('required_count', 0)}, "
+            f"lost={tracker_info.get('lost_count', 0)}, "
+            f"image={observation.get('image_index', -1)}, "
+            f"region={observation.get('camera_region', 'none')}, "
+            f"rel_region={observation.get('relative_region', 'front')}, "
+            f"angle={observation.get('relative_angle', 0.0)}, "
+            f"area={observation.get('area_ratio', 0.0)}, "
+            f"depth={observation.get('estimated_depth', None)}, "
+            f"target={planner_target.get('position', None)}, "
+            f"stable={tracker_info.get('stable_target_position', None)}"
+        )
+
+    def print_target_verification(self, index, verification_info):
+        if verification_info is None:
+            return
+
+        if not isinstance(verification_info, dict):
+            return
+
+        if not verification_info.get("checked", False):
+            print(
+                "[TargetVerifier] "
+                f"Episode {index}: checked=False, "
+                f"reason={verification_info.get('reason', '')}"
+            )
+            return
+
+        crop_caption = verification_info.get("crop_caption", "")
+        if crop_caption is None:
+            crop_caption = ""
+
+        if len(crop_caption) > 120:
+            crop_caption = crop_caption[:120] + "..."
+
+        print(
+            "[TargetVerifier] "
+            f"Episode {index}: "
+            f"verified={verification_info.get('verified', False)}, "
+            f"conf={verification_info.get('confidence', 0.0):.2f}, "
+            f"same_object={verification_info.get('same_object', False)}, "
+            f"hard_reject={verification_info.get('hard_reject', False)}, "
+            f"reason={verification_info.get('reason', '')}, "
+            f"reject={verification_info.get('reject_reason', '')}, "
+            f"crop_caption={crop_caption}"
+        )
+
+    def print_navigation_state(self, index, navigation_info):
+        if navigation_info is None:
+            return
+
+        changed = navigation_info.get("changed", False)
+        prev_mode = navigation_info.get("prev_mode", "none")
+        mode = navigation_info.get("mode", "none")
+        reason = navigation_info.get("reason", "")
+
+        if changed:
+            print(
+                "[NavMode] "
+                f"Episode {index}: {prev_mode} -> {mode}, "
+                f"reason={reason}"
+            )
+        else:
+            print(
+                "[NavMode] "
+                f"Episode {index}: mode={mode}, "
+                f"reason={reason}"
+            )
 
     def print_semantic_result(self, semantic_result, action, value):
         region_scores = semantic_result["region_scores"]
@@ -798,32 +920,35 @@ class ONAir(BaseModelWrapper):
             f"safety=({safety_scores['front']:.2f}, {safety_scores['left']:.2f}, {safety_scores['right']:.2f}), "
             f"novelty=({novelty_scores['front']:.2f}, {novelty_scores['left']:.2f}, {novelty_scores['right']:.2f}), "
             f"best={semantic_result['best_region']}, "
-            f"visible={semantic_result['target_visible']}, "
-            f"conf={semantic_result['target_confidence']:.2f}, "
+            f"llm_visible={semantic_result['target_visible']}, "
+            f"llm_conf={semantic_result['target_confidence']:.2f}, "
             f"action=[{action}, {value}]"
         )
 
-
-    def print_target_confirmation(self, index):
-        confirm_info = self.target_confirmation_infos[index]
-
-        if not isinstance(confirm_info, dict):
+    def print_selected_target(self, index, selected_target):
+        if selected_target is None:
             return
 
-        if not confirm_info.get("visible", False) and confirm_info.get("count", 0) <= 0:
+        if not selected_target.get("valid", False):
+            print(
+                "[Selected Target] "
+                f"Episode {index}: invalid, "
+                f"type={selected_target.get('target_type', 'none')}, "
+                f"reason={selected_target.get('stop_reason', 'no valid target')}"
+            )
             return
 
         print(
-            "[Target Confirm] "
+            "[Selected Target] "
             f"Episode {index}: "
-            f"visible={confirm_info.get('visible', False)}, "
-            f"conf={confirm_info.get('confidence', 0.0):.2f}, "
-            f"count={confirm_info.get('count', 0)}/{confirm_info.get('required_count', self.target_confirm_required_count)}, "
-            f"mode={confirm_info.get('mode', 'none')}, "
-            f"stop={confirm_info.get('stop', False)}, "
-            f"reason={confirm_info.get('reason', '')}"
+            f"type={selected_target.get('target_type', 'unknown')}, "
+            f"pos={selected_target.get('position', None)}, "
+            f"score={selected_target.get('score', 0.0):.3f}, "
+            f"conf={selected_target.get('confidence', 0.0):.2f}, "
+            f"dist={selected_target.get('distance', 0.0)}, "
+            f"rel_angle={selected_target.get('relative_angle', 0.0)}, "
+            f"rel_region={selected_target.get('relative_region', 'front')}"
         )
-
 
     def print_memory_summary(self, index, memory_summary):
         if memory_summary is None:
@@ -838,37 +963,6 @@ class ONAir(BaseModelWrapper):
             f"max_conf={memory_summary['max_confidence']:.2f}, "
             f"max_pos={memory_summary['max_position']}"
         )
-
-
-    def print_memory_target(self, index, memory_target):
-        if memory_target is None:
-            return
-
-        if not memory_target.get("valid", False):
-            print(
-                "[Memory Target] "
-                f"Episode {index}: no valid target, "
-                f"type={memory_target.get('target_type', 'none')}, "
-                f"reason={memory_target.get('stop_reason', 'fallback to current semantic result')}"
-            )
-            return
-
-        print(
-            "[Memory Target] "
-            f"Episode {index}: "
-            f"type={memory_target.get('target_type', 'unknown')}, "
-            f"cluster={memory_target.get('cluster_size', 0)}, "
-            f"pos={memory_target['position']}, "
-            f"score={memory_target['score']:.3f}, "
-            f"sem={memory_target['semantic_value']:.2f}, "
-            f"conf={memory_target['confidence']:.2f}, "
-            f"safety={memory_target['safety_value']:.2f}, "
-            f"novelty={memory_target['novelty_value']:.2f}, "
-            f"dist={memory_target['distance']}, "
-            f"rel_angle={memory_target['relative_angle']}, "
-            f"rel_region={memory_target['relative_region']}"
-        )
-
 
     def print_local_plan(self, index, planned_path):
         if planned_path is None:
@@ -895,9 +989,9 @@ class ONAir(BaseModelWrapper):
             f"preview={preview_path}"
         )
 
-
     def process_depth(self, depth_images):
         depth_info = []
+
         for depth_image in depth_images:
             distance_image = np.array(depth_image) / 255.0 * 100
             x = torch.from_numpy(distance_image).unsqueeze(0).unsqueeze(0).float()
@@ -906,22 +1000,23 @@ class ONAir(BaseModelWrapper):
             y_int = np.round(y_np).astype(int).tolist()
             depth_info.append(y_int)
 
-        return depth_info 
-
+        return depth_info
 
     def process_poses(self, poses):
         pre_poses_xyzYaw = []
+
         for pose in poses:
             pos = pose['position']
             raw_quaternionr = pose['quaternionr']
             quaternionr = airsim.Quaternionr(
-                x_val=raw_quaternionr[0], y_val=raw_quaternionr[1], 
-                z_val=raw_quaternionr[2], w_val=raw_quaternionr[3]
+                x_val=raw_quaternionr[0],
+                y_val=raw_quaternionr[1],
+                z_val=raw_quaternionr[2],
+                w_val=raw_quaternionr[3]
             )
             pitch, roll, yaw = airsim.to_eularian_angles(quaternionr)
             yaw_degree = round(math.degrees(yaw), 2)
 
-            # 结构化格式 [(x, y, z), yaw]
             formatted = [
                 (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2)),
                 yaw_degree
@@ -929,7 +1024,6 @@ class ONAir(BaseModelWrapper):
             pre_poses_xyzYaw.append(formatted)
 
         return pre_poses_xyzYaw
-
 
     def redirect_action(self, actions, step_size, fixed):
         new_actions = [None] * len(actions)
@@ -947,21 +1041,20 @@ class ONAir(BaseModelWrapper):
 
                 current_pose = self.current_poses[i]
                 x, y, z, yaw = current_pose
-
                 current_step_size = new_step_size[i]
 
                 if action == 'forward':
                     dx = math.cos(math.radians(yaw))
                     dy = math.sin(math.radians(yaw))
                     dz = 0
-
                     vector = np.array([dx, dy, dz])
                     norm = np.linalg.norm(vector)
+
                     if norm > 1e-6:
                         unit_vector = vector / norm
                     else:
                         unit_vector = np.array([0, 0, 0])
-                    
+
                     if fixed:
                         new_position = np.array([x, y, z]) + unit_vector * AirsimActionSettings.FORWARD_STEP_SIZE
                     else:
@@ -972,23 +1065,22 @@ class ONAir(BaseModelWrapper):
                         new_step_size[i] = 15
                         print(f"[INFO] Episode {i}: '{action}' would go out of bounds → replaced with '{new_actions[i]}'")
 
-
                 elif action == "left":
                     unit_x = 1.0 * math.cos(math.radians(yaw + 90))
                     unit_y = 1.0 * math.sin(math.radians(yaw + 90))
                     vector = np.array([unit_x, unit_y, 0])
-
                     norm = np.linalg.norm(vector)
+
                     if norm > 1e-6:
                         unit_vector = vector / norm
                     else:
                         unit_vector = np.array([0, 0, 0])
-                    
+
                     if fixed:
                         new_position = np.array([x, y, z]) - unit_vector * AirsimActionSettings.LEFT_RIGHT_STEP_SIZE
                     else:
                         new_position = np.array([x, y, z]) - unit_vector * current_step_size
-                    
+
                     if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
                         new_actions[i] = 'rotl'
                         new_step_size[i] = 15
@@ -998,13 +1090,13 @@ class ONAir(BaseModelWrapper):
                     unit_x = 1.0 * math.cos(math.radians(yaw + 90))
                     unit_y = 1.0 * math.sin(math.radians(yaw + 90))
                     vector = np.array([unit_x, unit_y, 0])
-
                     norm = np.linalg.norm(vector)
+
                     if norm > 1e-6:
                         unit_vector = vector / norm
                     else:
                         unit_vector = np.array([0, 0, 0])
-                    
+
                     if fixed:
                         new_position = np.array([x, y, z]) + unit_vector * AirsimActionSettings.LEFT_RIGHT_STEP_SIZE
                     else:
@@ -1015,51 +1107,14 @@ class ONAir(BaseModelWrapper):
                         new_step_size[i] = 15
                         print(f"[INFO] Episode {i}: '{action}' would go out of bounds → replaced with '{new_actions[i]}'")
 
-
                 else:
                     new_actions[i] = action
                     new_step_size[i] = step_size[i]
-                    continue  # 跳过不检查 ascend/descend/rotl/rotr/stop
+                    continue
 
             except Exception as e:
                 print(f"[WARNING] run() failed to check bounds for episode {i}: {e}")
-                # 不变更动作
                 new_actions[i] = actions[i]
                 new_step_size[i] = step_size[i]
-        
+
         return new_actions, new_step_size
-           
-    
-    # def turn_to_nearest_axis(self, dx, dy, yaw):
-    #     def closest_signed_xy_axis(dx: float, dy: float):
-    #         """
-    #         找出 (dx,dy) 在 XY 平面里最接近的有向轴方向，并返回该方向和向该轴的最小夹角（度）。
-    #         """
-    #         L = math.hypot(dx, dy)
-    #         if L == 0:
-    #             raise ValueError("零向量没有方向")
-    #         # 计算与四个方向的夹角（弧度）
-    #         angles = {
-    #             '+X':   math.acos( dx / L),
-    #             '-X':   math.acos(-dx / L),
-    #             '+Y':   math.acos( dy / L),
-    #             '-Y':   math.acos(-dy / L),
-    #         }
-    #         # 选最小的
-    #         axis, angle_rad = min(angles.items(), key=lambda kv: kv[1])
-    #         return axis, math.degrees(angle_rad)
-        
-    #     axis, _ = closest_signed_xy_axis(dx, dy)
-    #     target_yaws = { '+X':   0,
-    #                     '+Y':  90,
-    #                     '-X': 180,
-    #                     '-Y': 270}
-    #     target = target_yaws[axis]
-
-    #     delta_r = (target - yaw + 360) % 360
-    #     delta_l = (yaw - target + 360) % 360
-
-    #     if delta_r <= delta_l:
-    #         return 'rotr'
-    #     else:
-    #         return 'rotl'
