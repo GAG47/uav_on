@@ -186,6 +186,10 @@ class TargetTracker:
         if verification_info is None:
             verification_info = {}
 
+        self.update_candidate_cache_from_verification(
+            verification_info=verification_info
+        )
+
         new_info = dict(tracker_info)
         new_info["verification"] = verification_info
 
@@ -259,6 +263,9 @@ class TargetTracker:
                 return new_info
 
         if checked and not verified:
+            self.mark_verified_candidates_rejected(
+                verification_info=verification_info
+            )
             self.clear_unverified_state()
 
             new_info["confirmed"] = False
@@ -277,11 +284,6 @@ class TargetTracker:
 
             return new_info
 
-        # Important:
-        # When verification is not required, preserve the stop decision
-        # already made by update(). Otherwise a verified_target_stop target
-        # can be kept while stop_ready is overwritten to False, causing
-        # the agent to keep moving forward instead of stopping.
         new_info["confirmed"] = current_confirmed or self.verified_target is not None
         new_info["verified"] = current_verified or self.verified_target is not None
         new_info["stop_ready"] = current_stop_ready
@@ -291,6 +293,79 @@ class TargetTracker:
             new_info["reason"] = "reached verified target object position"
 
         return new_info
+
+    def update_candidate_cache_from_verification(self, verification_info):
+        if not isinstance(verification_info, dict):
+            return
+
+        candidates = verification_info.get("candidates", [])
+        if not isinstance(candidates, list):
+            return
+
+        cache_fields = [
+            "crop_caption",
+            "crop_debug",
+            "crop_path",
+            "caption_ready",
+            "caption_step",
+            "caption_source",
+        ]
+
+        for verified_candidate in candidates:
+            if not isinstance(verified_candidate, dict):
+                continue
+
+            candidate_id = verified_candidate.get("candidate_id", None)
+            if candidate_id is None:
+                continue
+
+            cached_candidate = self.find_candidate(candidate_id)
+            if cached_candidate is None:
+                continue
+
+            for field in cache_fields:
+                if field in verified_candidate:
+                    cached_candidate[field] = verified_candidate.get(field)
+
+            crop_caption = cached_candidate.get("crop_caption", "")
+            if isinstance(crop_caption, str) and len(crop_caption.strip()) > 0:
+                cached_candidate["caption_ready"] = True
+                cached_candidate["caption_step"] = verified_candidate.get(
+                    "caption_step",
+                    cached_candidate.get("step_num", 0)
+                )
+
+    def mark_verified_candidates_rejected(self, verification_info):
+        if not isinstance(verification_info, dict):
+            return
+
+        candidates = verification_info.get("candidates", [])
+        reason = verification_info.get("reason", "")
+        reject_reason = verification_info.get("reject_reason", "")
+
+        if not isinstance(candidates, list):
+            return
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+
+            candidate_id = candidate.get("candidate_id", None)
+            if candidate_id is None:
+                continue
+
+            cached_candidate = self.find_candidate(candidate_id)
+            if cached_candidate is None:
+                continue
+
+            cached_candidate["verification_reject_count"] = (
+                int(cached_candidate.get("verification_reject_count", 0)) + 1
+            )
+            cached_candidate["last_reject_reason"] = reject_reason if reject_reason else reason
+            cached_candidate["last_rejected_step"] = candidate.get(
+                "step_num",
+                cached_candidate.get("step_num", 0)
+            )
 
     def set_verified_target(self, candidate, verification_info):
         candidate_position = candidate.get("target_world_position", None)
@@ -688,6 +763,14 @@ class TargetTracker:
             "abnormal_large_box": bool(observation.get("abnormal_large_box", False)),
             "current_pose": list(current_pose),
             "crop_caption": "",
+            "crop_debug": {},
+            "crop_path": "",
+            "caption_ready": False,
+            "caption_step": -1,
+            "caption_source": "",
+            "verification_reject_count": 0,
+            "last_reject_reason": "",
+            "last_rejected_step": -1,
         }
 
         return candidate
@@ -719,21 +802,74 @@ class TargetTracker:
 
     def get_verification_candidates(self, step_num):
         candidates = self.get_recent_candidates(step_num=step_num)
+        valid_candidates = []
 
-        candidates.sort(
-            key=lambda item: item.get("candidate_quality", 0.0),
+        for candidate in candidates:
+            age = max(0, step_num - int(candidate.get("step_num", 0)))
+            reject_count = int(candidate.get("verification_reject_count", 0))
+            caption_ready = bool(candidate.get("caption_ready", False))
+            is_current_step = int(candidate.get("step_num", -1)) == step_num
+
+            if age > 0 and not caption_ready:
+                continue
+
+            if reject_count >= 2 and age > 0:
+                continue
+
+            if reject_count >= 3:
+                continue
+
+            priority = self.compute_verification_priority(
+                candidate=candidate,
+                step_num=step_num
+            )
+
+            candidate = dict(candidate)
+            candidate["verification_priority"] = priority
+            valid_candidates.append(candidate)
+
+        valid_candidates.sort(
+            key=lambda item: item.get("verification_priority", 0.0),
             reverse=True
         )
 
-        return candidates[:self.max_candidates_for_verification]
+        return valid_candidates[:self.max_candidates_for_verification]
+
+    def compute_verification_priority(self, candidate, step_num):
+        priority = float(candidate.get("candidate_quality", 0.0))
+        age = max(0, step_num - int(candidate.get("step_num", 0)))
+        reject_count = int(candidate.get("verification_reject_count", 0))
+
+        if int(candidate.get("step_num", -1)) == step_num:
+            priority += 0.25
+
+        if bool(candidate.get("caption_ready", False)):
+            priority += 0.12
+
+        if candidate.get("camera_region", "unknown") == "front":
+            priority += 0.08
+
+        if abs(float(candidate.get("center_offset_x", 0.0))) <= 0.50:
+            priority += 0.04
+
+        priority -= 0.04 * age
+        priority -= 0.35 * reject_count
+
+        return round(max(0.0, priority), 4)
 
     def prune_candidate_buffer(self, step_num):
         new_buffer = []
 
         for candidate in self.candidate_buffer:
             age = step_num - int(candidate.get("step_num", 0))
-            if age <= self.candidate_ttl:
-                new_buffer.append(candidate)
+            if age > self.candidate_ttl:
+                continue
+
+            reject_count = int(candidate.get("verification_reject_count", 0))
+            if reject_count >= 3:
+                continue
+
+            new_buffer.append(candidate)
 
         self.candidate_buffer = new_buffer
 

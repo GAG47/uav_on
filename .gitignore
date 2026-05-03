@@ -31,3 +31,4 @@ logs/
 *.jsonl
 __pycache__/
 *.pyc
+debug/

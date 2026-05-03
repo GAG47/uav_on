@@ -916,7 +916,9 @@ class ONAir(BaseModelWrapper):
             )
             return
 
+        selected_candidate_id = verification_info.get("selected_candidate_id", None)
         crop_caption = verification_info.get("crop_caption", "")
+
         if crop_caption is None:
             crop_caption = ""
 
@@ -930,10 +932,64 @@ class ONAir(BaseModelWrapper):
             f"conf={verification_info.get('confidence', 0.0):.2f}, "
             f"same_object={verification_info.get('same_object', False)}, "
             f"hard_reject={verification_info.get('hard_reject', False)}, "
+            f"selected={selected_candidate_id}, "
+            f"candidate_count={verification_info.get('candidate_count', 0)}, "
             f"reason={verification_info.get('reason', '')}, "
             f"reject={verification_info.get('reject_reason', '')}, "
             f"crop_caption={crop_caption}"
         )
+
+        candidate_debug = verification_info.get("candidate_debug", [])
+        if not isinstance(candidate_debug, list):
+            candidate_debug = []
+
+        for candidate in candidate_debug[:6]:
+            if not isinstance(candidate, dict):
+                continue
+
+            candidate_id = candidate.get("candidate_id", None)
+            candidate_caption = candidate.get("crop_caption", "")
+            if candidate_caption is None:
+                candidate_caption = ""
+
+            if len(candidate_caption) > 100:
+                candidate_caption = candidate_caption[:100] + "..."
+
+            crop_debug = candidate.get("crop_debug", {})
+            if not isinstance(crop_debug, dict):
+                crop_debug = {}
+
+            print(
+                "[TargetVerifierCandidate] "
+                f"Episode {index}: "
+                f"id={candidate_id}, "
+                f"step={candidate.get('step_num', None)}, "
+                f"img={candidate.get('image_index', None)}, "
+                f"region={candidate.get('camera_region', None)}, "
+                f"score={float(candidate.get('score', 0.0)):.3f}, "
+                f"area={float(candidate.get('area_ratio', 0.0)):.4f}, "
+                f"bbox={candidate.get('bbox', None)}, "
+                f"target={candidate.get('target_world_position', None)}, "
+                f"caption_len={candidate.get('crop_caption_len', 0)}, "
+                f"caption={candidate_caption}"
+            )
+
+            print(
+                "[TargetVerifierCrop] "
+                f"Episode {index}: "
+                f"id={candidate_id}, "
+                f"ok={crop_debug.get('ok', False)}, "
+                f"stage={crop_debug.get('stage', '')}, "
+                f"debug_reason={crop_debug.get('reason', '')}, "
+                f"rgb_count={crop_debug.get('rgb_count', 0)}, "
+                f"image_type={crop_debug.get('image_type', '')}, "
+                f"image_size={crop_debug.get('image_size', None)}, "
+                f"crop_box={crop_debug.get('crop_box', None)}, "
+                f"crop_size={crop_debug.get('crop_size', None)}, "
+                f"caption_type={crop_debug.get('caption_type', '')}, "
+                f"caption_len={crop_debug.get('caption_len', 0)}, "
+                f"crop_path={crop_debug.get('crop_path', '')}"
+            )
 
     def print_navigation_state(self, index, navigation_info):
         if navigation_info is None:
