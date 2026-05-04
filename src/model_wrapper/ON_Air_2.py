@@ -107,18 +107,20 @@ class ONAir(BaseModelWrapper):
                 yield img_list[-tail:]
 
         captions = []
-        print("start generate caption")
-        start = time.time()
+        verbose_eval = os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1"
 
+        if verbose_eval:
+            print("start generate caption")
+
+        start = time.time()
         for imgs in iterate_batches(b64_imgs):
             raw = generate_caption(imgs)
-
             if len(raw) != len(imgs):
                 raise ValueError(f"Expected {len(imgs)} captions, got {len(raw)}")
-
             captions.extend(raw)
 
-        print("generation captions time:", time.time() - start)
+        if verbose_eval:
+            print("generation captions time:", time.time() - start)
 
         depth_info_all = self.process_depth(depth_images=depth_images)
 
@@ -320,7 +322,8 @@ class ONAir(BaseModelWrapper):
 
             self.grounding_dino_results[index] = {}
 
-            print(f"[Semantic Memory] Episode {index}: initialized")
+            if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
+                print(f"[Semantic Memory] Episode {index}: initialized")
 
     def run_grounding_dino_detection(self, index, rgb_images, object_name, description, step_num):
         try:
@@ -372,9 +375,11 @@ class ONAir(BaseModelWrapper):
 
         planned_path = self.plan_local_path(index, selected_target)
 
-        self.print_semantic_result(semantic_result, action, value)
+        if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
+            self.print_semantic_result(semantic_result, action, value)
+            self.print_memory_summary(index, memory_summary)
+
         self.print_selected_target(index, selected_target)
-        self.print_memory_summary(index, memory_summary)
         self.print_local_plan(index, planned_path)
 
         return action, value, done, semantic_result
@@ -397,9 +402,11 @@ class ONAir(BaseModelWrapper):
 
         planned_path = self.plan_local_path(index, selected_target)
 
-        self.print_semantic_result(semantic_result, action, value)
+        if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
+            self.print_semantic_result(semantic_result, action, value)
+            self.print_memory_summary(index, memory_summary)
+
         self.print_selected_target(index, selected_target)
-        self.print_memory_summary(index, memory_summary)
         self.print_local_plan(index, planned_path)
 
         return action, value, done, semantic_result
@@ -904,26 +911,44 @@ class ONAir(BaseModelWrapper):
     def print_target_verification(self, index, verification_info):
         if verification_info is None:
             return
-
         if not isinstance(verification_info, dict):
             return
 
+        verbose_eval = os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1"
+        verbose_stop = os.environ.get("AIRHUNT_VERBOSE_STOP", "0") == "1"
+
         if not verification_info.get("checked", False):
+            reason = verification_info.get("reason", "")
+            if reason is None:
+                reason = ""
+            if len(reason) > 220:
+                reason = reason[:220] + "..."
+
             print(
                 "[TargetVerifier] "
                 f"Episode {index}: checked=False, "
-                f"reason={verification_info.get('reason', '')}"
+                f"reason={reason}"
             )
             return
 
         selected_candidate_id = verification_info.get("selected_candidate_id", None)
+        reason = verification_info.get("reason", "")
+        reject_reason = verification_info.get("reject_reason", "")
         crop_caption = verification_info.get("crop_caption", "")
 
+        if reason is None:
+            reason = ""
+        if reject_reason is None:
+            reject_reason = ""
         if crop_caption is None:
             crop_caption = ""
 
-        if len(crop_caption) > 120:
-            crop_caption = crop_caption[:120] + "..."
+        if len(reason) > 220:
+            reason = reason[:220] + "..."
+        if len(reject_reason) > 220:
+            reject_reason = reject_reason[:220] + "..."
+        if len(crop_caption) > 140:
+            crop_caption = crop_caption[:140] + "..."
 
         print(
             "[TargetVerifier] "
@@ -934,10 +959,13 @@ class ONAir(BaseModelWrapper):
             f"hard_reject={verification_info.get('hard_reject', False)}, "
             f"selected={selected_candidate_id}, "
             f"candidate_count={verification_info.get('candidate_count', 0)}, "
-            f"reason={verification_info.get('reason', '')}, "
-            f"reject={verification_info.get('reject_reason', '')}, "
+            f"reason={reason}, "
+            f"reject={reject_reason}, "
             f"crop_caption={crop_caption}"
         )
+
+        if not verbose_eval and not verbose_stop:
+            return
 
         candidate_debug = verification_info.get("candidate_debug", [])
         if not isinstance(candidate_debug, list):
@@ -949,11 +977,11 @@ class ONAir(BaseModelWrapper):
 
             candidate_id = candidate.get("candidate_id", None)
             candidate_caption = candidate.get("crop_caption", "")
+
             if candidate_caption is None:
                 candidate_caption = ""
-
-            if len(candidate_caption) > 100:
-                candidate_caption = candidate_caption[:100] + "..."
+            if len(candidate_caption) > 120:
+                candidate_caption = candidate_caption[:120] + "..."
 
             crop_debug = candidate.get("crop_debug", {})
             if not isinstance(crop_debug, dict):
@@ -994,22 +1022,44 @@ class ONAir(BaseModelWrapper):
     def print_navigation_state(self, index, navigation_info):
         if navigation_info is None:
             return
+        if not isinstance(navigation_info, dict):
+            return
+
+        verbose_eval = os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1"
+        stop_trace = os.environ.get("AIRHUNT_STOP_TRACE", "1") != "0"
 
         changed = navigation_info.get("changed", False)
         prev_mode = navigation_info.get("prev_mode", "none")
         mode = navigation_info.get("mode", "none")
         reason = navigation_info.get("reason", "")
 
+        if reason is None:
+            reason = ""
+        if len(reason) > 240:
+            reason = reason[:240] + "..."
+
+        should_print = (
+            verbose_eval
+            or stop_trace
+            or changed
+            or mode != "explore"
+        )
+
+        if not should_print:
+            return
+
         if changed:
             print(
                 "[NavMode] "
-                f"Episode {index}: {prev_mode} -> {mode}, "
+                f"Episode {index}: "
+                f"{prev_mode} -> {mode}, "
                 f"reason={reason}"
             )
         else:
             print(
                 "[NavMode] "
-                f"Episode {index}: mode={mode}, "
+                f"Episode {index}: "
+                f"mode={mode}, "
                 f"reason={reason}"
             )
 
