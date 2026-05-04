@@ -33,6 +33,12 @@ class TargetTracker:
         stable_track_score=0.42,
         track_position_gate=12.0,
         track_spread_gate=8.0,
+        allow_down_verification=True,
+        down_candidate_score=0.28,
+        down_min_candidate_quality=0.10,
+        down_ground_span_scale=1.15,
+        down_stop_position_distance=3.0,
+        down_min_navigate_steps_before_stop=2,
     ):
         self.candidate_score = candidate_score
         self.confirm_score = confirm_score
@@ -67,6 +73,13 @@ class TargetTracker:
         self.track_position_gate = track_position_gate
         self.track_spread_gate = track_spread_gate
 
+        self.allow_down_verification = allow_down_verification
+        self.down_candidate_score = down_candidate_score
+        self.down_min_candidate_quality = down_min_candidate_quality
+        self.down_ground_span_scale = down_ground_span_scale
+        self.down_stop_position_distance = down_stop_position_distance
+        self.down_min_navigate_steps_before_stop = down_min_navigate_steps_before_stop
+
         self.candidate_buffer = []
         self.candidate_counter = 0
 
@@ -87,6 +100,8 @@ class TargetTracker:
         self.verified_target_score = 0.0
         self.verified_target_step = -1
         self.verified_candidate_id = None
+        self.verified_target_region = "unknown"
+        self.verified_from_overhead = False
 
     def reset(self):
         self.candidate_buffer = []
@@ -109,6 +124,8 @@ class TargetTracker:
         self.verified_target_score = 0.0
         self.verified_target_step = -1
         self.verified_candidate_id = None
+        self.verified_target_region = "unknown"
+        self.verified_from_overhead = False
 
     def update(self, grounding_result, current_pose, depth_info=None, step_num=0):
         observations = self.parse_grounding_result(
@@ -134,9 +151,7 @@ class TargetTracker:
         best_track = self.select_best_track(stable_only=False, step_num=step_num)
         best_stable_track = self.select_best_track(stable_only=True, step_num=step_num)
 
-        verification_candidates = self.get_verification_candidates(
-            step_num=step_num
-        )
+        verification_candidates = self.get_verification_candidates(step_num=step_num)
 
         candidate = len(self.get_recent_candidates(step_num=step_num)) > 0
         stable_track = best_stable_track is not None
@@ -203,6 +218,7 @@ class TargetTracker:
             "candidate": candidate,
             "horizontal_candidate": self.has_horizontal_candidate(verification_candidates),
             "down_candidate": self.has_down_candidate(observations),
+            "overhead_candidate": self.has_overhead_candidate(verification_candidates),
             "consistent": stable_track,
             "same_object": stable_track,
             "stable_track": stable_track,
@@ -223,6 +239,8 @@ class TargetTracker:
             "verified_target_position": self.verified_target_position,
             "verified_candidate_id": self.verified_candidate_id,
             "verified_track_id": self.verified_track_id,
+            "verified_target_region": self.verified_target_region,
+            "verified_from_overhead": self.verified_from_overhead,
             "candidate_buffer_size": len(self.candidate_buffer),
             "added_candidate_count": added_candidates,
             "verification_candidates": verification_candidates,
@@ -270,6 +288,12 @@ class TargetTracker:
 
         if checked and verified and selected_candidate_id is not None:
             candidate = self.find_candidate(selected_candidate_id)
+            if candidate is None:
+                selected_candidate = verification_info.get("selected_candidate", None)
+                if isinstance(selected_candidate, dict):
+                    candidate = selected_candidate
+                    self.candidate_buffer.append(candidate)
+
             if candidate is not None:
                 track = self.find_track(candidate.get("track_id", None))
                 self.set_verified_target(
@@ -316,9 +340,11 @@ class TargetTracker:
                 new_info["verified_target_position"] = self.verified_target_position
                 new_info["verified_candidate_id"] = self.verified_candidate_id
                 new_info["verified_track_id"] = self.verified_track_id
+                new_info["verified_target_region"] = self.verified_target_region
+                new_info["verified_from_overhead"] = self.verified_from_overhead
                 new_info["best_track"] = self.public_track_info(track)
                 new_info["reason"] = (
-                    "target object verified by task-aware track selection: "
+                    "target object verified by task-aware object selection: "
                     + str(verification_info.get("reason", ""))
                 )
                 return new_info
@@ -339,6 +365,8 @@ class TargetTracker:
             new_info["verified_target_position"] = self.verified_target_position
             new_info["verified_candidate_id"] = self.verified_candidate_id
             new_info["verified_track_id"] = self.verified_track_id
+            new_info["verified_target_region"] = self.verified_target_region
+            new_info["verified_from_overhead"] = self.verified_from_overhead
             new_info["track_summary"] = self.build_track_summary(
                 step_num=tracker_info.get("observation", {}).get("step_num", 0)
             )
@@ -370,6 +398,7 @@ class TargetTracker:
             "crop_caption",
             "crop_debug",
             "crop_path",
+            "context_path",
             "caption_ready",
             "caption_step",
             "caption_source",
@@ -530,12 +559,16 @@ class TargetTracker:
         )
         self.verified_target_step = int(candidate.get("step_num", 0))
         self.verified_candidate_id = candidate.get("candidate_id", None)
+        self.verified_target_region = candidate.get("camera_region", "unknown")
+        self.verified_from_overhead = bool(candidate.get("overhead_view", False))
 
         self.verified_target = dict(candidate)
         self.verified_target["target_world_position"] = self.verified_target_position
         self.verified_target["verification_confidence"] = confidence
         self.verified_target["verification_reason"] = verification_info.get("reason", "")
         self.verified_target["track_id"] = self.verified_track_id
+        self.verified_target["verified_target_region"] = self.verified_target_region
+        self.verified_target["verified_from_overhead"] = self.verified_from_overhead
 
         if track is not None:
             self.verified_target["track_position"] = track.get("position", None)
@@ -578,6 +611,8 @@ class TargetTracker:
         self.verified_target_step = -1
         self.verified_candidate_id = None
         self.verified_track_id = None
+        self.verified_target_region = "unknown"
+        self.verified_from_overhead = False
         self.navigate_count = 0
 
     def refresh_verified_target_from_track(self, step_num):
@@ -616,14 +651,21 @@ class TargetTracker:
         if not self.has_valid_verified_target(step_num=step_num):
             return False
 
-        if self.navigate_count < self.min_navigate_steps_before_stop:
-            return False
-
         current_xy = (float(current_pose[0]), float(current_pose[1]))
         distance = self.xy_distance(
             p1=current_xy,
             p2=self.verified_target_position
         )
+
+        if self.verified_from_overhead or self.verified_target_region == "down":
+            if self.navigate_count < self.down_min_navigate_steps_before_stop:
+                return False
+            if distance <= self.down_stop_position_distance:
+                return True
+            return False
+
+        if self.navigate_count < self.min_navigate_steps_before_stop:
+            return False
 
         if distance <= self.stop_position_distance:
             return True
@@ -648,11 +690,11 @@ class TargetTracker:
         relative_angle = self.normalize_angle(target_angle_world - float(current_pose[3]))
 
         move_distance = max(
-            2.0,
+            1.5,
             min(8.0, distance - self.navigate_stop_distance)
         )
         if distance <= self.navigate_stop_distance:
-            move_distance = 2.0
+            move_distance = min(2.0, max(1.0, distance))
 
         target_position = self.forward_position(
             current_pose=current_pose,
@@ -660,9 +702,13 @@ class TargetTracker:
             move_distance=move_distance
         )
 
+        target_type = "verified_target_navigate"
+        if self.verified_from_overhead:
+            target_type = "verified_overhead_navigate"
+
         return {
             "valid": True,
-            "target_type": "verified_target_navigate",
+            "target_type": target_type,
             "position": target_position,
             "viewpoint_position": target_position,
             "target_world_position": target_xy,
@@ -679,6 +725,8 @@ class TargetTracker:
             "estimated_depth": self.verified_target.get("estimated_depth", None) if self.verified_target else None,
             "candidate_id": self.verified_candidate_id,
             "track_id": self.verified_track_id,
+            "camera_region": self.verified_target_region,
+            "overhead_view": self.verified_from_overhead,
             "stop_reason": "",
         }
 
@@ -704,6 +752,8 @@ class TargetTracker:
             "estimated_depth": self.verified_target.get("estimated_depth", None) if self.verified_target else None,
             "candidate_id": self.verified_candidate_id,
             "track_id": self.verified_track_id,
+            "camera_region": self.verified_target_region,
+            "overhead_view": self.verified_from_overhead,
             "stop_reason": "reached verified target object position",
         }
 
@@ -822,12 +872,32 @@ class TargetTracker:
                 relative_angle=relative_angle,
                 estimated_depth=estimated_depth
             )
-        else:
+            verification_only = False
+            navigation_allowed = True
+            overhead_view = False
+        elif is_downward:
             camera_yaw_offset = 0.0
             bbox_yaw_offset = 0.0
             relative_angle = 0.0
             relative_region = "down"
+            target_world_position = self.estimate_down_world_position(
+                current_pose=current_pose,
+                center_offset_x=center_offset_x,
+                center_offset_y=center_offset_y,
+                estimated_depth=estimated_depth
+            )
+            verification_only = True
+            navigation_allowed = False
+            overhead_view = True
+        else:
+            camera_yaw_offset = 0.0
+            bbox_yaw_offset = 0.0
+            relative_angle = 0.0
+            relative_region = "unknown"
             target_world_position = None
+            verification_only = True
+            navigation_allowed = False
+            overhead_view = False
 
         quality_score = self.compute_detection_quality(
             score=score,
@@ -863,6 +933,9 @@ class TargetTracker:
             "camera_region": camera_region,
             "is_horizontal": is_horizontal,
             "is_downward": is_downward,
+            "verification_only": verification_only,
+            "navigation_allowed": navigation_allowed,
+            "overhead_view": overhead_view,
             "camera_yaw_offset": round(camera_yaw_offset, 2),
             "bbox_yaw_offset": round(bbox_yaw_offset, 2),
             "relative_angle": round(relative_angle, 2),
@@ -911,6 +984,7 @@ class TargetTracker:
                 candidate["track_hit_count"] = track.get("hit_count", 0)
                 candidate["stable_step_count"] = track.get("stable_step_count", 0)
                 candidate["track_stable"] = track.get("stable", False)
+                candidate["track_position"] = track.get("position", None)
 
             self.candidate_buffer.append(candidate)
             added_count += 1
@@ -932,10 +1006,17 @@ class TargetTracker:
         if not observation.get("valid", False):
             return "invalid_detection"
 
-        if not observation.get("is_horizontal", False):
-            return "non_horizontal_view"
+        is_horizontal = observation.get("is_horizontal", False)
+        is_downward = observation.get("is_downward", False)
 
-        if observation.get("score", 0.0) < self.candidate_score:
+        if not is_horizontal and not is_downward:
+            return "unknown_view"
+
+        if is_downward and not self.allow_down_verification:
+            return "down_view_disabled"
+
+        score_threshold = self.down_candidate_score if is_downward else self.candidate_score
+        if observation.get("score", 0.0) < score_threshold:
             return "low_gdino_score"
 
         if observation.get("area_ratio", 0.0) < self.min_area_ratio:
@@ -959,7 +1040,8 @@ class TargetTracker:
         if observation.get("target_world_position", None) is None:
             return "no_target_world_position"
 
-        if observation.get("quality_score", 0.0) < self.min_candidate_quality:
+        quality_threshold = self.down_min_candidate_quality if is_downward else self.min_candidate_quality
+        if observation.get("quality_score", 0.0) < quality_threshold:
             return "low_candidate_quality"
 
         return "ok"
@@ -975,6 +1057,11 @@ class TargetTracker:
             "detection_index": int(observation.get("detection_index", 0)),
             "image_index": int(observation.get("image_index", -1)),
             "camera_region": observation.get("camera_region", "unknown"),
+            "is_horizontal": bool(observation.get("is_horizontal", False)),
+            "is_downward": bool(observation.get("is_downward", False)),
+            "verification_only": bool(observation.get("verification_only", False)),
+            "navigation_allowed": bool(observation.get("navigation_allowed", True)),
+            "overhead_view": bool(observation.get("overhead_view", False)),
             "phrase": observation.get("phrase", ""),
             "score": float(observation.get("score", 0.0)),
             "bbox": observation.get("bbox", None),
@@ -1006,6 +1093,7 @@ class TargetTracker:
             "crop_caption": "",
             "crop_debug": {},
             "crop_path": "",
+            "context_path": "",
             "caption_ready": False,
             "caption_step": -1,
             "caption_source": "",
@@ -1023,9 +1111,15 @@ class TargetTracker:
         width_ratio = float(observation.get("width_ratio", 0.0))
         height_ratio = float(observation.get("height_ratio", 0.0))
         center_offset_x = abs(float(observation.get("center_offset_x", 0.0)))
+        center_offset_y = abs(float(observation.get("center_offset_y", 0.0)))
 
         if observation.get("camera_region", "unknown") == "front":
             quality += 0.10
+
+        if observation.get("camera_region", "unknown") == "down":
+            quality += 0.04
+            if center_offset_x <= 0.65 and center_offset_y <= 0.65:
+                quality += 0.06
 
         if center_offset_x <= 0.50:
             quality += 0.05
@@ -1162,6 +1256,9 @@ class TargetTracker:
         if track_region in horizontal_regions and candidate_region in horizontal_regions:
             return 0.65
 
+        if "down" in [track_region, candidate_region]:
+            return 0.55
+
         return 0.2
 
     def compute_phrase_score(self, track, candidate):
@@ -1221,6 +1318,7 @@ class TargetTracker:
             "relative_angles": [float(candidate.get("relative_angle", 0.0))],
             "last_camera_region": candidate.get("camera_region", "unknown"),
             "camera_regions": [candidate.get("camera_region", "unknown")],
+            "has_overhead_observation": bool(candidate.get("overhead_view", False)),
             "last_phrase": candidate.get("phrase", ""),
             "phrases": [candidate.get("phrase", "")],
             "last_score": float(candidate.get("score", 0.0)),
@@ -1292,6 +1390,7 @@ class TargetTracker:
         track["last_phrase"] = candidate.get("phrase", "")
         track["last_score"] = float(candidate.get("score", 0.0))
         track["last_area_ratio"] = float(candidate.get("area_ratio", 0.0))
+        track["has_overhead_observation"] = bool(track.get("has_overhead_observation", False)) or bool(candidate.get("overhead_view", False))
 
         candidate_ids = track.get("candidate_ids", [])
         candidate_ids.append(candidate.get("candidate_id", None))
@@ -1513,6 +1612,7 @@ class TargetTracker:
             "best_candidate_id": track.get("best_candidate_id", None),
             "last_candidate_id": track.get("last_candidate_id", None),
             "last_camera_region": track.get("last_camera_region", "unknown"),
+            "has_overhead_observation": bool(track.get("has_overhead_observation", False)),
             "last_phrase": track.get("last_phrase", ""),
         }
 
@@ -1522,6 +1622,7 @@ class TargetTracker:
             "stable": 0,
             "verified": 0,
             "rejected": 0,
+            "overhead": 0,
             "best": None,
         }
 
@@ -1535,6 +1636,8 @@ class TargetTracker:
                 summary["verified"] += 1
             if int(track.get("reject_count", 0)) > 0:
                 summary["rejected"] += 1
+            if bool(track.get("has_overhead_observation", False)):
+                summary["overhead"] += 1
 
         return summary
 
@@ -1642,6 +1745,7 @@ class TargetTracker:
             candidate["track_position"] = track.get("position", None)
             candidate["track_stable"] = bool(track.get("stable", False))
             candidate["track_verified"] = bool(track.get("verified", False))
+            candidate["track_has_overhead_observation"] = bool(track.get("has_overhead_observation", False))
             track_candidates.append(candidate)
 
         if len(track_candidates) == 0:
@@ -1667,6 +1771,9 @@ class TargetTracker:
 
         if candidate.get("camera_region", "unknown") == "front":
             priority += 0.08
+
+        if candidate.get("camera_region", "unknown") == "down":
+            priority += 0.06
 
         if abs(float(candidate.get("center_offset_x", 0.0))) <= 0.50:
             priority += 0.04
@@ -1746,8 +1853,16 @@ class TargetTracker:
     def has_down_candidate(self, observations):
         for observation in observations:
             if observation.get("camera_region", "unknown") == "down":
-                if observation.get("score", 0.0) >= self.confirm_score:
+                if observation.get("score", 0.0) >= self.down_candidate_score:
                     return True
+        return False
+
+    def has_overhead_candidate(self, candidates):
+        for candidate in candidates:
+            if candidate.get("camera_region", "unknown") == "down":
+                return True
+            if bool(candidate.get("overhead_view", False)):
+                return True
         return False
 
     def select_best_observation(self, observations):
@@ -1803,7 +1918,7 @@ class TargetTracker:
             quality *= 0.20
 
         if is_downward:
-            quality *= 0.30
+            quality *= 0.75
 
         if not is_horizontal and not is_downward:
             quality *= 0.20
@@ -1821,15 +1936,22 @@ class TargetTracker:
             "total": len(observations),
             "accepted": 0,
             "rejected": 0,
+            "down_accepted": 0,
+            "down_rejected": 0,
             "reasons": {},
         }
 
         for observation in observations:
             reason = observation.get("candidate_filter_reason", "unknown")
+            is_downward = bool(observation.get("is_downward", False))
             if reason == "ok":
                 summary["accepted"] += 1
+                if is_downward:
+                    summary["down_accepted"] += 1
             else:
                 summary["rejected"] += 1
+                if is_downward:
+                    summary["down_rejected"] += 1
             summary["reasons"][reason] = summary["reasons"].get(reason, 0) + 1
 
         return summary
@@ -1905,6 +2027,32 @@ class TargetTracker:
 
         tx = x + math.cos(math.radians(target_yaw)) * estimated_depth
         ty = y + math.sin(math.radians(target_yaw)) * estimated_depth
+
+        return (round(tx, 2), round(ty, 2))
+
+    def estimate_down_world_position(self, current_pose, center_offset_x, center_offset_y, estimated_depth=None):
+        x, y, z, yaw = current_pose
+        altitude = abs(float(z))
+
+        if estimated_depth is not None:
+            ground_span = max(2.0, min(30.0, float(estimated_depth)))
+        else:
+            ground_span = max(2.0, min(30.0, altitude * self.down_ground_span_scale))
+
+        right_offset = float(center_offset_x) * ground_span
+        forward_offset = -float(center_offset_y) * ground_span
+
+        yaw_rad = math.radians(float(yaw))
+        tx = (
+            float(x)
+            + math.cos(yaw_rad) * forward_offset
+            - math.sin(yaw_rad) * right_offset
+        )
+        ty = (
+            float(y)
+            + math.sin(yaw_rad) * forward_offset
+            + math.cos(yaw_rad) * right_offset
+        )
 
         return (round(tx, 2), round(ty, 2))
 
@@ -2015,6 +2163,9 @@ class TargetTracker:
             "camera_region": "none",
             "is_horizontal": False,
             "is_downward": False,
+            "verification_only": False,
+            "navigation_allowed": False,
+            "overhead_view": False,
             "camera_yaw_offset": 0.0,
             "bbox_yaw_offset": 0.0,
             "relative_angle": 0.0,
@@ -2055,5 +2206,7 @@ class TargetTracker:
             "estimated_depth": None,
             "candidate_id": None,
             "track_id": None,
+            "camera_region": "unknown",
+            "overhead_view": False,
             "stop_reason": "",
         }

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+
 from io import BytesIO
 
 import numpy as np
@@ -20,17 +21,25 @@ class TargetVerifier:
         min_stable_step_count=2,
         debug_dir="debug/target_verifier",
         save_debug_crops=True,
+        allow_down_candidates=True,
+        crop_padding=0.35,
+        min_crop_size=224,
+        context_padding=1.60,
     ):
         self.client = client
-        self.model = model
-        self.verification_threshold = verification_threshold
-        self.max_candidates = max_candidates
+        self.model = os.getenv("TARGET_VERIFIER_MODEL", model)
+        self.verification_threshold = float(os.getenv("TARGET_VERIFIER_THRESHOLD", verification_threshold))
+        self.max_candidates = int(os.getenv("TARGET_VERIFIER_MAX_CANDIDATES", max_candidates))
         self.hard_reject_large_area = hard_reject_large_area
         self.small_object_large_area = small_object_large_area
         self.require_stable_track = require_stable_track
         self.min_stable_step_count = min_stable_step_count
         self.debug_dir = debug_dir
         self.save_debug_crops = save_debug_crops
+        self.allow_down_candidates = os.getenv("TARGET_VERIFIER_ALLOW_DOWN", "1") == "1" and allow_down_candidates
+        self.crop_padding = float(os.getenv("TARGET_VERIFIER_CROP_PADDING", crop_padding))
+        self.min_crop_size = int(os.getenv("TARGET_VERIFIER_MIN_CROP_SIZE", min_crop_size))
+        self.context_padding = float(os.getenv("TARGET_VERIFIER_CONTEXT_PADDING", context_padding))
 
     def verify_sync(
         self,
@@ -96,15 +105,15 @@ class TargetVerifier:
             )
 
         candidates = candidates[:self.max_candidates]
-        candidates = self.attach_crop_captions(
+        candidates = self.attach_visual_evidence(
             candidates=candidates,
             rgb_images=rgb_images,
             current_step_num=current_step_num,
             encode_image_fn=encode_image_fn,
             generate_caption_fn=generate_caption_fn
         )
-
         candidates = self.filter_caption_ready_candidates(candidates)
+
         if len(candidates) == 0:
             return self.default_result(
                 checked=True,
@@ -235,10 +244,16 @@ class TargetVerifier:
             if not isinstance(candidate, dict):
                 continue
 
+            camera_region = candidate.get("camera_region", "unknown")
+            is_down = camera_region == "down" or bool(candidate.get("overhead_view", False))
+
             if candidate.get("target_world_position", None) is None:
                 continue
 
-            if candidate.get("camera_region", "unknown") not in ["front", "left", "right"]:
+            if camera_region not in ["front", "left", "right", "down"]:
+                continue
+
+            if is_down and not self.allow_down_candidates:
                 continue
 
             if bool(candidate.get("full_frame_like_box", False)):
@@ -265,12 +280,15 @@ class TargetVerifier:
                 if candidate.get("track_id", None) is None:
                     continue
 
-            valid_candidates.append(dict(candidate))
+            candidate = dict(candidate)
+            candidate["verification_view_role"] = "overhead" if is_down else "horizontal"
+            valid_candidates.append(candidate)
 
         valid_candidates.sort(
             key=lambda item: item.get("verification_priority", item.get("candidate_quality", 0.0)),
             reverse=True
         )
+
         return valid_candidates
 
     def filter_caption_ready_candidates(self, candidates):
@@ -298,6 +316,7 @@ class TargetVerifier:
             key=lambda item: item.get("verification_priority", item.get("candidate_quality", 0.0)),
             reverse=True
         )
+
         return valid_candidates
 
     def validate_selected_candidate(self, selected_candidate, selected_track_id, confidence):
@@ -308,8 +327,12 @@ class TargetVerifier:
         if not isinstance(crop_caption, str) or len(crop_caption.strip()) == 0:
             return False, "Selected candidate has no crop caption."
 
-        if selected_candidate.get("camera_region", "unknown") not in ["front", "left", "right"]:
-            return False, "Selected candidate is not from a horizontal camera view."
+        camera_region = selected_candidate.get("camera_region", "unknown")
+        if camera_region not in ["front", "left", "right", "down"]:
+            return False, "Selected candidate is not from an allowed camera view."
+
+        if camera_region == "down" and not self.allow_down_candidates:
+            return False, "Down-view verification is disabled."
 
         if self.require_stable_track:
             if not bool(selected_candidate.get("track_stable", False)):
@@ -337,7 +360,7 @@ class TargetVerifier:
 
         return True, ""
 
-    def attach_crop_captions(
+    def attach_visual_evidence(
         self,
         candidates,
         rgb_images,
@@ -388,9 +411,23 @@ class TargetVerifier:
 
             crop, crop_debug = self.build_candidate_crop(
                 rgb_images=rgb_images,
-                candidate=candidate
+                candidate=candidate,
+                padding=self.crop_padding,
+                min_size=self.min_crop_size,
+                crop_kind="target"
             )
             candidate["crop_debug"] = crop_debug
+
+            context, context_debug = self.build_candidate_crop(
+                rgb_images=rgb_images,
+                candidate=candidate,
+                padding=self.context_padding,
+                min_size=self.min_crop_size,
+                crop_kind="context"
+            )
+            candidate["context_debug"] = context_debug
+            if isinstance(context_debug, dict):
+                candidate["context_path"] = context_debug.get("crop_path", "")
 
             if crop is None:
                 candidate["crop_caption"] = ""
@@ -416,16 +453,7 @@ class TargetVerifier:
 
         try:
             crop_b64 = encode_image_fn(crop_bytes_list)
-            for idx in crop_indices:
-                candidates[idx]["crop_debug"]["stage"] = "encode_crop"
-                candidates[idx]["crop_debug"]["encoded_type"] = str(type(crop_b64))
-                candidates[idx]["crop_debug"]["encoded_count"] = len(crop_b64) if isinstance(crop_b64, list) else 0
-
             crop_captions = generate_caption_fn(crop_b64)
-            for idx in crop_indices:
-                candidates[idx]["crop_debug"]["stage"] = "generate_caption"
-                candidates[idx]["crop_debug"]["caption_type"] = str(type(crop_captions))
-                candidates[idx]["crop_debug"]["caption_raw"] = str(crop_captions)
 
             if not isinstance(crop_captions, list):
                 for idx in crop_indices:
@@ -454,7 +482,6 @@ class TargetVerifier:
                     candidates[candidate_idx]["crop_debug"]["reason"] = "caption list shorter than crop list"
                     candidates[candidate_idx]["caption_ready"] = False
                     candidates[candidate_idx]["caption_source"] = "caption_missing"
-
         except Exception as e:
             for idx in crop_indices:
                 candidates[idx]["crop_caption"] = ""
@@ -476,7 +503,7 @@ class TargetVerifier:
             return True
         return True
 
-    def build_candidate_crop(self, rgb_images, candidate):
+    def build_candidate_crop(self, rgb_images, candidate, padding=0.35, min_size=224, crop_kind="target"):
         crop_debug = self.default_crop_debug(
             candidate=candidate,
             stage="start",
@@ -488,6 +515,8 @@ class TargetVerifier:
             bbox = candidate.get("bbox", None)
             crop_debug["image_index"] = image_index
             crop_debug["bbox"] = bbox
+            crop_debug["crop_kind"] = crop_kind
+            crop_debug["padding"] = padding
 
             if rgb_images is None:
                 crop_debug["stage"] = "check_rgb_images"
@@ -517,8 +546,10 @@ class TargetVerifier:
             crop_debug["image_size"] = [width, height]
 
             x1, y1, x2, y2 = [float(v) for v in bbox]
-            pad_x = max(6.0, (x2 - x1) * 0.20)
-            pad_y = max(6.0, (y2 - y1) * 0.20)
+            box_w = max(1.0, x2 - x1)
+            box_h = max(1.0, y2 - y1)
+            pad_x = max(6.0, box_w * padding)
+            pad_y = max(6.0, box_h * padding)
 
             x1 = max(0, int(x1 - pad_x))
             y1 = max(0, int(y1 - pad_y))
@@ -526,30 +557,48 @@ class TargetVerifier:
             y2 = min(height, int(y2 + pad_y))
 
             crop_debug["crop_box"] = [x1, y1, x2, y2]
+
             if x2 <= x1 or y2 <= y1:
                 crop_debug["stage"] = "crop_box"
                 crop_debug["reason"] = f"invalid crop box: {[x1, y1, x2, y2]}"
                 return None, crop_debug
 
             crop = image.crop((x1, y1, x2, y2))
+            crop_debug["crop_size_before_resize"] = [crop.size[0], crop.size[1]]
+
+            crop = self.resize_small_crop(crop, min_size=min_size)
             crop_debug["crop_size"] = [crop.size[0], crop.size[1]]
 
             crop_path = self.save_debug_crop(
                 crop=crop,
                 candidate=candidate,
-                image_index=image_index
+                image_index=image_index,
+                crop_kind=crop_kind
             )
             crop_debug["crop_path"] = crop_path
             crop_debug["stage"] = "crop"
             crop_debug["reason"] = "crop built"
-            candidate["crop_path"] = crop_path
+
+            if crop_kind == "target":
+                candidate["crop_path"] = crop_path
+            else:
+                candidate["context_path"] = crop_path
 
             return crop, crop_debug
-
         except Exception as e:
             crop_debug["stage"] = "exception"
             crop_debug["reason"] = str(e)
             return None, crop_debug
+
+    def resize_small_crop(self, crop, min_size=224):
+        width, height = crop.size
+        if width >= min_size and height >= min_size:
+            return crop
+
+        scale = max(float(min_size) / max(1.0, width), float(min_size) / max(1.0, height))
+        new_width = int(round(width * scale))
+        new_height = int(round(height * scale))
+        return crop.resize((new_width, new_height), Image.BICUBIC)
 
     def to_pil_image(self, image):
         if isinstance(image, Image.Image):
@@ -572,20 +621,19 @@ class TargetVerifier:
                 array = image
                 if array.dtype != np.uint8:
                     array = np.clip(array, 0, 255).astype(np.uint8)
-
                 if len(array.shape) == 2:
                     return Image.fromarray(array).convert("RGB")
-
                 if len(array.shape) == 3:
                     if array.shape[0] in [1, 3, 4] and array.shape[2] not in [1, 3, 4]:
                         array = np.transpose(array, (1, 2, 0))
                     if array.shape[2] == 1:
                         array = array[:, :, 0]
                     return Image.fromarray(array).convert("RGB")
-
-            return Image.fromarray(image).convert("RGB")
+                return Image.fromarray(image).convert("RGB")
         except Exception:
             return None
+
+        return None
 
     def bytes_to_pil_image(self, image_bytes):
         try:
@@ -599,19 +647,15 @@ class TargetVerifier:
             for channels in [4, 3, 1]:
                 if array.size % channels != 0:
                     continue
-
                 pixels = array.size // channels
                 side = int(np.sqrt(pixels))
                 if side * side != pixels:
                     continue
-
                 if channels == 1:
                     raw_image = array.reshape((side, side))
                 else:
                     raw_image = array.reshape((side, side, channels))
-
                 return Image.fromarray(raw_image).convert("RGB")
-
             return None
         except Exception:
             return None
@@ -624,7 +668,7 @@ class TargetVerifier:
         except Exception:
             return None
 
-    def save_debug_crop(self, crop, candidate, image_index):
+    def save_debug_crop(self, crop, candidate, image_index, crop_kind="target"):
         if not self.save_debug_crops:
             return ""
 
@@ -643,6 +687,7 @@ class TargetVerifier:
             os.makedirs(step_dir, exist_ok=True)
 
             filename = (
+                f"{crop_kind}_"
                 f"{candidate_id}_"
                 f"{track_id}_"
                 f"img_{image_index}_"
@@ -707,6 +752,8 @@ class TargetVerifier:
                 "step_num": candidate.get("step_num", None),
                 "image_index": candidate.get("image_index", None),
                 "camera_region": candidate.get("camera_region", None),
+                "verification_view_role": candidate.get("verification_view_role", "unknown"),
+                "overhead_view": candidate.get("overhead_view", False),
                 "score": candidate.get("score", 0.0),
                 "area_ratio": candidate.get("area_ratio", 0.0),
                 "bbox": candidate.get("bbox", None),
@@ -717,6 +764,8 @@ class TargetVerifier:
                 "caption_source": candidate.get("caption_source", ""),
                 "verification_reject_count": candidate.get("verification_reject_count", 0),
                 "verification_priority": candidate.get("verification_priority", 0.0),
+                "crop_path": candidate.get("crop_path", ""),
+                "context_path": candidate.get("context_path", ""),
                 "crop_debug": crop_debug,
             })
 
@@ -740,10 +789,10 @@ class TargetVerifier:
         return (
             "You are the Task-2 object verification module for an aerial object navigation system. "
             "The detector may hallucinate objects, misclassify background textures, or produce poorly localized boxes. "
-            "You must verify whether one stable tracked candidate is exactly the target object described by the instruction. "
-            "Only select a candidate when its crop caption, local context, bbox information, and track evidence clearly support the target. "
-            "If none clearly matches, return none. "
-            "Do not decide navigation actions and do not decide whether the drone should stop."
+            "Your job is to select the candidate object that best matches the target instruction, or select none. "
+            "Use crop captions, local context, camera view role, bbox information, and track evidence. "
+            "Down-view candidates are overhead evidence: they may verify that the target is below the UAV, but they do not imply an immediate stop. "
+            "Do not output navigation actions and do not decide whether the drone should stop."
         )
 
     def build_prompt(
@@ -780,11 +829,14 @@ class TargetVerifier:
                 "track_hit_count": candidate.get("track_hit_count", 0),
                 "track_score": candidate.get("track_score", 0.0),
                 "track_position": candidate.get("track_position", None),
+                "track_has_overhead_observation": candidate.get("track_has_overhead_observation", False),
                 "phrase": candidate.get("phrase", ""),
                 "detector_score": candidate.get("score", 0.0),
                 "verification_priority": candidate.get("verification_priority", 0.0),
                 "verification_reject_count": candidate.get("verification_reject_count", 0),
                 "camera_region": candidate.get("camera_region", "unknown"),
+                "verification_view_role": candidate.get("verification_view_role", "unknown"),
+                "overhead_view": candidate.get("overhead_view", False),
                 "image_index": candidate.get("image_index", -1),
                 "bbox": candidate.get("bbox", None),
                 "area_ratio": candidate.get("area_ratio", 0.0),
@@ -795,6 +847,7 @@ class TargetVerifier:
                 "caption_ready": candidate.get("caption_ready", False),
                 "caption_source": candidate.get("caption_source", ""),
                 "crop_path": candidate.get("crop_path", ""),
+                "context_path": candidate.get("context_path", ""),
                 "crop_debug_stage": crop_debug.get("stage", ""),
                 "crop_debug_reason": crop_debug.get("reason", ""),
             })
@@ -830,17 +883,18 @@ Semantic reasoning result:
 - evidence: {semantic_result.get("evidence", [])}
 
 Task:
-This is related-object verification, not navigation control. Select exactly one candidate only if it is the target object specified by the instruction.
+This is related-object verification, not navigation control.
+Select exactly one candidate only if it is the most likely target object specified by the instruction.
 
 Selection rules:
-1. A valid target must match the detailed object description, not just the detector phrase.
-2. Use the crop_caption as the primary visual evidence. Do not select a candidate with an empty or vague crop_caption.
-3. Use the four-view captions only as context; they cannot override a negative crop caption.
-4. Use track evidence as support. Prefer candidates with stable_step_count >= 2 and track_stable=true.
-5. Reject background regions such as trees, vegetation, wall, roof, road, sidewalk, shadow, hut, shed, building facade, bench, sculpture, or vague clutter unless the crop clearly shows the requested target object.
-6. Reject candidates whose crop describes a similar but wrong object, wrong color, wrong size, wrong material, wrong shape, or missing key attributes.
-7. If the evidence is ambiguous, return decision="none" and selected_candidate_id=null.
-8. Verifying an object does not mean the drone should stop.
+1. Use crop_caption as the primary object-level evidence.
+2. Use four-view captions as context only; they cannot override a clearly negative crop caption.
+3. Use track evidence as support. Prefer track_stable=true and stable_step_count >= 2.
+4. Horizontal candidates can support target navigation if selected.
+5. Down-view candidates are valid verification evidence when the target appears below the UAV; selecting a down-view candidate means the target is likely under/near the UAV, not that the drone should immediately stop.
+6. Reject background regions such as tree, vegetation, roof, hut, shed, building, dock, pier, sign, rock, water, boat, or clutter unless the crop itself clearly contains the requested target object.
+7. If a crop contains a background person but the boxed candidate/object is mainly a structure or clutter, return none.
+8. If evidence is ambiguous, return decision="none".
 
 Output only valid JSON with this exact schema:
 {{
@@ -848,7 +902,7 @@ Output only valid JSON with this exact schema:
   "selected_candidate_id": "candidate id string or null",
   "selected_track_id": "track id string or null",
   "confidence": 0.0,
-  "reason": "short explanation based on crop caption and context",
+  "reason": "short explanation based on crop caption, context, camera view, and track evidence",
   "reject_reason": "short explanation if no candidate is selected, otherwise empty"
 }}
 """
@@ -872,6 +926,7 @@ Output only valid JSON with this exact schema:
                 parsed["selected_candidate_id"] = None
             if parsed.get("selected_track_id", None) in ["", "null", "None", "none"]:
                 parsed["selected_track_id"] = None
+
             if parsed.get("decision", None) is None:
                 parsed["decision"] = "select" if parsed.get("selected_candidate_id", None) is not None else "none"
 
