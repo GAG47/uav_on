@@ -18,7 +18,7 @@ from utils.logger import logger
 sys.path.append(str(Path(str(os.getcwd())).resolve()))
 
 from airsim_plugin.AirVLNSimulatorClientTool import AirVLNSimulatorClientTool
-from utils.env_utils_uav import SimState, getNextPosition
+from utils.env_utils_uav import SimState
 from utils.env_vector_uav import VectorEnvUtil
 
 
@@ -375,7 +375,22 @@ class AirVLNENV:
                 index=index
             )
 
-            if use_continuous and action != 'stop' and self.sim_states[index].is_end == False:
+            if action == 'stop' or self.sim_states[index].is_end == True:
+                new_pose = copy.deepcopy(airsim_pose)
+                fly_type = "move"
+                executed_actions.append('stop')
+                execute_infos.append({
+                    "execute_type": "stop_hold",
+                    "next_waypoint": None,
+                    "step_distance": 0.0,
+                    "max_continuous_step": self.max_continuous_step,
+                    "is_step_limited": False,
+                    "planned_path_len": 0,
+                    "planned_path_length": 0.0,
+                    "hold_reason": "episode stopped"
+                })
+
+            elif use_continuous:
                 new_pose, fly_type, execute_info = self.get_continuous_next_pose(
                     airsim_pose=airsim_pose,
                     planned_path=planned_path,
@@ -383,34 +398,35 @@ class AirVLNENV:
                 )
                 executed_actions.append('continuous')
                 execute_infos.append(execute_info)
+
             else:
-                new_pose, fly_type = getNextPosition(
-                    airsim_pose,
-                    action,
-                    steps_size[index],
-                    is_fixed
-                )
-                executed_actions.append(action)
+                new_pose = copy.deepcopy(airsim_pose)
+                fly_type = "move"
+                executed_actions.append('continuous_hold')
                 execute_infos.append({
-                    "execute_type": "legacy",
+                    "execute_type": "continuous_hold",
                     "next_waypoint": None,
                     "step_distance": 0.0,
                     "max_continuous_step": self.max_continuous_step,
                     "is_step_limited": False,
                     "planned_path_len": 0,
-                    "planned_path_length": 0.0
+                    "planned_path_length": 0.0,
+                    "hold_reason": "no valid continuous planned path"
                 })
+                print(
+                    "[Continuous Execute] "
+                    f"Episode {index}: no valid planned path; "
+                    "holding position instead of using legacy fallback."
+                )
 
             prev_pitch, prev_roll, prev_yaw = airsim.to_eularian_angles(airsim_pose.orientation)
             curr_pitch, curr_roll, curr_yaw = airsim.to_eularian_angles(new_pose.orientation)
-
             delta_yaw = abs((math.degrees(curr_yaw - prev_yaw) + 180) % 360 - 180)
             self.sim_states[index].heading_changes.append(delta_yaw)
 
             pos = new_pose.position
             curr = np.array([pos.x_val, pos.y_val, pos.z_val])
             coords = np.array(self.batch[index]["object_position"])
-
             if coords.ndim == 2 and coords.shape[1] == 3:
                 dists = np.linalg.norm(coords - curr[None, :], axis=1)
                 min_dist = dists.min()
@@ -425,12 +441,10 @@ class AirVLNENV:
 
         format_pose = []
         format_fly_type = []
-
         cnt = 0
         for index1, item in enumerate(self.machines_info):
             format_pose.append([])
             format_fly_type.append([])
-
             for index2, _ in enumerate(item['open_scenes']):
                 format_pose[index1].append(poses[cnt])
                 format_fly_type[index1].append(fly_types[cnt])
@@ -440,7 +454,6 @@ class AirVLNENV:
             poses_list=format_pose,
             fly_types=format_fly_type
         )
-
         if not result:
             logger.error('move_to_next_pose error')
 
@@ -460,7 +473,6 @@ class AirVLNENV:
             self.sim_states[index].step += 1
 
             traj = self.sim_states[index].trajectory
-
             if len(traj) >= 1:
                 p_prev = np.array(traj[-1]['sensors']['state']['position'])
             else:
@@ -475,7 +487,6 @@ class AirVLNENV:
                 poses[index].position.y_val,
                 poses[index].position.z_val
             ])
-
             step_dist = np.linalg.norm(p_curr - p_prev)
             self.sim_states[index].move_distance += step_dist
 
@@ -502,10 +513,8 @@ class AirVLNENV:
                 'distance_to_target': round(distance_to_target, 2),
                 'execute_type': executed_actions[index],
             }
-
             trajectory_info.update(execute_infos[index])
             self.sim_states[index].trajectory.append(trajectory_info)
-
 
     def get_planned_path_for_episode(self, planned_paths, index):
         if planned_paths is None:

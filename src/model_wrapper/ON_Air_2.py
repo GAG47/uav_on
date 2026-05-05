@@ -472,11 +472,11 @@ class ONAir(BaseModelWrapper):
 
             tracker_info = navigation_info.get("tracker_info", {})
             if isinstance(tracker_info, dict):
-                stop_target["target_world_position"] = tracker_info.get("verified_target_position", None)
-
+                stop_target["target_world_position"] = tracker_info.get(
+                    "verified_target_position", None
+                )
             stop_target["stop_reason"] = navigation_info.get(
-                "reason",
-                "reached verified target object position"
+                "reason", "reached verified target object position"
             )
             self.memory_targets[index] = stop_target
             return "stop", 0, True, stop_target
@@ -489,7 +489,7 @@ class ONAir(BaseModelWrapper):
             NavigationState.MODE_RECOVER
         ]:
             if isinstance(planner_target, dict) and planner_target.get("valid", False):
-                action, value, done = self.target_to_legacy_action(
+                action, value, done = self.target_to_continuous_action(
                     target=planner_target,
                     semantic_result=semantic_result,
                     fixed=fixed
@@ -497,46 +497,44 @@ class ONAir(BaseModelWrapper):
                 self.memory_targets[index] = planner_target
                 return action, value, done, planner_target
 
-        return self.memory_to_legacy_action(
+        return self.memory_to_continuous_target(
             index=index,
             semantic_result=semantic_result,
             fixed=fixed
         )
 
-    def memory_to_legacy_action(self, index, semantic_result, fixed):
+    def memory_to_continuous_target(self, index, semantic_result, fixed):
         try:
             memory = self.semantic_memories[index]
             current_pose = self.current_poses[index]
-
             memory_target = memory.get_best_memory_target(
                 current_pose=current_pose,
                 min_confidence=0.05,
                 min_distance=3.0,
                 max_distance=45.0
             )
-
             self.memory_targets[index] = memory_target
 
-            if memory_target.get("valid", False):
-                action, value, done = self.target_to_legacy_action(
+            if isinstance(memory_target, dict) and memory_target.get("valid", False):
+                action, value, done = self.target_to_continuous_action(
                     target=memory_target,
                     semantic_result=semantic_result,
                     fixed=fixed
                 )
                 return action, value, done, memory_target
-
         except Exception as e:
             print(f"[WARNING] failed to use semantic memory for episode {index}: {e}")
 
-        action, value, done = self.semantic_to_legacy_action(
+        action, value, done, semantic_target = self.semantic_to_continuous_target(
+            index=index,
             semantic_result=semantic_result,
             fixed=fixed
         )
-        return action, value, done, self.default_memory_target()
+        self.memory_targets[index] = semantic_target
+        return action, value, done, semantic_target
 
-    def target_to_legacy_action(self, target, semantic_result, fixed):
+    def target_to_continuous_action(self, target, semantic_result, fixed):
         target_type = target.get("target_type", "memory")
-
         if target_type in [
             "verified_target_stop",
             "gdino_stop",
@@ -548,46 +546,17 @@ class ONAir(BaseModelWrapper):
         if target.get("stop_reason", ""):
             return "stop", 0, True
 
-        relative_region = target.get("relative_region", "front")
-        relative_angle = target.get("relative_angle", 0.0)
-        safety_value = target.get("safety_value", 0.5)
-        target_score = target.get("score", 0.0)
-
-        if safety_value < 0.20 and not target_type.startswith("gdino") and not target_type.startswith("verified"):
-            if fixed:
-                return "rotl", 0, False
-            else:
-                return "rotl", 30, False
-
-        if relative_region == "front":
-            action = "forward"
-        elif relative_region == "left":
-            action = "left"
-        elif relative_region == "right":
-            action = "right"
-        elif relative_region == "back_left":
-            action = "rotl"
-        elif relative_region == "back_right":
-            action = "rotr"
-        else:
-            action = "forward"
+        if not target.get("valid", False):
+            return "continuous", 0, False
 
         if fixed:
             value = 0
+        elif target_type.startswith("gdino") or target_type.startswith("verified"):
+            value = self.estimate_target_step_size(target)
         else:
-            if action in ["rotl", "rotr"]:
-                value = min(60, max(15, abs(relative_angle)))
-            elif target_type.startswith("gdino") or target_type.startswith("verified"):
-                value = self.estimate_target_step_size(target)
-            else:
-                value = self.estimate_unfixed_step_size(
-                    region_score=target_score,
-                    safety_score=safety_value,
-                    target_visible=False,
-                    target_confidence=0.0
-                )
+            value = 0
 
-        return action, value, False
+        return "continuous", value, False
 
     def estimate_target_step_size(self, target):
         distance = target.get("distance", 4.0)
@@ -616,19 +585,27 @@ class ONAir(BaseModelWrapper):
             current_pose = self.current_poses[index]
 
             if local_planner is None:
-                return self.default_local_plan("local planner is None")
+                planned_path = self.default_local_plan("local planner is None")
+                self.planned_paths[index] = planned_path
+                return planned_path
+
+            if selected_target is None or not selected_target.get("valid", False):
+                planned_path = self.default_local_plan("selected target is invalid")
+                self.planned_paths[index] = planned_path
+                return planned_path
 
             planned_path = local_planner.plan_path(
                 current_pose=current_pose,
                 memory_target=selected_target
             )
-
             self.planned_paths[index] = planned_path
             return planned_path
 
         except Exception as e:
             print(f"[WARNING] failed to plan local path for episode {index}: {e}")
-            return self.default_local_plan(str(e))
+            planned_path = self.default_local_plan(str(e))
+            self.planned_paths[index] = planned_path
+            return planned_path
 
     def parse_semantic_result(self, text):
         try:
@@ -770,43 +747,123 @@ class ONAir(BaseModelWrapper):
 
         return semantic_result
 
-    def semantic_to_legacy_action(self, semantic_result, fixed):
+    def semantic_to_continuous_target(self, index, semantic_result, fixed):
         region_scores = semantic_result["region_scores"]
         safety_scores = semantic_result["safety_scores"]
+        novelty_scores = semantic_result.get("novelty_scores", {})
         best_region = semantic_result["best_region"]
 
-        max_safety = max(safety_scores.values())
-
-        if max_safety < 0.25:
-            if fixed:
-                return "rotl", 0, False
-            else:
-                return "rotl", 30, False
-
-        if best_region not in ["front", "left", "right"]:
+        valid_regions = ["front", "left", "right"]
+        if best_region not in valid_regions:
             best_region = max(region_scores, key=region_scores.get)
 
-        if best_region == "front":
-            action = "forward"
-        elif best_region == "left":
-            action = "left"
-        elif best_region == "right":
-            action = "right"
-        else:
-            action = "forward"
+        max_safety = max(safety_scores.values())
+        if max_safety < 0.25:
+            target = self.default_memory_target()
+            target["target_type"] = "continuous_hold"
+            target["stop_reason"] = ""
+            return "continuous", 0, False, target
+
+        best_score = -1.0
+        for region in valid_regions:
+            region_score = float(region_scores.get(region, 0.0))
+            safety_score = float(safety_scores.get(region, 0.5))
+            novelty_score = float(novelty_scores.get(region, 0.5))
+            score = 0.55 * region_score + 0.35 * safety_score + 0.10 * novelty_score
+            if score > best_score:
+                best_score = score
+                best_region = region
+
+        target = self.build_continuous_target_from_region(
+            index=index,
+            region=best_region,
+            semantic_result=semantic_result,
+            score=best_score,
+            fixed=fixed
+        )
+
+        return "continuous", 0, False, target
+
+    def build_continuous_target_from_region(self, index, region, semantic_result, score, fixed):
+        try:
+            current_pose = self.current_poses[index]
+            x = float(current_pose[0])
+            y = float(current_pose[1])
+            z = float(current_pose[2])
+            yaw = float(current_pose[3])
+        except Exception:
+            target = self.default_memory_target()
+            target["target_type"] = "continuous_hold"
+            return target
+
+        region_scores = semantic_result.get("region_scores", {})
+        safety_scores = semantic_result.get("safety_scores", {})
+        novelty_scores = semantic_result.get("novelty_scores", {})
+
+        region_score = float(region_scores.get(region, 0.0))
+        safety_value = float(safety_scores.get(region, 0.5))
+        novelty_value = float(novelty_scores.get(region, 0.5))
+        target_visible = bool(semantic_result.get("target_visible", False))
+        target_confidence = float(semantic_result.get("target_confidence", 0.0))
 
         if fixed:
-            value = 0
+            distance = 6.0
         else:
-            value = self.estimate_unfixed_step_size(
-                region_score=region_scores[best_region],
-                safety_score=safety_scores[best_region],
-                target_visible=False,
-                target_confidence=0.0
+            distance = self.estimate_unfixed_step_size(
+                region_score=region_score,
+                safety_score=safety_value,
+                target_visible=target_visible,
+                target_confidence=target_confidence
             )
+            distance = max(4.0, min(10.0, float(distance)))
 
-        done = False
-        return action, value, done
+        angle_offset = {
+            "front": 0.0,
+            "left": -65.0,
+            "right": 65.0,
+        }.get(region, 0.0)
+
+        target_yaw = yaw + angle_offset
+        wx = x + distance * math.cos(math.radians(target_yaw))
+        wy = y + distance * math.sin(math.radians(target_yaw))
+        wx, wy = self.bound_xy_to_search_area(index, wx, wy, margin=2.0)
+
+        target = self.default_memory_target()
+        target.update({
+            "valid": True,
+            "target_type": "semantic_continuous_explore",
+            "grid": None,
+            "position": (round(wx, 2), round(wy, 2)),
+            "viewpoint_position": (round(wx, 2), round(wy, 2)),
+            "frontier_position": None,
+            "score": round(float(score), 4),
+            "semantic_value": round(float(region_score), 4),
+            "confidence": round(float(target_confidence), 4),
+            "safety_value": round(float(safety_value), 4),
+            "novelty_value": round(float(novelty_value), 4),
+            "visited": False,
+            "observe_count": 0,
+            "distance": round(float(math.hypot(wx - x, wy - y)), 2),
+            "target_yaw": round(float(target_yaw), 2),
+            "relative_angle": round(float(angle_offset), 2),
+            "relative_region": region,
+            "stop_reason": ""
+        })
+        return target
+
+    def bound_xy_to_search_area(self, index, x, y, margin=2.0):
+        try:
+            start_position = self.start_position[index]
+            x_min = float(start_position[0]) - 50.0 + margin
+            x_max = float(start_position[0]) + 50.0 - margin
+            y_min = float(start_position[1]) - 50.0 + margin
+            y_max = float(start_position[1]) + 50.0 - margin
+            x = max(x_min, min(x_max, float(x)))
+            y = max(y_min, min(y_max, float(y)))
+        except Exception:
+            x = float(x)
+            y = float(y)
+        return x, y
 
     def estimate_unfixed_step_size(self, region_score, safety_score, target_visible, target_confidence):
         if target_visible or target_confidence >= 0.6:
@@ -1180,95 +1237,24 @@ class ONAir(BaseModelWrapper):
         return pre_poses_xyzYaw
 
     def redirect_action(self, actions, step_size, fixed):
-        new_actions = [None] * len(actions)
-        new_step_size = list(step_size)
+        new_actions = []
+        new_step_size = []
 
         for i, action in enumerate(actions):
-            new_actions[i] = action
+            if action == "stop":
+                new_actions.append("stop")
+                new_step_size.append(0)
+                continue
 
-            try:
-                start_position = self.start_position[i]
-                x_min = round(start_position[0] - 50, 2)
-                x_max = round(start_position[0] + 50, 2)
-                y_min = round(start_position[1] - 50, 2)
-                y_max = round(start_position[1] + 50, 2)
+            if action != "continuous":
+                print(
+                    "[Continuous Execute] "
+                    f"Episode {i}: unexpected action={action}; "
+                    "coerced to continuous. Legacy movement fallback is disabled."
+                )
 
-                current_pose = self.current_poses[i]
-                x, y, z, yaw = current_pose
-                current_step_size = new_step_size[i]
-
-                if action == 'forward':
-                    dx = math.cos(math.radians(yaw))
-                    dy = math.sin(math.radians(yaw))
-                    dz = 0
-                    vector = np.array([dx, dy, dz])
-                    norm = np.linalg.norm(vector)
-
-                    if norm > 1e-6:
-                        unit_vector = vector / norm
-                    else:
-                        unit_vector = np.array([0, 0, 0])
-
-                    if fixed:
-                        new_position = np.array([x, y, z]) + unit_vector * AirsimActionSettings.FORWARD_STEP_SIZE
-                    else:
-                        new_position = np.array([x, y, z]) + unit_vector * current_step_size
-
-                    if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
-                        new_actions[i] = 'rotl'
-                        new_step_size[i] = 15
-                        print(f"[INFO] Episode {i}: '{action}' would go out of bounds → replaced with '{new_actions[i]}'")
-
-                elif action == "left":
-                    unit_x = 1.0 * math.cos(math.radians(yaw + 90))
-                    unit_y = 1.0 * math.sin(math.radians(yaw + 90))
-                    vector = np.array([unit_x, unit_y, 0])
-                    norm = np.linalg.norm(vector)
-
-                    if norm > 1e-6:
-                        unit_vector = vector / norm
-                    else:
-                        unit_vector = np.array([0, 0, 0])
-
-                    if fixed:
-                        new_position = np.array([x, y, z]) - unit_vector * AirsimActionSettings.LEFT_RIGHT_STEP_SIZE
-                    else:
-                        new_position = np.array([x, y, z]) - unit_vector * current_step_size
-
-                    if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
-                        new_actions[i] = 'rotl'
-                        new_step_size[i] = 15
-                        print(f"[INFO] Episode {i}: '{action}' would go out of bounds → replaced with '{new_actions[i]}'")
-
-                elif action == "right":
-                    unit_x = 1.0 * math.cos(math.radians(yaw + 90))
-                    unit_y = 1.0 * math.sin(math.radians(yaw + 90))
-                    vector = np.array([unit_x, unit_y, 0])
-                    norm = np.linalg.norm(vector)
-
-                    if norm > 1e-6:
-                        unit_vector = vector / norm
-                    else:
-                        unit_vector = np.array([0, 0, 0])
-
-                    if fixed:
-                        new_position = np.array([x, y, z]) + unit_vector * AirsimActionSettings.LEFT_RIGHT_STEP_SIZE
-                    else:
-                        new_position = np.array([x, y, z]) + unit_vector * current_step_size
-
-                    if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
-                        new_actions[i] = 'rotl'
-                        new_step_size[i] = 15
-                        print(f"[INFO] Episode {i}: '{action}' would go out of bounds → replaced with '{new_actions[i]}'")
-
-                else:
-                    new_actions[i] = action
-                    new_step_size[i] = step_size[i]
-                    continue
-
-            except Exception as e:
-                print(f"[WARNING] run() failed to check bounds for episode {i}: {e}")
-                new_actions[i] = actions[i]
-                new_step_size[i] = step_size[i]
+            new_actions.append("continuous")
+            new_step_size.append(0)
 
         return new_actions, new_step_size
+
