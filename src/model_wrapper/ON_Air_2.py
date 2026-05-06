@@ -13,6 +13,7 @@ try:
     from src.planner.navigation_state import NavigationState
     from src.planner.target_tracker import TargetTracker
     from src.planner.target_verifier import TargetVerifier
+    from src.planner.target_viewpoint_planner import TargetViewpointPlanner
     from src.planner.final_stop_gate import FinalStopGate
     from src.model_wrapper.grounding_dino_client import GroundingDINOClient
 except Exception:
@@ -21,6 +22,7 @@ except Exception:
     from planner.navigation_state import NavigationState
     from planner.target_tracker import TargetTracker
     from planner.target_verifier import TargetVerifier
+    from planner.target_viewpoint_planner import TargetViewpointPlanner
     from planner.final_stop_gate import FinalStopGate
     from model_wrapper.grounding_dino_client import GroundingDINOClient
 
@@ -312,6 +314,9 @@ class ONAir(BaseModelWrapper):
             )
 
             self.local_planners[index] = LocalPlanner(
+                memory=self.semantic_memories[index]
+            )
+            self.target_viewpoint_planners[index] = TargetViewpointPlanner(
                 memory=self.semantic_memories[index]
             )
 
