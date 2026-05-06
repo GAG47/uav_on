@@ -13,6 +13,7 @@ try:
     from src.planner.navigation_state import NavigationState
     from src.planner.target_tracker import TargetTracker
     from src.planner.target_verifier import TargetVerifier
+    from src.planner.final_stop_gate import FinalStopGate
     from src.model_wrapper.grounding_dino_client import GroundingDINOClient
 except Exception:
     from planner.semantic_memory import SemanticMemory
@@ -20,6 +21,7 @@ except Exception:
     from planner.navigation_state import NavigationState
     from planner.target_tracker import TargetTracker
     from planner.target_verifier import TargetVerifier
+    from planner.final_stop_gate import FinalStopGate
     from model_wrapper.grounding_dino_client import GroundingDINOClient
 
 import numpy as np
@@ -65,6 +67,8 @@ class ONAir(BaseModelWrapper):
 
         self.navigation_states = [NavigationState() for _ in range(batch_size)]
         self.navigation_infos = [{} for _ in range(batch_size)]
+        self.final_stop_gates = [FinalStopGate() for _ in range(batch_size)]
+        self.final_stop_infos = [{} for _ in range(batch_size)]
 
         self.unfixed_system_prompt = unfixed_system_prompt
         self.fixed_system_prompt = fixed_system_prompt
@@ -320,6 +324,8 @@ class ONAir(BaseModelWrapper):
 
             self.navigation_states[index].reset()
             self.navigation_infos[index] = {}
+            self.final_stop_gates[index].reset()
+            self.final_stop_infos[index] = {}
 
             self.grounding_dino_results[index] = {}
 
@@ -458,10 +464,23 @@ class ONAir(BaseModelWrapper):
                 "verified_target_stop",
                 "gdino_stop",
                 "gdino_verified_stop",
-                "gdino_position_stop"
+                "gdino_position_stop",
+                "final_stop"
             ]:
-                self.memory_targets[index] = planner_target
-                return "stop", 0, True, planner_target
+                stop_decision = self.try_final_stop_gate(
+                    index=index,
+                    navigation_info=navigation_info,
+                    stop_target=planner_target
+                )
+                if stop_decision is not None:
+                    return stop_decision
+
+                planner_target = self.build_stop_recovery_target(
+                    index=index,
+                    navigation_info=navigation_info,
+                    rejected_stop_target=planner_target
+                )
+                mode = NavigationState.MODE_NAVIGATE
 
         if mode == NavigationState.MODE_STOP:
             stop_target = self.default_memory_target()
@@ -473,40 +492,187 @@ class ONAir(BaseModelWrapper):
 
             tracker_info = navigation_info.get("tracker_info", {})
             if isinstance(tracker_info, dict):
-                stop_target["target_world_position"] = tracker_info.get("verified_target_position", None)
+                stop_target["target_world_position"] = tracker_info.get(
+                    "verified_target_position", None
+                )
+                stop_target["stop_reason"] = navigation_info.get(
+                    "reason", "reached verified target object position"
+                )
 
-            stop_target["stop_reason"] = navigation_info.get(
-                "reason",
-                "reached verified target object position"
+            stop_decision = self.try_final_stop_gate(
+                index=index,
+                navigation_info=navigation_info,
+                stop_target=stop_target
             )
-            self.memory_targets[index] = stop_target
-            return "stop", 0, True, stop_target
+            if stop_decision is not None:
+                return stop_decision
 
-        # AirHunt-style rule:
+            planner_target = self.build_stop_recovery_target(
+                index=index,
+                navigation_info=navigation_info,
+                rejected_stop_target=stop_target
+            )
+            mode = NavigationState.MODE_NAVIGATE
+
         # CONFIRM / VERIFY only collect and verify object candidates.
         # They must not directly execute unverified GDINO targets.
+        if mode in [
+            NavigationState.MODE_CONFIRM,
+            NavigationState.MODE_VERIFY
+        ]:
+            return self.memory_to_legacy_action(
+                index=index,
+                semantic_result=semantic_result,
+                fixed=fixed
+            )
+
         if mode in [
             NavigationState.MODE_NAVIGATE,
             NavigationState.MODE_RECOVER
         ]:
-            navigation_target = self.build_target_navigation_goal(
-                index=index,
-                planner_target=planner_target
-            )
-            if navigation_target.get("valid", False):
-                action, value, done = self.target_to_legacy_action(
-                    target=navigation_target,
-                    semantic_result=semantic_result,
-                    fixed=fixed
+            if isinstance(planner_target, dict) and planner_target.get("valid", False):
+                navigation_target = self.build_target_navigation_goal(
+                    index=index,
+                    planner_target=planner_target
                 )
-                self.memory_targets[index] = navigation_target
-                return action, value, done, navigation_target
+                if navigation_target.get("valid", False):
+                    action, value, done = self.target_to_legacy_action(
+                        target=navigation_target,
+                        semantic_result=semantic_result,
+                        fixed=fixed
+                    )
+                    self.memory_targets[index] = navigation_target
+                    return action, value, done, navigation_target
 
         return self.memory_to_legacy_action(
             index=index,
             semantic_result=semantic_result,
             fixed=fixed
         )
+
+    def try_final_stop_gate(self, index, navigation_info, stop_target):
+        try:
+            stop_gate = self.final_stop_gates[index]
+            tracker_info = self.target_tracker_infos[index]
+            verification_info = self.target_verification_infos[index]
+            current_pose = self.current_poses[index]
+
+            update_info = self.memory_update_infos[index]
+            if not isinstance(update_info, dict):
+                update_info = {}
+
+            stop_info = stop_gate.check(
+                current_pose=current_pose,
+                navigation_info=navigation_info,
+                tracker_info=tracker_info,
+                verification_info=verification_info,
+                stop_target=stop_target,
+                step_num=update_info.get("step_num", None)
+            )
+            self.final_stop_infos[index] = stop_info
+            self.print_final_stop_gate(index, stop_info)
+
+            if not stop_info.get("allow_stop", False):
+                return None
+
+            stop_target["target_type"] = "final_stop"
+            stop_target["valid"] = True
+            stop_target["stop_reason"] = "final stop gate passed"
+            stop_target["final_stop_gate"] = stop_info
+            self.memory_targets[index] = stop_target
+            return "stop", 0, True, stop_target
+
+        except Exception as e:
+            print(f"[FinalStopGate] Episode {index}: failed: {e}")
+            self.final_stop_infos[index] = {
+                "allow_stop": False,
+                "reasons": [str(e)]
+            }
+            return None
+
+    def build_stop_recovery_target(self, index, navigation_info, rejected_stop_target):
+        tracker_info = navigation_info.get("tracker_info", {})
+        if not isinstance(tracker_info, dict):
+            tracker_info = self.target_tracker_infos[index]
+
+        planner_target = tracker_info.get("planner_target", None)
+        if isinstance(planner_target, dict) and planner_target.get("valid", False):
+            if planner_target.get("target_type", "") not in [
+                "verified_target_stop",
+                "gdino_stop",
+                "gdino_verified_stop",
+                "gdino_position_stop",
+                "final_stop"
+            ]:
+                return planner_target
+
+        target_position = None
+
+        if isinstance(tracker_info, dict):
+            target_position = tracker_info.get("verified_target_position", None)
+
+        if target_position is None and isinstance(rejected_stop_target, dict):
+            target_position = rejected_stop_target.get("target_world_position", None)
+
+        target = self.default_memory_target()
+        target["target_type"] = "verified_target_navigate"
+        target["planner_goal_type"] = "verified_target_reapproach"
+        target["valid"] = target_position is not None
+        target["position"] = target_position
+        target["viewpoint_position"] = target_position
+        target["target_world_position"] = target_position
+        target["score"] = 1.0
+        target["confidence"] = 1.0
+        target["approach_reason"] = "final stop rejected, continue target approach"
+        target["stop_reason"] = ""
+
+        if target_position is None:
+            target["valid"] = False
+            target["approach_reason"] = (
+                "final stop rejected and no verified target position for recovery"
+            )
+            return target
+
+        current_pose = self.current_poses[index]
+        if current_pose is not None and len(current_pose) >= 2:
+            try:
+                dx = float(target_position[0]) - float(current_pose[0])
+                dy = float(target_position[1]) - float(current_pose[1])
+                distance = math.sqrt(dx * dx + dy * dy)
+                goal_yaw = math.degrees(math.atan2(dy, dx))
+                current_yaw = float(current_pose[3]) if len(current_pose) >= 4 else 0.0
+                relative_angle = self.normalize_angle(goal_yaw - current_yaw)
+
+                target["distance"] = round(distance, 2)
+                target["target_yaw"] = round(goal_yaw, 2)
+                target["relative_angle"] = round(relative_angle, 2)
+                target["relative_region"] = self.classify_relative_region(relative_angle)
+            except Exception:
+                pass
+
+        return target
+
+    def classify_relative_region(self, relative_angle):
+        if -45.0 <= relative_angle <= 45.0:
+            return "front"
+
+        if 45.0 < relative_angle <= 135.0:
+            return "left"
+
+        if -135.0 <= relative_angle < -45.0:
+            return "right"
+
+        if relative_angle > 135.0:
+            return "back_left"
+
+        return "back_right"
+
+    def normalize_angle(self, angle):
+        while angle > 180.0:
+            angle -= 360.0
+        while angle < -180.0:
+            angle += 360.0
+        return angle
 
     def build_target_navigation_goal(self, index, planner_target):
         try:
@@ -1073,6 +1239,45 @@ class ONAir(BaseModelWrapper):
                 f"caption_len={crop_debug.get('caption_len', 0)}, "
                 f"crop_path={crop_debug.get('crop_path', '')}"
             )
+
+    def print_final_stop_gate(self, index, stop_info):
+        if not isinstance(stop_info, dict):
+            return
+
+        reasons = stop_info.get("reasons", [])
+        warnings = stop_info.get("warnings", [])
+
+        if not isinstance(reasons, list):
+            reasons = [str(reasons)]
+
+        if not isinstance(warnings, list):
+            warnings = [str(warnings)]
+
+        reason_text = "; ".join([str(item) for item in reasons])
+        warning_text = "; ".join([str(item) for item in warnings])
+
+        if len(reason_text) > 260:
+            reason_text = reason_text[:260] + "..."
+
+        if len(warning_text) > 180:
+            warning_text = warning_text[:180] + "..."
+
+        print(
+            "[FinalStopGate] "
+            f"Episode {index}: "
+            f"allow={stop_info.get('allow_stop', False)}, "
+            f"distance={stop_info.get('stop_distance', None)}, "
+            f"depth={stop_info.get('estimated_depth', None)}, "
+            f"score={stop_info.get('detection_score', 0.0):.3f}, "
+            f"area={stop_info.get('area_ratio', 0.0):.4f}, "
+            f"ver_conf={stop_info.get('verification_confidence', 0.0)}, "
+            f"same_object={stop_info.get('same_object', False)}, "
+            f"stable={stop_info.get('position_stable', False)}, "
+            f"nav_count={stop_info.get('navigate_count', 0)}, "
+            f"lost={stop_info.get('lost_count', 0)}, "
+            f"reasons={reason_text}, "
+            f"warnings={warning_text}"
+        )
 
     def print_navigation_state(self, index, navigation_info):
         if navigation_info is None:

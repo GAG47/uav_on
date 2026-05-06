@@ -23,3 +23,4 @@ try:
 except Exception:
     pass
 from .target_viewpoint_planner import TargetViewpointPlanner
+from .final_stop_gate import FinalStopGate
