@@ -355,22 +355,9 @@ class AirVLNENV:
                 self.sim_states[index].is_end = True
 
             current_pose = self.sim_states[index].pose
-            if isinstance(current_pose, list):
-                pos = current_pose[:3]
-                quat = current_pose[3:]
-                airsim_pose = airsim.Pose(
-                    airsim.Vector3r(*pos),
-                    airsim.Quaternionr(
-                        x_val=quat[0],
-                        y_val=quat[1],
-                        z_val=quat[2],
-                        w_val=quat[3]
-                    )
-                )
-            else:
-                airsim_pose = current_pose
+            airsim_pose = self.to_airsim_pose(current_pose)
 
-            use_continuous, planned_path = self.get_planned_path_for_episode(
+            use_continuous, planned_path, plan_reason = self.get_planned_path_for_episode(
                 planned_paths=planned_paths,
                 index=index
             )
@@ -384,26 +371,36 @@ class AirVLNENV:
                 executed_actions.append('continuous')
                 execute_infos.append(execute_info)
             else:
-                new_pose, fly_type = getNextPosition(
-                    airsim_pose,
-                    action,
-                    steps_size[index],
-                    is_fixed
+                new_pose = self.copy_airsim_pose(airsim_pose)
+                fly_type = "move"
+
+                if action == 'stop':
+                    hold_reason = "stop action"
+                    executed_action = "stop"
+                elif self.sim_states[index].is_end == True:
+                    hold_reason = "episode ended"
+                    executed_action = "stop"
+                else:
+                    hold_reason = plan_reason
+                    executed_action = "continuous_hold"
+
+                executed_actions.append(executed_action)
+                execute_infos.append(
+                    self.build_hold_execute_info(
+                        reason=hold_reason,
+                        planned_path=planned_path
+                    )
                 )
-                executed_actions.append(action)
-                execute_infos.append({
-                    "execute_type": "legacy",
-                    "next_waypoint": None,
-                    "step_distance": 0.0,
-                    "max_continuous_step": self.max_continuous_step,
-                    "is_step_limited": False,
-                    "planned_path_len": 0,
-                    "planned_path_length": 0.0
-                })
+
+                if executed_action == "continuous_hold":
+                    print(
+                        "[Continuous Hold] "
+                        f"Episode {index}: "
+                        f"reason={hold_reason}"
+                    )
 
             prev_pitch, prev_roll, prev_yaw = airsim.to_eularian_angles(airsim_pose.orientation)
             curr_pitch, curr_roll, curr_yaw = airsim.to_eularian_angles(new_pose.orientation)
-
             delta_yaw = abs((math.degrees(curr_yaw - prev_yaw) + 180) % 360 - 180)
             self.sim_states[index].heading_changes.append(delta_yaw)
 
@@ -425,8 +422,8 @@ class AirVLNENV:
 
         format_pose = []
         format_fly_type = []
-
         cnt = 0
+
         for index1, item in enumerate(self.machines_info):
             format_pose.append([])
             format_fly_type.append([])
@@ -460,7 +457,6 @@ class AirVLNENV:
             self.sim_states[index].step += 1
 
             traj = self.sim_states[index].trajectory
-
             if len(traj) >= 1:
                 p_prev = np.array(traj[-1]['sensors']['state']['position'])
             else:
@@ -506,10 +502,60 @@ class AirVLNENV:
             trajectory_info.update(execute_infos[index])
             self.sim_states[index].trajectory.append(trajectory_info)
 
+    def to_airsim_pose(self, current_pose):
+        if isinstance(current_pose, list):
+            pos = current_pose[:3]
+            quat = current_pose[3:]
+
+            return airsim.Pose(
+                airsim.Vector3r(*pos),
+                airsim.Quaternionr(
+                    x_val=quat[0],
+                    y_val=quat[1],
+                    z_val=quat[2],
+                    w_val=quat[3]
+                )
+            )
+
+        return current_pose
+
+    def copy_airsim_pose(self, airsim_pose):
+        return airsim.Pose(
+            airsim.Vector3r(
+                x_val=airsim_pose.position.x_val,
+                y_val=airsim_pose.position.y_val,
+                z_val=airsim_pose.position.z_val
+            ),
+            airsim.Quaternionr(
+                x_val=airsim_pose.orientation.x_val,
+                y_val=airsim_pose.orientation.y_val,
+                z_val=airsim_pose.orientation.z_val,
+                w_val=airsim_pose.orientation.w_val
+            )
+        )
+
+    def build_hold_execute_info(self, reason, planned_path=None):
+        if isinstance(planned_path, dict):
+            planned_path_len = int(planned_path.get("path_len", 0))
+            planned_path_length = float(planned_path.get("path_length", 0.0))
+        else:
+            planned_path_len = 0
+            planned_path_length = 0.0
+
+        return {
+            "execute_type": "continuous_hold",
+            "next_waypoint": None,
+            "step_distance": 0.0,
+            "max_continuous_step": self.max_continuous_step,
+            "is_step_limited": False,
+            "planned_path_len": planned_path_len,
+            "planned_path_length": planned_path_length,
+            "hold_reason": reason
+        }
 
     def get_planned_path_for_episode(self, planned_paths, index):
         if planned_paths is None:
-            return False, None
+            return False, None, "planned_paths is None"
 
         try:
             if isinstance(planned_paths, list):
@@ -517,26 +563,26 @@ class AirVLNENV:
             elif isinstance(planned_paths, dict):
                 planned_path = planned_paths.get(index, None)
             else:
-                return False, None
+                return False, None, "planned_paths has invalid type"
 
             if planned_path is None:
-                return False, None
+                return False, None, "planned_path is None"
 
             if not isinstance(planned_path, dict):
-                return False, None
+                return False, None, "planned_path is not a dict"
 
             if not planned_path.get("valid", False):
-                return False, None
+                return False, planned_path, planned_path.get("reason", "planned_path is invalid")
 
             path = planned_path.get("path", [])
             if path is None or len(path) < 2:
-                return False, None
+                return False, planned_path, "planned_path has fewer than 2 points"
 
-            return True, planned_path
+            return True, planned_path, "valid planned_path"
 
         except Exception as e:
             print(f"[WARNING] failed to get planned path for episode {index}: {e}")
-            return False, None
+            return False, None, str(e)
 
 
     def get_continuous_next_pose(self, airsim_pose, planned_path, index):

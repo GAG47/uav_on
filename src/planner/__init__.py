@@ -22,3 +22,4 @@ try:
     from .target_verifier import TargetVerifier
 except Exception:
     pass
+from .target_viewpoint_planner import TargetViewpointPlanner

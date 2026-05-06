@@ -51,6 +51,7 @@ class ONAir(BaseModelWrapper):
         self.memory_targets = [{} for _ in range(batch_size)]
 
         self.local_planners = [None for _ in range(batch_size)]
+        self.target_viewpoint_planners = [None for _ in range(batch_size)]
         self.planned_paths = [{} for _ in range(batch_size)]
 
         self.grounding_dino_client = GroundingDINOClient()
@@ -488,20 +489,71 @@ class ONAir(BaseModelWrapper):
             NavigationState.MODE_NAVIGATE,
             NavigationState.MODE_RECOVER
         ]:
-            if isinstance(planner_target, dict) and planner_target.get("valid", False):
+            navigation_target = self.build_target_navigation_goal(
+                index=index,
+                planner_target=planner_target
+            )
+            if navigation_target.get("valid", False):
                 action, value, done = self.target_to_legacy_action(
-                    target=planner_target,
+                    target=navigation_target,
                     semantic_result=semantic_result,
                     fixed=fixed
                 )
-                self.memory_targets[index] = planner_target
-                return action, value, done, planner_target
+                self.memory_targets[index] = navigation_target
+                return action, value, done, navigation_target
 
         return self.memory_to_legacy_action(
             index=index,
             semantic_result=semantic_result,
             fixed=fixed
         )
+
+    def build_target_navigation_goal(self, index, planner_target):
+        try:
+            viewpoint_planner = self.target_viewpoint_planners[index]
+            current_pose = self.current_poses[index]
+
+            if viewpoint_planner is None:
+                return self.default_memory_target_with_reason(
+                    reason="target viewpoint planner is None"
+                )
+
+            navigation_target = viewpoint_planner.build_navigation_target(
+                current_pose=current_pose,
+                planner_target=planner_target
+            )
+
+            if not navigation_target.get("valid", False):
+                reason = navigation_target.get("approach_reason", "no feasible approach viewpoint")
+                print(
+                    "[TargetViewpoint] "
+                    f"Episode {index}: invalid, reason={reason}"
+                )
+                return navigation_target
+
+            print(
+                "[TargetViewpoint] "
+                f"Episode {index}: "
+                f"type={navigation_target.get('candidate_type', 'unknown')}, "
+                f"goal={navigation_target.get('viewpoint_position', None)}, "
+                f"target={navigation_target.get('target_world_position', None)}, "
+                f"dist={navigation_target.get('distance', 0.0)}, "
+                f"target_dist={navigation_target.get('target_distance', 0.0)}, "
+                f"score={navigation_target.get('score', 0.0)}"
+            )
+
+            return navigation_target
+
+        except Exception as e:
+            print(f"[TargetViewpoint] Episode {index}: failed to build approach viewpoint: {e}")
+            return self.default_memory_target_with_reason(str(e))
+
+    def default_memory_target_with_reason(self, reason):
+        target = self.default_memory_target()
+        target["target_type"] = "target_approach_viewpoint"
+        target["planner_goal_type"] = "none"
+        target["approach_reason"] = reason
+        return target
 
     def memory_to_legacy_action(self, index, semantic_result, fixed):
         try:
@@ -843,7 +895,10 @@ class ONAir(BaseModelWrapper):
             "target_yaw": 0.0,
             "relative_angle": 0.0,
             "relative_region": "front",
-            "stop_reason": ""
+            "stop_reason": "",
+            "planner_goal_type": "none",
+            "approach_viewpoint": None,
+            "approach_reason": ""
         }
 
     def default_local_plan(self, reason):
@@ -1180,95 +1235,14 @@ class ONAir(BaseModelWrapper):
         return pre_poses_xyzYaw
 
     def redirect_action(self, actions, step_size, fixed):
-        new_actions = [None] * len(actions)
+        """
+        Keep the model-level action labels for logging only.
+
+        AirHunt-style execution is driven by planned_paths in env_uav.py.
+        If a planned path is invalid, the environment will hold and replan
+        instead of falling back to legacy discrete actions such as rotl/left/right.
+        """
+        new_actions = list(actions)
         new_step_size = list(step_size)
-
-        for i, action in enumerate(actions):
-            new_actions[i] = action
-
-            try:
-                start_position = self.start_position[i]
-                x_min = round(start_position[0] - 50, 2)
-                x_max = round(start_position[0] + 50, 2)
-                y_min = round(start_position[1] - 50, 2)
-                y_max = round(start_position[1] + 50, 2)
-
-                current_pose = self.current_poses[i]
-                x, y, z, yaw = current_pose
-                current_step_size = new_step_size[i]
-
-                if action == 'forward':
-                    dx = math.cos(math.radians(yaw))
-                    dy = math.sin(math.radians(yaw))
-                    dz = 0
-                    vector = np.array([dx, dy, dz])
-                    norm = np.linalg.norm(vector)
-
-                    if norm > 1e-6:
-                        unit_vector = vector / norm
-                    else:
-                        unit_vector = np.array([0, 0, 0])
-
-                    if fixed:
-                        new_position = np.array([x, y, z]) + unit_vector * AirsimActionSettings.FORWARD_STEP_SIZE
-                    else:
-                        new_position = np.array([x, y, z]) + unit_vector * current_step_size
-
-                    if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
-                        new_actions[i] = 'rotl'
-                        new_step_size[i] = 15
-                        print(f"[INFO] Episode {i}: '{action}' would go out of bounds → replaced with '{new_actions[i]}'")
-
-                elif action == "left":
-                    unit_x = 1.0 * math.cos(math.radians(yaw + 90))
-                    unit_y = 1.0 * math.sin(math.radians(yaw + 90))
-                    vector = np.array([unit_x, unit_y, 0])
-                    norm = np.linalg.norm(vector)
-
-                    if norm > 1e-6:
-                        unit_vector = vector / norm
-                    else:
-                        unit_vector = np.array([0, 0, 0])
-
-                    if fixed:
-                        new_position = np.array([x, y, z]) - unit_vector * AirsimActionSettings.LEFT_RIGHT_STEP_SIZE
-                    else:
-                        new_position = np.array([x, y, z]) - unit_vector * current_step_size
-
-                    if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
-                        new_actions[i] = 'rotl'
-                        new_step_size[i] = 15
-                        print(f"[INFO] Episode {i}: '{action}' would go out of bounds → replaced with '{new_actions[i]}'")
-
-                elif action == "right":
-                    unit_x = 1.0 * math.cos(math.radians(yaw + 90))
-                    unit_y = 1.0 * math.sin(math.radians(yaw + 90))
-                    vector = np.array([unit_x, unit_y, 0])
-                    norm = np.linalg.norm(vector)
-
-                    if norm > 1e-6:
-                        unit_vector = vector / norm
-                    else:
-                        unit_vector = np.array([0, 0, 0])
-
-                    if fixed:
-                        new_position = np.array([x, y, z]) + unit_vector * AirsimActionSettings.LEFT_RIGHT_STEP_SIZE
-                    else:
-                        new_position = np.array([x, y, z]) + unit_vector * current_step_size
-
-                    if new_position[0] > x_max or new_position[0] < x_min or new_position[1] > y_max or new_position[1] < y_min:
-                        new_actions[i] = 'rotl'
-                        new_step_size[i] = 15
-                        print(f"[INFO] Episode {i}: '{action}' would go out of bounds → replaced with '{new_actions[i]}'")
-
-                else:
-                    new_actions[i] = action
-                    new_step_size[i] = step_size[i]
-                    continue
-
-            except Exception as e:
-                print(f"[WARNING] run() failed to check bounds for episode {i}: {e}")
-                new_actions[i] = actions[i]
-                new_step_size[i] = step_size[i]
-
         return new_actions, new_step_size
+
