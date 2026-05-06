@@ -35,14 +35,24 @@ class SemanticMemory:
         self.confidence = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         self.safety_value = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         self.novelty_value = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-
         self.observe_count = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
         self.last_update_step = -np.ones((self.grid_size, self.grid_size), dtype=np.int32)
         self.visited = np.zeros((self.grid_size, self.grid_size), dtype=np.bool_)
 
-        self.last_region_update = {}
-        self.last_frontiers = []
+        self.free_confidence = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        self.obstacle_confidence = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        self.occupancy_update_count = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
+        self.last_occupancy_step = -np.ones((self.grid_size, self.grid_size), dtype=np.int32)
 
+        self.depth_obstacle_min = 0.8
+        self.depth_obstacle_max = self.max_sensing_range
+        self.depth_ray_clearance = max(1.5, self.resolution)
+        self.depth_free_confidence = 0.55
+        self.depth_obstacle_confidence = 0.85
+
+        self.last_region_update = {}
+        self.last_occupancy_update = {}
+        self.last_frontiers = []
         self.last_selected_frontier = None
         self.frontier_selection_count = {}
         self.frontier_switch_margin = 0.08
@@ -52,33 +62,36 @@ class SemanticMemory:
         self.viewpoint_planner = ViewpointPlanner(self)
         self.sgcp_planner = SGCPPlanner(self)
 
-
     def reset(self, origin):
         self.origin = np.array(origin[:3], dtype=float)
-
         self.semantic_value.fill(0.0)
         self.confidence.fill(0.0)
         self.safety_value.fill(0.0)
         self.novelty_value.fill(0.0)
-
         self.observe_count.fill(0)
         self.last_update_step.fill(-1)
         self.visited.fill(False)
-
+        self.free_confidence.fill(0.0)
+        self.obstacle_confidence.fill(0.0)
+        self.occupancy_update_count.fill(0)
+        self.last_occupancy_step.fill(-1)
         self.last_region_update = {}
+        self.last_occupancy_update = {}
         self.last_frontiers = []
-
         self.last_selected_frontier = None
         self.frontier_selection_count = {}
-
 
     def same_origin(self, origin, threshold=1e-3):
         origin = np.array(origin[:3], dtype=float)
         return np.linalg.norm(self.origin[:2] - origin[:2]) < threshold
 
-
     def update(self, semantic_result, current_pose, depth_info=None, step_num=0):
         self.mark_visited(current_pose)
+        self.update_geometry_from_depth(
+            current_pose=current_pose,
+            depth_info=depth_info,
+            step_num=step_num
+        )
 
         region_scores = semantic_result.get("region_scores", {})
         safety_scores = semantic_result.get("safety_scores", {})
@@ -98,7 +111,6 @@ class SemanticMemory:
                 region=region,
                 depth_grid=region_depth
             )
-
             self.update_region(
                 cells=cells,
                 region=region,
@@ -110,6 +122,169 @@ class SemanticMemory:
 
         return self.get_summary()
 
+    def update_geometry_from_depth(self, current_pose, depth_info, step_num):
+        if depth_info is None:
+            return
+
+        region_updates = {}
+        for region in ["front", "left", "right"]:
+            depth_grid = self.get_region_depth(depth_info, region)
+            rays = self.depth_grid_to_rays(depth_grid)
+            if len(rays) == 0:
+                region_updates[region] = {
+                    "ray_count": 0,
+                    "free_cells": 0,
+                    "obstacle_cells": 0,
+                }
+                continue
+
+            region_yaw = self.get_region_yaw(current_pose[3], region)
+            free_cells = 0
+            obstacle_cells = 0
+            for rel_angle, depth_value, ray_confidence in rays:
+                if depth_value is None:
+                    continue
+                if depth_value <= 0.0 or not math.isfinite(depth_value):
+                    continue
+
+                ray_yaw = region_yaw + rel_angle
+                obstacle_depth = min(float(depth_value), self.depth_obstacle_max)
+
+                if self.depth_obstacle_min <= obstacle_depth < self.depth_obstacle_max:
+                    free_until = max(0.0, obstacle_depth - self.depth_ray_clearance)
+                    free_cells += self.mark_free_ray(
+                        current_pose=current_pose,
+                        yaw=ray_yaw,
+                        max_distance=free_until,
+                        confidence=self.depth_free_confidence * ray_confidence,
+                        step_num=step_num
+                    )
+                    obstacle_cells += self.mark_obstacle_point(
+                        current_pose=current_pose,
+                        yaw=ray_yaw,
+                        distance=obstacle_depth,
+                        confidence=self.depth_obstacle_confidence * ray_confidence,
+                        step_num=step_num
+                    )
+                else:
+                    free_cells += self.mark_free_ray(
+                        current_pose=current_pose,
+                        yaw=ray_yaw,
+                        max_distance=self.max_sensing_range,
+                        confidence=self.depth_free_confidence * ray_confidence,
+                        step_num=step_num
+                    )
+
+            region_updates[region] = {
+                "ray_count": len(rays),
+                "free_cells": free_cells,
+                "obstacle_cells": obstacle_cells,
+            }
+
+        self.last_occupancy_update = region_updates
+
+    def depth_grid_to_rays(self, depth_grid):
+        if depth_grid is None:
+            return []
+        try:
+            depth_array = np.array(depth_grid, dtype=np.float32)
+        except Exception:
+            return []
+        if depth_array.size == 0:
+            return []
+
+        if depth_array.ndim == 0:
+            depth_array = depth_array.reshape(1, 1)
+        elif depth_array.ndim == 1:
+            depth_array = depth_array.reshape(1, -1)
+        elif depth_array.ndim > 2:
+            depth_array = depth_array.reshape(depth_array.shape[0], -1)
+
+        h, w = depth_array.shape
+        rays = []
+        for col in range(w):
+            column = depth_array[:, col]
+            column = column[np.isfinite(column)]
+            column = column[column > 0.0]
+            if column.size == 0:
+                continue
+
+            depth_value = float(np.percentile(column, 30))
+            if w == 1:
+                rel_ratio = 0.0
+            else:
+                rel_ratio = (float(col) / float(w - 1) - 0.5) * 2.0
+            rel_angle = rel_ratio * self.sector_angle * 0.5
+            ray_confidence = 1.0 - 0.25 * abs(rel_ratio)
+            rays.append((rel_angle, depth_value, ray_confidence))
+        return rays
+
+    def mark_free_ray(self, current_pose, yaw, max_distance, confidence, step_num):
+        if max_distance <= self.resolution * 0.5:
+            return 0
+
+        x, y = float(current_pose[0]), float(current_pose[1])
+        step = max(self.resolution * 0.5, 0.5)
+        marked = 0
+        distance = step
+        while distance <= max_distance:
+            wx = x + distance * math.cos(math.radians(yaw))
+            wy = y + distance * math.sin(math.radians(yaw))
+            grid = self.world_to_grid(wx, wy)
+            if grid is not None:
+                gx, gy = grid
+                self.integrate_free_cell(gx, gy, confidence, step_num)
+                marked += 1
+            distance += step
+        return marked
+
+    def mark_obstacle_point(self, current_pose, yaw, distance, confidence, step_num):
+        x, y = float(current_pose[0]), float(current_pose[1])
+        wx = x + distance * math.cos(math.radians(yaw))
+        wy = y + distance * math.sin(math.radians(yaw))
+        center = self.world_to_grid(wx, wy)
+        if center is None:
+            return 0
+
+        marked = 0
+        cx, cy = center
+        radius = max(1, int(math.ceil(1.0 / max(self.resolution, 1e-6))))
+        for gx in range(cx - radius, cx + radius + 1):
+            for gy in range(cy - radius, cy + radius + 1):
+                if not self.in_bounds(gx, gy):
+                    continue
+                wx_cell, wy_cell = self.grid_to_world(gx, gy)
+                if math.hypot(wx_cell - wx, wy_cell - wy) > self.resolution * 1.2:
+                    continue
+                self.integrate_obstacle_cell(gx, gy, confidence, step_num)
+                marked += 1
+        return marked
+
+    def integrate_free_cell(self, gx, gy, confidence, step_num):
+        confidence = max(0.0, min(1.0, float(confidence)))
+        self.free_confidence[gx, gy] = max(float(self.free_confidence[gx, gy]), confidence)
+        self.occupancy_update_count[gx, gy] += 1
+        self.last_occupancy_step[gx, gy] = step_num
+
+        if self.obstacle_confidence[gx, gy] < 0.45:
+            old_conf = float(self.confidence[gx, gy])
+            new_conf = max(old_conf, 0.10 * confidence)
+            self.confidence[gx, gy] = new_conf
+            self.safety_value[gx, gy] = max(float(self.safety_value[gx, gy]), 0.65 * confidence)
+
+    def integrate_obstacle_cell(self, gx, gy, confidence, step_num):
+        confidence = max(0.0, min(1.0, float(confidence)))
+        self.obstacle_confidence[gx, gy] = max(float(self.obstacle_confidence[gx, gy]), confidence)
+        self.free_confidence[gx, gy] = min(float(self.free_confidence[gx, gy]), 0.35)
+        self.occupancy_update_count[gx, gy] += 1
+        self.last_occupancy_step[gx, gy] = step_num
+
+        old_conf = float(self.confidence[gx, gy])
+        self.confidence[gx, gy] = max(old_conf, 0.35 * confidence)
+        if old_conf <= 1e-6:
+            self.safety_value[gx, gy] = min(float(self.safety_value[gx, gy]), 0.05)
+        else:
+            self.safety_value[gx, gy] = min(float(self.safety_value[gx, gy]), 0.12)
 
     def update_region(self, cells, region, region_score, safety_score, novelty_score, step_num):
         if len(cells) == 0:
@@ -127,7 +302,6 @@ class SemanticMemory:
                 safety_score=safety_score,
                 novelty_score=novelty_score
             )
-
             old_conf = float(self.confidence[gx, gy])
             old_value = float(self.semantic_value[gx, gy])
             old_safety = float(self.safety_value[gx, gy])
@@ -140,19 +314,15 @@ class SemanticMemory:
             self.semantic_value[gx, gy] = (
                 old_conf * old_value + new_conf * region_score
             ) / denom
-
             self.safety_value[gx, gy] = (
                 old_conf * old_safety + new_conf * safety_score
             ) / denom
-
             self.novelty_value[gx, gy] = (
                 old_conf * old_novelty + new_conf * novelty_score
             ) / denom
-
             self.confidence[gx, gy] = (
                 old_conf * old_conf + new_conf * new_conf
             ) / denom
-
             self.observe_count[gx, gy] += 1
             self.last_update_step[gx, gy] = step_num
 
@@ -163,42 +333,34 @@ class SemanticMemory:
             "novelty": novelty_score
         }
 
-
     def compute_update_confidence(self, distance_weight, safety_score, novelty_score):
         base_conf = 0.4 * safety_score + 0.3 * novelty_score + 0.3
         update_conf = base_conf * distance_weight
         update_conf = max(0.05, min(1.0, update_conf))
         return update_conf
 
-
     def mark_visited(self, current_pose):
         x, y, z, yaw = current_pose
         center = self.world_to_grid(x, y)
-
         if center is None:
             return
 
         radius_cell = int(math.ceil(self.visited_radius / self.resolution))
         cx, cy = center
-
         for gx in range(cx - radius_cell, cx + radius_cell + 1):
             for gy in range(cy - radius_cell, cy + radius_cell + 1):
                 if not self.in_bounds(gx, gy):
                     continue
-
                 wx, wy = self.grid_to_world(gx, gy)
                 dist = math.hypot(wx - x, wy - y)
-
                 if dist <= self.visited_radius:
                     self.visited[gx, gy] = True
-
+                    self.free_confidence[gx, gy] = max(float(self.free_confidence[gx, gy]), 0.8)
 
     def get_region_cells(self, current_pose, region, depth_grid=None):
         x, y, z, yaw = current_pose
-
         region_yaw = self.get_region_yaw(yaw, region)
         visible_range = self.estimate_visible_range(depth_grid)
-
         center = self.world_to_grid(x, y)
         if center is None:
             return []
@@ -206,32 +368,24 @@ class SemanticMemory:
         radius_cell = int(math.ceil(visible_range / self.resolution))
         cx, cy = center
         cells = []
-
         for gx in range(cx - radius_cell, cx + radius_cell + 1):
             for gy in range(cy - radius_cell, cy + radius_cell + 1):
                 if not self.in_bounds(gx, gy):
                     continue
-
                 wx, wy = self.grid_to_world(gx, gy)
                 dx = wx - x
                 dy = wy - y
                 dist = math.hypot(dx, dy)
-
                 if dist < self.resolution * 0.5:
                     continue
-
                 if dist > visible_range:
                     continue
-
                 cell_yaw = math.degrees(math.atan2(dy, dx))
                 yaw_diff = abs(self.normalize_angle(cell_yaw - region_yaw))
-
                 if yaw_diff <= self.sector_angle / 2.0:
                     distance_weight = max(0.0, 1.0 - dist / max(visible_range, 1e-6))
                     cells.append((gx, gy, distance_weight))
-
         return cells
-
 
     def get_region_yaw(self, yaw, region):
         if region == "front":
@@ -243,37 +397,28 @@ class SemanticMemory:
         else:
             return yaw
 
-
     def estimate_visible_range(self, depth_grid):
         if depth_grid is None:
             return self.max_sensing_range * 0.7
-
         try:
             depth_array = np.array(depth_grid, dtype=np.float32)
             depth_array = depth_array[np.isfinite(depth_array)]
-
             if depth_array.size == 0:
                 return self.max_sensing_range * 0.7
-
             depth_array = depth_array[depth_array > 0]
             if depth_array.size == 0:
                 return self.max_sensing_range * 0.7
-
             mean_depth = float(np.mean(depth_array))
             low_depth = float(np.percentile(depth_array, 30))
             visible_range = 0.5 * mean_depth + 0.5 * low_depth
-
             visible_range = max(4.0, min(self.max_sensing_range, visible_range))
             return visible_range
-
         except Exception:
             return self.max_sensing_range * 0.7
-
 
     def get_region_depth(self, depth_info, region):
         if depth_info is None or len(depth_info) < 3:
             return None
-
         if region == "front":
             return depth_info[0]
         elif region == "left":
@@ -282,7 +427,6 @@ class SemanticMemory:
             return depth_info[2]
         else:
             return None
-
 
     def get_best_memory_target(
         self,
@@ -295,7 +439,6 @@ class SemanticMemory:
             max_distance = self.map_size / 2.0
 
         score_map = self.compute_planning_score_map()
-
         frontiers = self.frontier_builder.get_semantic_frontiers(
             current_pose=current_pose,
             score_map=score_map,
@@ -303,13 +446,11 @@ class SemanticMemory:
             min_distance=min_distance,
             max_distance=max_distance
         )
-
         frontiers = self.viewpoint_planner.generate_viewpoints_for_frontiers(
             frontiers=frontiers,
             score_map=score_map,
             current_pose=current_pose
         )
-
         self.last_frontiers = frontiers
 
         if len(frontiers) > 0:
@@ -317,7 +458,6 @@ class SemanticMemory:
                 frontiers=frontiers,
                 current_pose=current_pose
             )
-
             if target is not None:
                 target = self.apply_frontier_hysteresis(
                     selected_target=target,
@@ -334,11 +474,9 @@ class SemanticMemory:
             max_distance=max_distance
         )
 
-
     def apply_frontier_hysteresis(self, selected_target, frontiers):
         if selected_target is None or not selected_target.get("valid", False):
             return selected_target
-
         if self.last_selected_frontier is None:
             selected_target["hysteresis_kept"] = False
             selected_target["hysteresis_reason"] = "no previous frontier"
@@ -348,7 +486,6 @@ class SemanticMemory:
             frontiers=frontiers,
             last_frontier=self.last_selected_frontier
         )
-
         if matched_frontier is None:
             selected_target["hysteresis_kept"] = False
             selected_target["hysteresis_reason"] = "previous frontier disappeared"
@@ -356,7 +493,6 @@ class SemanticMemory:
 
         selected_score = float(selected_target.get("score", 0.0))
         matched_score = float(matched_frontier.get("score", 0.0))
-
         if selected_score <= matched_score + self.frontier_switch_margin:
             target = dict(matched_frontier)
             target["target_type"] = selected_target.get("target_type", "sgcp_frontier")
@@ -373,84 +509,61 @@ class SemanticMemory:
         selected_target["hysteresis_reason"] = "new frontier is significantly better"
         return selected_target
 
-
     def find_matching_frontier(self, frontiers, last_frontier):
         if last_frontier is None:
             return None
-
         last_pos = last_frontier.get("frontier_position", None)
         if last_pos is None:
             last_pos = last_frontier.get("position", None)
-
         if last_pos is None:
             return None
 
         best_frontier = None
         best_dist = None
-
         for frontier in frontiers:
             pos = frontier.get("frontier_position", None)
             if pos is None:
                 pos = frontier.get("position", None)
-
             if pos is None:
                 continue
-
             dist = math.hypot(pos[0] - last_pos[0], pos[1] - last_pos[1])
-
             if best_dist is None or dist < best_dist:
                 best_dist = dist
                 best_frontier = frontier
 
         if best_frontier is None:
             return None
-
         if best_dist is not None and best_dist <= self.frontier_match_distance:
             return best_frontier
-
         return None
-
 
     def update_frontier_selection_history(self, target):
         if target is None or not target.get("valid", False):
             return
-
         self.last_selected_frontier = dict(target)
-
         key = self.get_frontier_key(
             target.get("frontier_position", target.get("position", None))
         )
-
         if key is None:
             return
-
         if key not in self.frontier_selection_count:
             self.frontier_selection_count[key] = 0
-
         self.frontier_selection_count[key] += 1
-
 
     def get_frontier_selection_count(self, position):
         key = self.get_frontier_key(position)
-
         if key is None:
             return 0
-
         return int(self.frontier_selection_count.get(key, 0))
-
 
     def get_frontier_key(self, position):
         if position is None:
             return None
-
         x, y = position
         cell_size = max(self.resolution * 2.0, 1e-6)
-
         key_x = int(round(float(x) / cell_size))
         key_y = int(round(float(y) / cell_size))
-
         return f"{key_x}_{key_y}"
-
 
     def get_best_memory_cell_target(
         self,
@@ -463,13 +576,11 @@ class SemanticMemory:
             max_distance = self.map_size / 2.0
 
         observed_mask = self.confidence >= min_confidence
-
         if not np.any(observed_mask):
             return self.default_memory_target()
 
         score_map = self.compute_planning_score_map()
         score_map = np.where(observed_mask, score_map, -1.0)
-
         self.suppress_nearby_cells(
             score_map=score_map,
             current_pose=current_pose,
@@ -483,7 +594,6 @@ class SemanticMemory:
         max_index = np.unravel_index(np.argmax(score_map), score_map.shape)
         gx, gy = int(max_index[0]), int(max_index[1])
         wx, wy = self.grid_to_world(gx, gy)
-
         target = {
             "valid": True,
             "target_type": "cell",
@@ -505,33 +615,26 @@ class SemanticMemory:
             "observe_count": int(self.observe_count[gx, gy]),
             "cluster_size": 1,
         }
-
         target = self.add_relative_info_to_target(target, current_pose)
         return target
-
 
     def select_best_frontier(self, frontiers):
         if len(frontiers) == 0:
             return self.default_memory_target()
-
         best_frontier = max(frontiers, key=lambda item: item.get("score", 0.0))
         return best_frontier
-
 
     def add_relative_info_to_target(self, target, current_pose):
         if not target.get("valid", False):
             return target
-
         x, y, z, yaw = current_pose
         pos = target.get("position", None)
-
         if pos is None:
             return target
 
         wx, wy = pos
         dx = wx - x
         dy = wy - y
-
         distance = math.hypot(dx, dy)
         target_yaw = math.degrees(math.atan2(dy, dx))
         relative_angle = self.normalize_angle(target_yaw - yaw)
@@ -541,58 +644,46 @@ class SemanticMemory:
         target["target_yaw"] = round(target_yaw, 2)
         target["relative_angle"] = round(relative_angle, 2)
         target["relative_region"] = relative_region
-
         return target
-
 
     def compute_planning_score_map(self):
         semantic_score = np.clip(self.semantic_value, 0.0, 1.0)
         confidence_score = np.clip(self.confidence, 0.0, 1.0)
         safety_score = np.clip(self.safety_value, 0.0, 1.0)
         novelty_score = np.clip(self.novelty_value, 0.0, 1.0)
+        obstacle_penalty = 1.0 - 0.7 * np.clip(self.obstacle_confidence, 0.0, 1.0)
 
-        # 语义是主项；安全、新颖性、置信度作为调制项，避免单帧低置信噪声主导规划。
         score_map = semantic_score
         score_map = score_map * (0.4 + 0.6 * confidence_score)
         score_map = score_map * (0.5 + 0.5 * safety_score)
         score_map = score_map * (0.5 + 0.5 * novelty_score)
+        score_map = score_map * obstacle_penalty
 
         visited_penalty = np.where(self.visited, 0.55, 1.0)
         score_map = score_map * visited_penalty
-
         return score_map
-
 
     def suppress_nearby_cells(self, score_map, current_pose, min_distance, max_distance):
         x, y, z, yaw = current_pose
-
         for gx in range(self.grid_size):
             for gy in range(self.grid_size):
                 if score_map[gx, gy] < 0.0:
                     continue
-
                 wx, wy = self.grid_to_world(gx, gy)
                 dist = math.hypot(wx - x, wy - y)
-
                 if dist < min_distance or dist > max_distance:
                     score_map[gx, gy] = -1.0
-
 
     def get_relative_region(self, relative_angle):
         if abs(relative_angle) <= 35.0:
             return "front"
-
         if relative_angle > 35.0 and relative_angle <= 135.0:
             return "right"
-
         if relative_angle < -35.0 and relative_angle >= -135.0:
             return "left"
-
         if relative_angle > 135.0:
             return "back_right"
-
         return "back_left"
-
 
     def default_memory_target(self):
         target = {
@@ -620,9 +711,7 @@ class SemanticMemory:
             "relative_angle": 0.0,
             "relative_region": "front"
         }
-
         return target
-
 
     def get_neighbors(self, gx, gy, eight_connected=True):
         if eight_connected:
@@ -643,88 +732,79 @@ class SemanticMemory:
         for dx, dy in offsets:
             nx = gx + dx
             ny = gy + dy
-
             if self.in_bounds(nx, ny):
                 neighbors.append((nx, ny))
-
         return neighbors
-
 
     def world_to_grid(self, x, y):
         gx = int(round((x - self.origin[0]) / self.resolution + self.center_idx))
         gy = int(round((y - self.origin[1]) / self.resolution + self.center_idx))
-
         if not self.in_bounds(gx, gy):
             return None
-
         return gx, gy
-
 
     def grid_to_world(self, gx, gy):
         x = (gx - self.center_idx) * self.resolution + self.origin[0]
         y = (gy - self.center_idx) * self.resolution + self.origin[1]
         return x, y
 
-
     def in_bounds(self, gx, gy):
         return 0 <= gx < self.grid_size and 0 <= gy < self.grid_size
-
 
     def get_summary(self):
         observed_mask = self.confidence > 0.0
         observed_cells = int(np.sum(observed_mask))
         visited_cells = int(np.sum(self.visited))
+        free_cells = int(np.sum(self.free_confidence >= 0.2))
+        obstacle_cells = int(np.sum(self.obstacle_confidence >= 0.45))
 
         if observed_cells == 0:
             return {
                 "observed_cells": observed_cells,
                 "visited_cells": visited_cells,
+                "free_cells": free_cells,
+                "obstacle_cells": obstacle_cells,
                 "max_value": 0.0,
                 "max_confidence": 0.0,
                 "max_position": None,
                 "mean_value": 0.0,
                 "frontier_count": 0,
-                "last_region_update": self.last_region_update
+                "last_region_update": self.last_region_update,
+                "last_occupancy_update": self.last_occupancy_update,
             }
 
         value_map = self.semantic_value * np.maximum(self.confidence, 1e-6)
         value_map = np.where(observed_mask, value_map, -1.0)
-
         max_index = np.unravel_index(np.argmax(value_map), value_map.shape)
         max_x, max_y = self.grid_to_world(max_index[0], max_index[1])
-
         observed_values = self.semantic_value[observed_mask]
-
         return {
             "observed_cells": observed_cells,
             "visited_cells": visited_cells,
+            "free_cells": free_cells,
+            "obstacle_cells": obstacle_cells,
             "max_value": float(self.semantic_value[max_index]),
             "max_confidence": float(self.confidence[max_index]),
             "max_position": (round(max_x, 2), round(max_y, 2)),
             "mean_value": float(np.mean(observed_values)),
             "frontier_count": len(self.last_frontiers),
-            "last_region_update": self.last_region_update
+            "last_region_update": self.last_region_update,
+            "last_occupancy_update": self.last_occupancy_update,
         }
-
 
     def _get_score(self, score_dict, key, default):
         try:
             if not isinstance(score_dict, dict):
                 return default
-
             value = float(score_dict.get(key, default))
             value = max(0.0, min(1.0, value))
             return value
-
         except Exception:
             return default
-
 
     def normalize_angle(self, angle):
         while angle > 180.0:
             angle -= 360.0
-
         while angle < -180.0:
             angle += 360.0
-
         return angle

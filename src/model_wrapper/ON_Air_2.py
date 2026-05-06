@@ -1136,6 +1136,27 @@ class ONAir(BaseModelWrapper):
             f"action=[{action}, {value}]"
         )
 
+    def format_log_value(self, value, default="None"):
+        if value is None:
+            return default
+        return value
+
+    def format_log_float(self, value, digits=3, default="None"):
+        try:
+            if value is None:
+                return default
+            return f"{float(value):.{digits}f}"
+        except Exception:
+            return default
+
+    def format_log_int(self, value, default="0"):
+        try:
+            if value is None:
+                return default
+            return str(int(value))
+        except Exception:
+            return default
+
     def print_selected_target(self, index, selected_target):
         if selected_target is None:
             return
@@ -1149,17 +1170,60 @@ class ONAir(BaseModelWrapper):
             )
             return
 
-        print(
+        target_type = selected_target.get("target_type", "unknown")
+        geometry_reachable = selected_target.get("geometry_reachable", None)
+        geometry_reason = selected_target.get("geometry_reason", None)
+        geometry_path_length = selected_target.get("geometry_path_length", None)
+        geometry_path_len = selected_target.get("geometry_path_len", None)
+        geometry_raw_path_len = selected_target.get("geometry_raw_path_len", None)
+        geometry_cost = selected_target.get("geometry_cost", None)
+        geometry_score = selected_target.get("geometry_score", None)
+        geometry_ratio = selected_target.get("geometry_path_to_straight_ratio", None)
+        geometry_goal_adjusted = selected_target.get("geometry_goal_adjusted", None)
+
+        sgcp_reachable_count = selected_target.get("sgcp_reachable_frontier_count", None)
+        sgcp_reasonable_count = selected_target.get("sgcp_reasonable_frontier_count", None)
+        sgcp_total_count = selected_target.get("sgcp_total_frontier_count", None)
+        sgcp_candidate_count = selected_target.get("sgcp_candidate_count", None)
+        sgcp_constraint_count = selected_target.get("sgcp_constraint_count", None)
+        sgcp_score = selected_target.get("sgcp_score", None)
+
+        log_text = (
             "[Selected Target] "
             f"Episode {index}: "
-            f"type={selected_target.get('target_type', 'unknown')}, "
+            f"type={target_type}, "
             f"pos={selected_target.get('position', None)}, "
-            f"score={selected_target.get('score', 0.0):.3f}, "
-            f"conf={selected_target.get('confidence', 0.0):.2f}, "
+            f"score={self.format_log_float(selected_target.get('score', 0.0), 3)}, "
+            f"conf={self.format_log_float(selected_target.get('confidence', 0.0), 2)}, "
             f"dist={selected_target.get('distance', 0.0)}, "
             f"rel_angle={selected_target.get('relative_angle', 0.0)}, "
             f"rel_region={selected_target.get('relative_region', 'front')}"
         )
+
+        if target_type == "sgcp_frontier" or geometry_reachable is not None:
+            log_text += (
+                f", geo_reachable={self.format_log_value(geometry_reachable)}, "
+                f"geo_reason={self.format_log_value(geometry_reason)}, "
+                f"geo_len={self.format_log_float(geometry_path_length, 2)}, "
+                f"geo_path_len={self.format_log_int(geometry_path_len)}, "
+                f"geo_raw_len={self.format_log_int(geometry_raw_path_len)}, "
+                f"geo_cost={self.format_log_float(geometry_cost, 3)}, "
+                f"geo_score={self.format_log_float(geometry_score, 3)}, "
+                f"geo_ratio={self.format_log_float(geometry_ratio, 3)}, "
+                f"geo_adjusted={self.format_log_value(geometry_goal_adjusted)}"
+            )
+
+        if target_type == "sgcp_frontier" or sgcp_total_count is not None:
+            log_text += (
+                f", sgcp_score={self.format_log_float(sgcp_score, 3)}, "
+                f"sgcp_reachable={self.format_log_int(sgcp_reachable_count)}, "
+                f"sgcp_reasonable={self.format_log_int(sgcp_reasonable_count)}, "
+                f"sgcp_total={self.format_log_int(sgcp_total_count)}, "
+                f"sgcp_candidates={self.format_log_int(sgcp_candidate_count)}, "
+                f"sgcp_constraints={self.format_log_int(sgcp_constraint_count)}"
+            )
+
+        print(log_text)
 
     def print_memory_summary(self, index, memory_summary):
         if memory_summary is None:
@@ -1183,7 +1247,15 @@ class ONAir(BaseModelWrapper):
             print(
                 "[Local Planner] "
                 f"Episode {index}: invalid, "
-                f"reason={planned_path.get('reason', 'unknown')}"
+                f"reason={planned_path.get('reason', 'unknown')}, "
+                f"path_len={planned_path.get('path_len', 0)}, "
+                f"path_length={planned_path.get('path_length', 0.0)}, "
+                f"straight={planned_path.get('straight_distance', 0.0)}, "
+                f"ratio={self.format_log_float(planned_path.get('path_to_straight_ratio', None), 3)}, "
+                f"geo_cost={self.format_log_float(planned_path.get('geometry_cost', None), 3)}, "
+                f"blocked={planned_path.get('blocked_cells', 0)}, "
+                f"obstacle={planned_path.get('obstacle_cells', 0)}, "
+                f"unknown_blocked={planned_path.get('unknown_blocked_cells', 0)}"
             )
             return
 
@@ -1194,8 +1266,19 @@ class ONAir(BaseModelWrapper):
             "[Local Planner] "
             f"Episode {index}: "
             f"valid=True, "
+            f"arrived={planned_path.get('arrived', False)}, "
+            f"reason={planned_path.get('reason', 'ok')}, "
             f"path_len={planned_path.get('path_len', 0)}, "
+            f"raw_len={planned_path.get('raw_grid_path_len', 0)}, "
             f"path_length={planned_path.get('path_length', 0.0)}, "
+            f"straight={planned_path.get('straight_distance', 0.0)}, "
+            f"ratio={self.format_log_float(planned_path.get('path_to_straight_ratio', None), 3)}, "
+            f"geo_cost={self.format_log_float(planned_path.get('geometry_cost', None), 3)}, "
+            f"geo_score={self.format_log_float(planned_path.get('geometry_score', None), 3)}, "
+            f"goal_adjusted={planned_path.get('goal_adjusted', False)}, "
+            f"blocked={planned_path.get('blocked_cells', 0)}, "
+            f"obstacle={planned_path.get('obstacle_cells', 0)}, "
+            f"unknown_blocked={planned_path.get('unknown_blocked_cells', 0)}, "
             f"target={planned_path.get('target_position', None)}, "
             f"preview={preview_path}"
         )
