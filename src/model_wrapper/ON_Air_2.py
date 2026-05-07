@@ -14,6 +14,8 @@ try:
     from src.planner.target_tracker import TargetTracker
     from src.planner.target_verifier import TargetVerifier
     from src.model_wrapper.grounding_dino_client import GroundingDINOClient
+    from src.planner.path_follower import PathFollower
+    from src.planner.planning_types import NavigationTarget, PathPlan, PlannerFeedback, PathReason
 except Exception:
     from planner.semantic_memory import SemanticMemory
     from planner.local_planner import LocalPlanner
@@ -21,6 +23,8 @@ except Exception:
     from planner.target_tracker import TargetTracker
     from planner.target_verifier import TargetVerifier
     from model_wrapper.grounding_dino_client import GroundingDINOClient
+    from planner.path_follower import PathFollower
+    from planner.planning_types import NavigationTarget, PathPlan, PlannerFeedback, PathReason
 
 import numpy as np
 import asyncio
@@ -52,6 +56,9 @@ class ONAir(BaseModelWrapper):
 
         self.local_planners = [None for _ in range(batch_size)]
         self.planned_paths = [{} for _ in range(batch_size)]
+        self.path_followers = [PathFollower() for _ in range(batch_size)]
+        self.path_follower_infos = [{} for _ in range(batch_size)]
+        self.planner_feedback_infos = [{} for _ in range(batch_size)]
 
         self.grounding_dino_client = GroundingDINOClient()
         self.grounding_dino_results = [{} for _ in range(batch_size)]
@@ -311,6 +318,8 @@ class ONAir(BaseModelWrapper):
             )
 
             self.planned_paths[index] = {}
+            self.path_follower_infos[index] = {}
+            self.planner_feedback_infos[index] = {}
             self.memory_targets[index] = {}
 
             self.target_trackers[index].reset()
@@ -367,20 +376,25 @@ class ONAir(BaseModelWrapper):
         semantic_result = self.parse_semantic_result(text)
         memory_summary = self.update_semantic_memory(index, semantic_result)
 
-        action, value, done, selected_target = self.select_navigation_action(
+        planner_step = self.planner_driven_step(
             index=index,
             semantic_result=semantic_result,
             fixed=False
         )
 
-        planned_path = self.plan_local_path(index, selected_target)
+        action = planner_step["action"]
+        value = planner_step["value"]
+        done = planner_step["done"]
+        selected_target = planner_step["selected_target"]
+        planned_path = planner_step["planned_path"]
 
         if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
             self.print_semantic_result(semantic_result, action, value)
             self.print_memory_summary(index, memory_summary)
-
-        self.print_selected_target(index, selected_target)
-        self.print_local_plan(index, planned_path)
+            self.print_selected_target(index, selected_target)
+            self.print_local_plan(index, planned_path)
+            self.print_path_follower(index, planner_step.get("path_follower_info", {}))
+            self.print_planner_feedback(index, planner_step.get("planner_feedback", {}))
 
         return action, value, done, semantic_result
 
@@ -394,241 +408,492 @@ class ONAir(BaseModelWrapper):
         semantic_result = self.parse_semantic_result(text)
         memory_summary = self.update_semantic_memory(index, semantic_result)
 
-        action, value, done, selected_target = self.select_navigation_action(
+        planner_step = self.planner_driven_step(
             index=index,
             semantic_result=semantic_result,
             fixed=True
         )
 
-        planned_path = self.plan_local_path(index, selected_target)
+        action = planner_step["action"]
+        value = planner_step["value"]
+        done = planner_step["done"]
+        selected_target = planner_step["selected_target"]
+        planned_path = planner_step["planned_path"]
 
         if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
             self.print_semantic_result(semantic_result, action, value)
             self.print_memory_summary(index, memory_summary)
-
-        self.print_selected_target(index, selected_target)
-        self.print_local_plan(index, planned_path)
+            self.print_selected_target(index, selected_target)
+            self.print_local_plan(index, planned_path)
+            self.print_path_follower(index, planner_step.get("path_follower_info", {}))
+            self.print_planner_feedback(index, planner_step.get("planner_feedback", {}))
 
         return action, value, done, semantic_result
 
-    async def batch_calls(self, conversations, fixed):
-        if fixed:
-            tasks = [self.fixed_single_call(index, conv) for index, conv in conversations]
-        else:
-            tasks = [self.unfixed_single_call(index, conv) for index, conv in conversations]
+    def planner_driven_step(self, index, semantic_result, fixed):
+        """
+        AirHunt-localized planner-driven step.
 
-        return await asyncio.gather(*tasks)
-
-    def run(self, inputs, fixed, prompt_info_list=None):
-        results = asyncio.run(self.batch_calls(inputs, fixed))
-        actions, steps_size, predict_dones, semantic_results = zip(*results)
-
-        self.semantic_results = list(semantic_results)
-
-        new_actions, new_step_size = self.redirect_action(actions, steps_size, fixed)
-
-        return list(new_actions), list(new_step_size), list(predict_dones)
-
-    def update_semantic_memory(self, index, semantic_result):
-        try:
-            memory = self.semantic_memories[index]
-            update_info = self.memory_update_infos[index]
-
-            memory_summary = memory.update(
-                semantic_result=semantic_result,
-                current_pose=update_info["current_pose"],
-                depth_info=update_info["depth_info"],
-                step_num=update_info["step_num"]
-            )
-
-            return memory_summary
-
-        except Exception as e:
-            print(f"[WARNING] failed to update semantic memory for episode {index}: {e}")
-            return None
-
-    def select_navigation_action(self, index, semantic_result, fixed):
-        navigation_info = self.navigation_infos[index]
-        mode = navigation_info.get("mode", "explore")
-        planner_target = navigation_info.get("planner_target", None)
-
-        if isinstance(planner_target, dict):
-            if planner_target.get("target_type", "") in [
-                "verified_target_stop",
-                "gdino_stop",
-                "gdino_verified_stop",
-                "gdino_position_stop"
-            ]:
-                self.memory_targets[index] = planner_target
-                return "stop", 0, True, planner_target
-
-        if mode == NavigationState.MODE_STOP:
-            stop_target = self.default_memory_target()
-            stop_target["target_type"] = "verified_target_stop"
-            stop_target["valid"] = True
-            stop_target["position"] = self.get_current_xy(index)
-            stop_target["viewpoint_position"] = self.get_current_xy(index)
-            stop_target["target_world_position"] = None
-
-            tracker_info = navigation_info.get("tracker_info", {})
-            if isinstance(tracker_info, dict):
-                stop_target["target_world_position"] = tracker_info.get("verified_target_position", None)
-
-            stop_target["stop_reason"] = navigation_info.get(
-                "reason",
-                "reached verified target object position"
-            )
-            self.memory_targets[index] = stop_target
-            return "stop", 0, True, stop_target
-
-        # AirHunt-style rule:
-        # CONFIRM / VERIFY only collect and verify object candidates.
-        # They must not directly execute unverified GDINO targets.
-        if mode in [
-            NavigationState.MODE_NAVIGATE,
-            NavigationState.MODE_RECOVER
-        ]:
-            if isinstance(planner_target, dict) and planner_target.get("valid", False):
-                action, value, done = self.target_to_legacy_action(
-                    target=planner_target,
-                    semantic_result=semantic_result,
-                    fixed=fixed
-                )
-                self.memory_targets[index] = planner_target
-                return action, value, done, planner_target
-
-        return self.memory_to_legacy_action(
+        Semantic outputs and GDINO verification only select a navigation target.
+        The final UAV-ON action must be produced from LocalPlanner path through
+        PathFollower. This function intentionally does not call
+        select_navigation_action().
+        """
+        selected_target = self.select_navigation_target(
             index=index,
             semantic_result=semantic_result,
             fixed=fixed
         )
 
-    def memory_to_legacy_action(self, index, semantic_result, fixed):
+        if self.is_stop_candidate(selected_target):
+            planned_path = self.default_local_plan("stop candidate selected")
+            path_follower_info = {
+                "valid": True,
+                "action": "stop",
+                "step_size": 0,
+                "done": True,
+                "reason": selected_target.get("stop_reason", "stop candidate selected"),
+                "action_source": "navigation_stop_candidate",
+            }
+            planner_feedback = self.build_planner_feedback(
+                index=index,
+                selected_target=selected_target,
+                planned_path=planned_path,
+                path_follower_info=path_follower_info
+            )
+
+            self.memory_targets[index] = selected_target
+            self.planned_paths[index] = planned_path
+            self.path_follower_infos[index] = path_follower_info
+            self.planner_feedback_infos[index] = planner_feedback
+
+            return {
+                "action": "stop",
+                "value": 0,
+                "done": True,
+                "selected_target": selected_target,
+                "planned_path": planned_path,
+                "path_follower_info": path_follower_info,
+                "planner_feedback": planner_feedback,
+            }
+
+        planned_path = self.plan_local_path(index, selected_target)
+        action, value, done, path_follower_info = self.follow_local_path(
+            index=index,
+            planned_path=planned_path,
+            fixed=fixed
+        )
+
+        if action is None:
+            semantic_target = self.build_semantic_region_target(
+                index=index,
+                semantic_result=semantic_result,
+                fixed=fixed,
+                reason="primary target path is not executable"
+            )
+            if semantic_target.get("valid", False):
+                retry_path = self.plan_local_path(index, semantic_target)
+                retry_action, retry_value, retry_done, retry_follower_info = self.follow_local_path(
+                    index=index,
+                    planned_path=retry_path,
+                    fixed=fixed
+                )
+                if retry_action is not None:
+                    selected_target = semantic_target
+                    planned_path = retry_path
+                    action = retry_action
+                    value = retry_value
+                    done = retry_done
+                    path_follower_info = retry_follower_info
+
+        if action is None:
+            action, value, done, path_follower_info = self.no_executable_path_action(
+                index=index,
+                fixed=fixed,
+                selected_target=selected_target,
+                planned_path=planned_path
+            )
+
+        planner_feedback = self.build_planner_feedback(
+            index=index,
+            selected_target=selected_target,
+            planned_path=planned_path,
+            path_follower_info=path_follower_info
+        )
+
+        self.memory_targets[index] = selected_target
+        self.planned_paths[index] = planned_path
+        self.path_follower_infos[index] = path_follower_info
+        self.planner_feedback_infos[index] = planner_feedback
+
+        return {
+            "action": action,
+            "value": value,
+            "done": done,
+            "selected_target": selected_target,
+            "planned_path": planned_path,
+            "path_follower_info": path_follower_info,
+            "planner_feedback": planner_feedback,
+        }
+
+    def select_navigation_target(self, index, semantic_result, fixed):
+        """
+        Select a semantic navigation target, not an action.
+
+        The returned target is still a planning target compatible with the current
+        LocalPlanner interface. It must be planned into a path before action output.
+        """
+        navigation_info = self.navigation_infos[index]
+        mode = navigation_info.get("mode", "explore")
+        planner_target = navigation_info.get("planner_target", None)
+
+        if isinstance(planner_target, dict):
+            if self.is_stop_candidate(planner_target):
+                return self.prepare_target_for_planning(
+                    target=planner_target,
+                    source="navigation_state_stop_candidate"
+                )
+
+        if mode == NavigationState.MODE_STOP:
+            return self.make_stop_candidate(index, navigation_info)
+
+        if mode in [NavigationState.MODE_NAVIGATE, NavigationState.MODE_RECOVER]:
+            if isinstance(planner_target, dict) and planner_target.get("valid", False):
+                return self.prepare_target_for_planning(
+                    target=planner_target,
+                    source="navigation_state_target"
+                )
+
+        memory_target = self.select_memory_navigation_target(index)
+        if memory_target.get("valid", False):
+            return memory_target
+
+        return self.build_semantic_region_target(
+            index=index,
+            semantic_result=semantic_result,
+            fixed=fixed,
+            reason="no valid memory target"
+        )
+
+    def select_memory_navigation_target(self, index):
         try:
             memory = self.semantic_memories[index]
             current_pose = self.current_poses[index]
-
             memory_target = memory.get_best_memory_target(
                 current_pose=current_pose,
                 min_confidence=0.05,
                 min_distance=3.0,
                 max_distance=45.0
             )
-
-            self.memory_targets[index] = memory_target
-
-            if memory_target.get("valid", False):
-                action, value, done = self.target_to_legacy_action(
-                    target=memory_target,
-                    semantic_result=semantic_result,
-                    fixed=fixed
-                )
-                return action, value, done, memory_target
-
+            return self.prepare_target_for_planning(
+                target=memory_target,
+                source="semantic_memory"
+            )
         except Exception as e:
-            print(f"[WARNING] failed to use semantic memory for episode {index}: {e}")
+            print(f"[WARNING] failed to select memory target for episode {index}: {e}")
+            target = self.default_memory_target()
+            target["reason"] = str(e)
+            return target
 
-        action, value, done = self.semantic_to_legacy_action(
-            semantic_result=semantic_result,
-            fixed=fixed
+    def prepare_target_for_planning(self, target, source=""):
+        if not isinstance(target, dict):
+            return self.default_memory_target()
+
+        new_target = copy.deepcopy(target)
+        if source:
+            new_target["source"] = source
+
+        if "target_type" not in new_target:
+            new_target["target_type"] = new_target.get("type", "memory")
+
+        target_position = self.extract_target_position(new_target)
+        if target_position is not None:
+            if new_target.get("position", None) is None:
+                new_target["position"] = target_position
+            if new_target.get("viewpoint_position", None) is None:
+                new_target["viewpoint_position"] = target_position
+
+        if "score" not in new_target:
+            new_target["score"] = new_target.get("semantic_value", 0.0)
+
+        if "relative_region" not in new_target:
+            new_target["relative_region"] = "front"
+
+        if "relative_angle" not in new_target:
+            new_target["relative_angle"] = 0.0
+
+        if "stop_reason" not in new_target:
+            new_target["stop_reason"] = ""
+
+        return new_target
+
+    def extract_target_position(self, target):
+        for key in [
+            "viewpoint_position",
+            "position",
+            "frontier_position",
+            "target_world_position",
+            "verified_target_position",
+        ]:
+            value = target.get(key, None)
+            if value is None:
+                continue
+            if not isinstance(value, (list, tuple)):
+                continue
+            if len(value) < 2:
+                continue
+            try:
+                x = float(value[0])
+                y = float(value[1])
+                z = float(value[2]) if len(value) >= 3 else 0.0
+                return (round(x, 2), round(y, 2), round(z, 2))
+            except Exception:
+                continue
+        return None
+
+    def build_semantic_region_target(self, index, semantic_result, fixed, reason=""):
+        try:
+            current_pose = self.current_poses[index]
+            x, y, z, yaw = current_pose
+
+            region_scores = semantic_result.get("region_scores", {})
+            safety_scores = semantic_result.get("safety_scores", {})
+            novelty_scores = semantic_result.get("novelty_scores", {})
+
+            best_region = semantic_result.get("best_region", "front")
+            if best_region not in ["front", "left", "right"]:
+                best_region = max(region_scores, key=region_scores.get)
+
+            region_score = float(region_scores.get(best_region, 0.0))
+            safety_score = float(safety_scores.get(best_region, 0.5))
+            novelty_score = float(novelty_scores.get(best_region, 0.5))
+
+            yaw_offset = self.get_region_yaw_offset(best_region)
+            target_yaw = yaw + yaw_offset
+
+            if fixed:
+                distance = 8.0
+            else:
+                distance = self.estimate_unfixed_step_size(
+                    region_score=region_score,
+                    safety_score=safety_score,
+                    target_visible=False,
+                    target_confidence=0.0
+                )
+                distance = max(5.0, min(12.0, float(distance) * 1.8))
+
+            target_x = x + math.cos(math.radians(target_yaw)) * distance
+            target_y = y + math.sin(math.radians(target_yaw)) * distance
+            target_x, target_y = self.clamp_to_search_bounds(index, target_x, target_y)
+
+            relative_angle = self.normalize_relative_angle(target_yaw - yaw)
+
+            target = self.default_memory_target()
+            target.update({
+                "valid": True,
+                "target_type": "semantic_region",
+                "source": "semantic_result",
+                "position": (round(target_x, 2), round(target_y, 2), round(z, 2)),
+                "viewpoint_position": (round(target_x, 2), round(target_y, 2), round(z, 2)),
+                "frontier_position": None,
+                "score": round(region_score, 3),
+                "semantic_value": round(region_score, 3),
+                "confidence": 0.1,
+                "safety_value": round(safety_score, 3),
+                "novelty_value": round(novelty_score, 3),
+                "distance": round(distance, 2),
+                "target_yaw": round(target_yaw, 2),
+                "relative_angle": round(relative_angle, 2),
+                "relative_region": best_region,
+                "stop_reason": "",
+                "reason": reason,
+            })
+            return target
+        except Exception as e:
+            print(f"[WARNING] failed to build semantic region target for episode {index}: {e}")
+            target = self.default_memory_target()
+            target["reason"] = str(e)
+            return target
+
+    def get_region_yaw_offset(self, region):
+        if region == "left":
+            return -90.0
+        if region == "right":
+            return 90.0
+        return 0.0
+
+    def clamp_to_search_bounds(self, index, x, y):
+        try:
+            start_position = self.start_position[index]
+            x_min = start_position[0] - 48.0
+            x_max = start_position[0] + 48.0
+            y_min = start_position[1] - 48.0
+            y_max = start_position[1] + 48.0
+            x = min(max(float(x), x_min), x_max)
+            y = min(max(float(y), y_min), y_max)
+        except Exception:
+            pass
+        return x, y
+
+    def normalize_relative_angle(self, angle):
+        angle = float(angle)
+        while angle > 180.0:
+            angle -= 360.0
+        while angle < -180.0:
+            angle += 360.0
+        return angle
+
+    def make_stop_candidate(self, index, navigation_info):
+        stop_target = self.default_memory_target()
+        stop_target["target_type"] = "verified_target_stop"
+        stop_target["source"] = "navigation_state"
+        stop_target["valid"] = True
+        stop_target["position"] = self.get_current_xy(index)
+        stop_target["viewpoint_position"] = self.get_current_xy(index)
+        stop_target["target_world_position"] = None
+
+        tracker_info = navigation_info.get("tracker_info", {})
+        if isinstance(tracker_info, dict):
+            stop_target["target_world_position"] = tracker_info.get(
+                "verified_target_position", None
+            )
+
+        stop_target["stop_reason"] = navigation_info.get(
+            "reason", "reached verified target object position"
         )
-        return action, value, done, self.default_memory_target()
+        return stop_target
 
-    def target_to_legacy_action(self, target, semantic_result, fixed):
-        target_type = target.get("target_type", "memory")
+    def is_stop_candidate(self, target):
+        if not isinstance(target, dict):
+            return False
 
+        target_type = target.get("target_type", "")
         if target_type in [
             "verified_target_stop",
             "gdino_stop",
             "gdino_verified_stop",
             "gdino_position_stop"
         ]:
-            return "stop", 0, True
+            return True
 
         if target.get("stop_reason", ""):
-            return "stop", 0, True
+            return True
 
-        relative_region = target.get("relative_region", "front")
-        relative_angle = target.get("relative_angle", 0.0)
-        safety_value = target.get("safety_value", 0.5)
-        target_score = target.get("score", 0.0)
+        return False
 
-        if safety_value < 0.20 and not target_type.startswith("gdino") and not target_type.startswith("verified"):
-            if fixed:
-                return "rotl", 0, False
-            else:
-                return "rotl", 30, False
+    def follow_local_path(self, index, planned_path, fixed):
+        try:
+            path_follower = self.path_followers[index]
+            current_pose = self.current_poses[index]
 
-        if relative_region == "front":
-            action = "forward"
-        elif relative_region == "left":
-            action = "left"
-        elif relative_region == "right":
-            action = "right"
-        elif relative_region == "back_left":
-            action = "rotl"
-        elif relative_region == "back_right":
-            action = "rotr"
-        else:
-            action = "forward"
+            action, step_size, done, info = path_follower.follow_as_tuple(
+                current_pose=current_pose,
+                path_plan=planned_path
+            )
 
+            if action is None:
+                return None, 0.0, False, info
+
+            if fixed and action != "stop":
+                step_size = 0
+
+            return action, step_size, done, info
+        except Exception as e:
+            print(f"[WARNING] failed to follow local path for episode {index}: {e}")
+            info = {
+                "valid": False,
+                "action": None,
+                "step_size": 0.0,
+                "done": False,
+                "reason": str(e),
+                "action_source": "path_follower_error",
+            }
+            return None, 0.0, False, info
+
+    def no_executable_path_action(self, index, fixed, selected_target, planned_path):
+        """
+        Compatibility guard for the current UAV-ON evaluation interface.
+
+        This is not a semantic fallback. It is only used when no executable path
+        action can be produced after trying the selected target and semantic region
+        target. PlannerFeedback records the failure so later steps can feed it back
+        into viewpoint reselection instead of keeping this guard as policy.
+        """
         if fixed:
             value = 0
         else:
-            if action in ["rotl", "rotr"]:
-                value = min(60, max(15, abs(relative_angle)))
-            elif target_type.startswith("gdino") or target_type.startswith("verified"):
-                value = self.estimate_target_step_size(target)
-            else:
-                value = self.estimate_unfixed_step_size(
-                    region_score=target_score,
-                    safety_score=safety_value,
-                    target_visible=False,
-                    target_confidence=0.0
-                )
+            value = 15
 
-        return action, value, False
+        info = {
+            "valid": False,
+            "action": "rotl",
+            "step_size": value,
+            "done": False,
+            "reason": "no_executable_path_after_replanning",
+            "action_source": "planner_interface_guard",
+            "path_reason": planned_path.get("reason", "unknown") if isinstance(planned_path, dict) else "unknown",
+            "path_len": planned_path.get("path_len", 0) if isinstance(planned_path, dict) else 0,
+            "path_length": planned_path.get("path_length", 0.0) if isinstance(planned_path, dict) else 0.0,
+        }
 
-    def estimate_target_step_size(self, target):
-        distance = target.get("distance", 4.0)
-        confidence = target.get("confidence", 0.0)
+        return "rotl", value, False, info
 
+    def build_planner_feedback(self, index, selected_target, planned_path, path_follower_info):
         try:
-            distance = float(distance)
-        except Exception:
-            distance = 4.0
+            path_plan = PathPlan.from_dict(planned_path)
+            target = NavigationTarget.from_dict(selected_target)
+            feedback = PlannerFeedback.from_path_plan(
+                path_plan=path_plan,
+                target=target,
+                viewpoint=None,
+                action_source=path_follower_info.get("action_source", "")
+            ).to_dict()
 
-        try:
-            confidence = float(confidence)
-        except Exception:
-            confidence = 0.0
-
-        if confidence >= 0.55:
-            step_size = max(2.0, min(5.0, distance))
-        else:
-            step_size = max(2.0, min(4.0, distance))
-
-        return step_size
-
-    def plan_local_path(self, index, selected_target):
-        try:
-            local_planner = self.local_planners[index]
-            current_pose = self.current_poses[index]
-
-            if local_planner is None:
-                return self.default_local_plan("local planner is None")
-
-            planned_path = local_planner.plan_path(
-                current_pose=current_pose,
-                memory_target=selected_target
-            )
-
-            self.planned_paths[index] = planned_path
-            return planned_path
-
+            feedback["path_follower_valid"] = bool(path_follower_info.get("valid", False))
+            feedback["path_follower_reason"] = path_follower_info.get("reason", "")
+            feedback["episode_index"] = index
+            return feedback
         except Exception as e:
-            print(f"[WARNING] failed to plan local path for episode {index}: {e}")
-            return self.default_local_plan(str(e))
+            return {
+                "valid": False,
+                "reason": str(e),
+                "episode_index": index,
+                "action_source": path_follower_info.get("action_source", "")
+                if isinstance(path_follower_info, dict) else "",
+            }
+
+    def print_path_follower(self, index, path_follower_info):
+        if not isinstance(path_follower_info, dict):
+            return
+
+        print(
+            "[PathFollower] "
+            f"Episode {index}: "
+            f"valid={path_follower_info.get('valid', False)}, "
+            f"action={path_follower_info.get('action', None)}, "
+            f"step={path_follower_info.get('step_size', 0.0)}, "
+            f"reason={path_follower_info.get('reason', '')}, "
+            f"source={path_follower_info.get('action_source', '')}, "
+            f"next={path_follower_info.get('next_waypoint', None)}, "
+            f"dist={path_follower_info.get('distance_to_waypoint', None)}, "
+            f"yaw_error={path_follower_info.get('yaw_error', None)}"
+        )
+
+    def print_planner_feedback(self, index, planner_feedback):
+        if not isinstance(planner_feedback, dict):
+            return
+
+        print(
+            "[PlannerFeedback] "
+            f"Episode {index}: "
+            f"valid={planner_feedback.get('valid', False)}, "
+            f"reason={planner_feedback.get('reason', '')}, "
+            f"target={planner_feedback.get('target_type', '')}, "
+            f"path_len={planner_feedback.get('path_len', 0)}, "
+            f"replan={planner_feedback.get('replan_required', False)}, "
+            f"reselect={planner_feedback.get('should_reselect_viewpoint', False)}, "
+            f"source={planner_feedback.get('action_source', '')}"
+        )
 
     def parse_semantic_result(self, text):
         try:
