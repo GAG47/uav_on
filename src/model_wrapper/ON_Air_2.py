@@ -437,7 +437,7 @@ class ONAir(BaseModelWrapper):
         Semantic outputs and GDINO verification only select a navigation target.
         The final UAV-ON action must be produced from LocalPlanner path through
         PathFollower. This function intentionally does not call
-        select_navigation_action().
+        semantic-to-action adapters.
         """
         selected_target = self.select_navigation_target(
             index=index,
@@ -513,6 +513,8 @@ class ONAir(BaseModelWrapper):
                 selected_target=selected_target,
                 planned_path=planned_path
             )
+
+        self.validate_env_action_source(path_follower_info)
 
         planner_feedback = self.build_planner_feedback(
             index=index,
@@ -616,8 +618,8 @@ class ONAir(BaseModelWrapper):
         if "score" not in new_target:
             new_target["score"] = new_target.get("semantic_value", 0.0)
 
-        if "relative_region" not in new_target:
-            new_target["relative_region"] = "front"
+        if "observation_region" not in new_target:
+            new_target["observation_region"] = new_target.get("relative_region", "")
 
         if "relative_angle" not in new_target:
             new_target["relative_angle"] = 0.0
@@ -704,7 +706,7 @@ class ONAir(BaseModelWrapper):
                 "distance": round(distance, 2),
                 "target_yaw": round(target_yaw, 2),
                 "relative_angle": round(relative_angle, 2),
-                "relative_region": best_region,
+                "observation_region": best_region,
                 "stop_reason": "",
                 "reason": reason,
             })
@@ -780,6 +782,50 @@ class ONAir(BaseModelWrapper):
             return True
 
         return False
+
+    def validate_env_action_source(self, path_follower_info):
+        """
+        Guard the planner-driven invariant.
+
+        High-level semantic targets, relative regions, or legacy action adapters
+        must not directly produce UAV-ON executable actions. The only normal
+        action source before StopGate refactor is PathFollower. The current
+        planner_interface_guard is kept only as a temporary interface guard and
+        will be removed when PlannerFeedback-driven viewpoint reselection is
+        introduced.
+        """
+        if not isinstance(path_follower_info, dict):
+            raise RuntimeError("invalid path follower info")
+
+        action_source = str(path_follower_info.get("action_source", ""))
+        forbidden_sources = {
+            "semantic_result",
+            "semantic_region",
+            "relative_region",
+            "llm_action",
+            "memory_to_legacy_action",
+            "target_to_legacy_action",
+            "select_navigation_action",
+        }
+
+        if action_source in forbidden_sources:
+            raise RuntimeError(
+                "semantic or legacy action source is forbidden in planner-driven execution: "
+                + action_source
+            )
+
+        allowed_sources = {
+            "path_follower",
+            "navigation_stop_candidate",
+            "planner_interface_guard",
+            "path_follower_error",
+        }
+
+        if action_source not in allowed_sources:
+            print(
+                "[WARNING] unexpected action source in planner-driven execution: "
+                f"{action_source}"
+            )
 
     def follow_local_path(self, index, planned_path, fixed):
         try:
