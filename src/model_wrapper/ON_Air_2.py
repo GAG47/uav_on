@@ -14,6 +14,7 @@ try:
     from src.planner.navigation_state import NavigationState
     from src.planner.target_tracker import TargetTracker
     from src.planner.target_verifier import TargetVerifier
+    from src.planner.final_stop_gate import FinalStopGate
     from src.model_wrapper.grounding_dino_client import GroundingDINOClient
     from src.planner.path_follower import PathFollower
     from src.planner.planning_types import NavigationTarget, PathPlan, PlannerFeedback, PathReason
@@ -24,6 +25,7 @@ except Exception:
     from planner.navigation_state import NavigationState
     from planner.target_tracker import TargetTracker
     from planner.target_verifier import TargetVerifier
+    from planner.final_stop_gate import FinalStopGate
     from model_wrapper.grounding_dino_client import GroundingDINOClient
     from planner.path_follower import PathFollower
     from planner.planning_types import NavigationTarget, PathPlan, PlannerFeedback, PathReason
@@ -64,6 +66,7 @@ class ONAir(BaseModelWrapper):
         self.path_followers = [PathFollower() for _ in range(batch_size)]
         self.path_follower_infos = [{} for _ in range(batch_size)]
         self.planner_feedback_infos = [{} for _ in range(batch_size)]
+        self.stop_gate_infos = [{} for _ in range(batch_size)]
 
         self.grounding_dino_client = GroundingDINOClient()
         self.grounding_dino_results = [{} for _ in range(batch_size)]
@@ -72,6 +75,7 @@ class ONAir(BaseModelWrapper):
         self.target_tracker_infos = [{} for _ in range(batch_size)]
 
         self.target_verifier = TargetVerifier(client=self.gpt_client)
+        self.final_stop_gate = FinalStopGate(success_distance=20.0)
         self.target_verification_infos = [{} for _ in range(batch_size)]
 
         self.navigation_states = [NavigationState() for _ in range(batch_size)]
@@ -330,6 +334,7 @@ class ONAir(BaseModelWrapper):
             self.rejected_viewpoint_ids[index] = set()
             self.path_follower_infos[index] = {}
             self.planner_feedback_infos[index] = {}
+            self.stop_gate_infos[index] = {}
             self.memory_targets[index] = {}
 
             self.target_trackers[index].reset()
@@ -406,6 +411,7 @@ class ONAir(BaseModelWrapper):
             self.print_local_plan(index, planned_path)
             self.print_path_follower(index, planner_step.get("path_follower_info", {}))
             self.print_planner_feedback(index, planner_step.get("planner_feedback", {}))
+            self.print_stop_gate(index, planner_step.get("stop_gate_info", {}))
 
         return action, value, done, semantic_result
 
@@ -447,9 +453,10 @@ class ONAir(BaseModelWrapper):
 
         Semantic outputs and GDINO verification only select a navigation target.
         The final UAV-ON action must be produced from LocalPlanner path through
-        PathFollower. Planner failures are converted into structured feedback
-        for viewpoint reselection, not direct fallback actions.
+        PathFollower. Stop can only be approved by FinalStopGate.
         """
+        stop_gate_info = {}
+
         selected_target = self.select_navigation_target(
             index=index,
             semantic_result=semantic_result,
@@ -457,39 +464,57 @@ class ONAir(BaseModelWrapper):
         )
 
         if self.is_stop_candidate(selected_target):
-            planned_path = self.default_local_plan("stop candidate selected")
-            executable_viewpoint = {}
-            path_follower_info = {
-                "valid": True,
-                "action": "stop",
-                "step_size": 0,
-                "done": True,
-                "reason": selected_target.get("stop_reason", "stop candidate selected"),
-                "action_source": "navigation_stop_candidate",
-            }
-            planner_feedback = self.build_planner_feedback(
+            stop_gate_info = self.try_final_stop_gate(
                 index=index,
-                selected_target=selected_target,
-                planned_path=planned_path,
-                path_follower_info=path_follower_info
+                stop_candidate=selected_target
             )
 
-            self.memory_targets[index] = selected_target
-            self.executable_viewpoints[index] = executable_viewpoint
-            self.planned_paths[index] = planned_path
-            self.path_follower_infos[index] = path_follower_info
-            self.planner_feedback_infos[index] = planner_feedback
+            if stop_gate_info.get("pass", False):
+                planned_path = self.default_local_plan("final stop gate passed")
+                executable_viewpoint = {}
+                path_follower_info = {
+                    "valid": True,
+                    "action": "stop",
+                    "step_size": 0,
+                    "done": True,
+                    "reason": stop_gate_info.get("reason", "final_stop_gate_passed"),
+                    "action_source": "final_stop_gate",
+                }
+                planner_feedback = self.build_planner_feedback(
+                    index=index,
+                    selected_target=selected_target,
+                    planned_path=planned_path,
+                    path_follower_info=path_follower_info
+                )
 
-            return {
-                "action": "stop",
-                "value": 0,
-                "done": True,
-                "selected_target": selected_target,
-                "executable_viewpoint": executable_viewpoint,
-                "planned_path": planned_path,
-                "path_follower_info": path_follower_info,
-                "planner_feedback": planner_feedback,
-            }
+                self.validate_env_action_source(path_follower_info)
+
+                self.memory_targets[index] = selected_target
+                self.executable_viewpoints[index] = executable_viewpoint
+                self.planned_paths[index] = planned_path
+                self.path_follower_infos[index] = path_follower_info
+                self.planner_feedback_infos[index] = planner_feedback
+                self.stop_gate_infos[index] = stop_gate_info
+
+                return {
+                    "action": "stop",
+                    "value": 0,
+                    "done": True,
+                    "selected_target": selected_target,
+                    "executable_viewpoint": executable_viewpoint,
+                    "planned_path": planned_path,
+                    "path_follower_info": path_follower_info,
+                    "planner_feedback": planner_feedback,
+                    "stop_gate_info": stop_gate_info,
+                }
+
+            selected_target = self.build_stop_gate_rejected_target(
+                index=index,
+                stop_candidate=selected_target,
+                stop_gate_info=stop_gate_info,
+                semantic_result=semantic_result,
+                fixed=fixed
+            )
 
         (
             executable_viewpoint,
@@ -600,6 +625,7 @@ class ONAir(BaseModelWrapper):
         self.planned_paths[index] = planned_path
         self.path_follower_infos[index] = path_follower_info
         self.planner_feedback_infos[index] = planner_feedback
+        self.stop_gate_infos[index] = stop_gate_info
 
         return {
             "action": action,
@@ -610,6 +636,7 @@ class ONAir(BaseModelWrapper):
             "planned_path": planned_path,
             "path_follower_info": path_follower_info,
             "planner_feedback": planner_feedback,
+            "stop_gate_info": stop_gate_info,
         }
 
     def select_navigation_target(self, index, semantic_result, fixed):
@@ -857,6 +884,82 @@ class ONAir(BaseModelWrapper):
 
         return False
 
+    def try_final_stop_gate(self, index, stop_candidate):
+        try:
+            stop_gate_info = self.final_stop_gate.evaluate(
+                current_pose=self.current_poses[index],
+                navigation_info=self.navigation_infos[index],
+                tracker_info=self.target_tracker_infos[index],
+                stop_candidate=stop_candidate
+            )
+            self.stop_gate_infos[index] = stop_gate_info
+            return stop_gate_info
+        except Exception as e:
+            stop_gate_info = {
+                "pass": False,
+                "reason": str(e),
+            }
+            self.stop_gate_infos[index] = stop_gate_info
+            return stop_gate_info
+
+    def build_stop_gate_rejected_target(
+        self,
+        index,
+        stop_candidate,
+        stop_gate_info,
+        semantic_result,
+        fixed,
+    ):
+        navigation_info = self.navigation_infos[index]
+        planner_target = navigation_info.get("planner_target", None)
+
+        if isinstance(planner_target, dict) and planner_target.get("valid", False):
+            target = self.prepare_target_for_planning(
+                target=planner_target,
+                source="stop_gate_rejected_approach"
+            )
+            target["stop_reason"] = ""
+
+            target_type = str(target.get("target_type", ""))
+            if "stop" in target_type:
+                target["target_type"] = "verified_object"
+
+            target["stop_gate_info"] = stop_gate_info
+            target["reason"] = (
+                "stop gate rejected candidate: "
+                + str(stop_gate_info.get("reason", "unknown"))
+            )
+            return target
+
+        target = self.build_semantic_region_target(
+            index=index,
+            semantic_result=semantic_result,
+            fixed=fixed,
+            reason=(
+                "stop gate rejected and no valid planner target: "
+                + str(stop_gate_info.get("reason", "unknown"))
+            )
+        )
+        target["stop_gate_info"] = stop_gate_info
+        return target
+
+    def print_stop_gate(self, index, stop_gate_info):
+        if not isinstance(stop_gate_info, dict):
+            return
+
+        if len(stop_gate_info) == 0:
+            return
+
+        print(
+            "[StopGate] "
+            f"Episode {index}: "
+            f"pass={stop_gate_info.get('pass', False)}, "
+            f"reason={stop_gate_info.get('reason', '')}, "
+            f"distance={stop_gate_info.get('distance', None)}, "
+            f"threshold={stop_gate_info.get('threshold', None)}, "
+            f"target={stop_gate_info.get('target_position', None)}"
+        )
+
     def run_viewpoint_plan(self, index, selected_target, fixed):
         executable_viewpoint = self.build_executable_viewpoint(index, selected_target)
         planned_path = self.plan_local_path(index, executable_viewpoint)
@@ -1092,7 +1195,7 @@ class ONAir(BaseModelWrapper):
 
         allowed_sources = {
             "path_follower",
-            "navigation_stop_candidate",
+            "final_stop_gate",
             "path_follower_error",
         }
 

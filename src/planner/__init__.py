@@ -35,3 +35,9 @@ try:
     from .path_follower import PathFollower
 except Exception:
     pass
+
+
+try:
+    from .final_stop_gate import FinalStopGate
+except Exception:
+    pass
