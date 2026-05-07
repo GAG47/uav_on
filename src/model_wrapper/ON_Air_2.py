@@ -18,6 +18,7 @@ try:
     from src.model_wrapper.grounding_dino_client import GroundingDINOClient
     from src.planner.path_follower import PathFollower
     from src.planner.planning_types import NavigationTarget, PathPlan, PlannerFeedback, PathReason
+    from src.eval.airhunt_metrics import AirHuntMetricsLogger
 except Exception:
     from planner.semantic_memory import SemanticMemory
     from planner.local_planner import LocalPlanner
@@ -29,6 +30,7 @@ except Exception:
     from model_wrapper.grounding_dino_client import GroundingDINOClient
     from planner.path_follower import PathFollower
     from planner.planning_types import NavigationTarget, PathPlan, PlannerFeedback, PathReason
+    from eval.airhunt_metrics import AirHuntMetricsLogger
 
 import numpy as np
 import asyncio
@@ -76,6 +78,7 @@ class ONAir(BaseModelWrapper):
 
         self.target_verifier = TargetVerifier(client=self.gpt_client)
         self.final_stop_gate = FinalStopGate(success_distance=20.0)
+        self.metrics_logger = AirHuntMetricsLogger()
         self.target_verification_infos = [{} for _ in range(batch_size)]
 
         self.navigation_states = [NavigationState() for _ in range(batch_size)]
@@ -403,6 +406,14 @@ class ONAir(BaseModelWrapper):
         selected_target = planner_step["selected_target"]
         planned_path = planner_step["planned_path"]
 
+        self.record_airhunt_step_trace(
+            index=index,
+            semantic_result=semantic_result,
+            memory_summary=memory_summary,
+            planner_step=planner_step,
+            fixed=False
+        )
+
         if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
             self.print_semantic_result(semantic_result, action, value)
             self.print_memory_summary(index, memory_summary)
@@ -437,6 +448,14 @@ class ONAir(BaseModelWrapper):
         selected_target = planner_step["selected_target"]
         planned_path = planner_step["planned_path"]
 
+        self.record_airhunt_step_trace(
+            index=index,
+            semantic_result=semantic_result,
+            memory_summary=memory_summary,
+            planner_step=planner_step,
+            fixed=True
+        )
+
         if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
             self.print_semantic_result(semantic_result, action, value)
             self.print_memory_summary(index, memory_summary)
@@ -446,6 +465,45 @@ class ONAir(BaseModelWrapper):
             self.print_planner_feedback(index, planner_step.get("planner_feedback", {}))
 
         return action, value, done, semantic_result
+
+    async def batch_calls(self, inputs, fixed):
+        tasks = []
+
+        for item in inputs:
+            if isinstance(item, tuple) and len(item) == 2:
+                index, conversation = item
+            else:
+                raise ValueError(
+                    "ONAir expects each input item to be (episode_index, conversation)"
+                )
+
+            if fixed:
+                tasks.append(self.fixed_single_call(index, conversation))
+            else:
+                tasks.append(self.unfixed_single_call(index, conversation))
+
+        if len(tasks) == 0:
+            return []
+
+        return await asyncio.gather(*tasks)
+
+    def run(self, inputs, fixed, prompt_info_list=None):
+        if inputs is None or len(inputs) == 0:
+            return [], [], []
+
+        results = asyncio.run(self.batch_calls(inputs, fixed))
+
+        actions = []
+        step_sizes = []
+        dones = []
+
+        for result in results:
+            action, value, done, _ = result
+            actions.append(action)
+            step_sizes.append(value)
+            dones.append(done)
+
+        return actions, step_sizes, dones
 
     def planner_driven_step(self, index, semantic_result, fixed):
         """
@@ -1292,7 +1350,56 @@ class ONAir(BaseModelWrapper):
             f"source={planner_feedback.get('action_source', '')}"
         )
 
+    def record_airhunt_step_trace(
+        self,
+        index,
+        semantic_result,
+        memory_summary,
+        planner_step,
+        fixed,
+    ):
+        if self.metrics_logger is None:
+            return
+
+        if not isinstance(planner_step, dict):
+            return
+
+        step_num = None
+        update_info = self.memory_update_infos[index]
+        if isinstance(update_info, dict):
+            step_num = update_info.get("step_num", None)
+
+        record = self.metrics_logger.make_step_record(
+            episode_index=index,
+            step_num=step_num,
+            current_pose=self.current_poses[index],
+            fixed=fixed,
+            semantic_result=semantic_result,
+            memory_summary=memory_summary,
+            grounding_dino_result=self.grounding_dino_results[index],
+            tracker_info=self.target_tracker_infos[index],
+            verification_info=self.target_verification_infos[index],
+            navigation_info=self.navigation_infos[index],
+            selected_target=planner_step.get("selected_target", {}),
+            executable_viewpoint=planner_step.get("executable_viewpoint", {}),
+            planned_path=planner_step.get("planned_path", {}),
+            path_follower_info=planner_step.get("path_follower_info", {}),
+            planner_feedback=planner_step.get("planner_feedback", {}),
+            stop_gate_info=planner_step.get("stop_gate_info", {}),
+            action=planner_step.get("action", None),
+            value=planner_step.get("value", 0),
+            done=planner_step.get("done", False),
+        )
+
+        self.metrics_logger.log_step(record)
+
+        if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
+            log_path = getattr(self.metrics_logger, "file_path", None)
+            if log_path is not None:
+                print(f"[AirHuntTrace] Episode {index}: saved_step_trace={log_path}")
+
     def parse_semantic_result(self, text):
+
         try:
             raw_text = text.strip()
 
