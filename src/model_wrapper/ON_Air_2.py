@@ -60,6 +60,7 @@ class ONAir(BaseModelWrapper):
         self.viewpoint_planners = [None for _ in range(batch_size)]
         self.planned_paths = [{} for _ in range(batch_size)]
         self.executable_viewpoints = [{} for _ in range(batch_size)]
+        self.rejected_viewpoint_ids = [set() for _ in range(batch_size)]
         self.path_followers = [PathFollower() for _ in range(batch_size)]
         self.path_follower_infos = [{} for _ in range(batch_size)]
         self.planner_feedback_infos = [{} for _ in range(batch_size)]
@@ -326,6 +327,7 @@ class ONAir(BaseModelWrapper):
 
             self.planned_paths[index] = {}
             self.executable_viewpoints[index] = {}
+            self.rejected_viewpoint_ids[index] = set()
             self.path_follower_infos[index] = {}
             self.planner_feedback_infos[index] = {}
             self.memory_targets[index] = {}
@@ -445,8 +447,8 @@ class ONAir(BaseModelWrapper):
 
         Semantic outputs and GDINO verification only select a navigation target.
         The final UAV-ON action must be produced from LocalPlanner path through
-        PathFollower. This function intentionally does not call
-        semantic-to-action adapters.
+        PathFollower. Planner failures are converted into structured feedback
+        for viewpoint reselection, not direct fallback actions.
         """
         selected_target = self.select_navigation_target(
             index=index,
@@ -489,13 +491,52 @@ class ONAir(BaseModelWrapper):
                 "planner_feedback": planner_feedback,
             }
 
-        executable_viewpoint = self.build_executable_viewpoint(index, selected_target)
-        planned_path = self.plan_local_path(index, executable_viewpoint)
-        action, value, done, path_follower_info = self.follow_local_path(
+        (
+            executable_viewpoint,
+            planned_path,
+            action,
+            value,
+            done,
+            path_follower_info,
+        ) = self.run_viewpoint_plan(
             index=index,
-            planned_path=planned_path,
+            selected_target=selected_target,
             fixed=fixed
         )
+
+        planner_feedback = self.build_planner_feedback(
+            index=index,
+            selected_target=selected_target,
+            planned_path=planned_path,
+            path_follower_info=path_follower_info
+        )
+
+        if action is None and planner_feedback.get("should_reselect_viewpoint", False):
+            self.reject_executable_viewpoint(
+                index=index,
+                executable_viewpoint=executable_viewpoint,
+                planner_feedback=planner_feedback
+            )
+
+            (
+                executable_viewpoint,
+                planned_path,
+                action,
+                value,
+                done,
+                path_follower_info,
+            ) = self.run_viewpoint_plan(
+                index=index,
+                selected_target=selected_target,
+                fixed=fixed
+            )
+
+            planner_feedback = self.build_planner_feedback(
+                index=index,
+                selected_target=selected_target,
+                planned_path=planned_path,
+                path_follower_info=path_follower_info
+            )
 
         if action is None:
             semantic_target = self.build_semantic_region_target(
@@ -505,38 +546,54 @@ class ONAir(BaseModelWrapper):
                 reason="primary target path is not executable"
             )
             if semantic_target.get("valid", False):
-                semantic_viewpoint = self.build_executable_viewpoint(index, semantic_target)
-                retry_path = self.plan_local_path(index, semantic_viewpoint)
-                retry_action, retry_value, retry_done, retry_follower_info = self.follow_local_path(
+                selected_target = semantic_target
+                (
+                    executable_viewpoint,
+                    planned_path,
+                    action,
+                    value,
+                    done,
+                    path_follower_info,
+                ) = self.run_viewpoint_plan(
                     index=index,
-                    planned_path=retry_path,
+                    selected_target=selected_target,
                     fixed=fixed
                 )
-                if retry_action is not None:
-                    selected_target = semantic_target
-                    executable_viewpoint = semantic_viewpoint
-                    planned_path = retry_path
-                    action = retry_action
-                    value = retry_value
-                    done = retry_done
-                    path_follower_info = retry_follower_info
+
+                planner_feedback = self.build_planner_feedback(
+                    index=index,
+                    selected_target=selected_target,
+                    planned_path=planned_path,
+                    path_follower_info=path_follower_info
+                )
 
         if action is None:
-            action, value, done, path_follower_info = self.no_executable_path_action(
+            selected_target = self.build_observe_viewpoint_target(
                 index=index,
-                fixed=fixed,
+                reason="no executable path after viewpoint reselection"
+            )
+            executable_viewpoint = selected_target
+            planned_path = self.plan_local_path(index, executable_viewpoint)
+            action, value, done, path_follower_info = self.follow_local_path(
+                index=index,
+                planned_path=planned_path,
+                fixed=fixed
+            )
+
+            planner_feedback = self.build_planner_feedback(
+                index=index,
                 selected_target=selected_target,
-                planned_path=planned_path
+                planned_path=planned_path,
+                path_follower_info=path_follower_info
+            )
+
+        if action is None:
+            raise RuntimeError(
+                "planner-driven execution failed to produce an action through "
+                "viewpoint -> PathPlan -> PathFollower"
             )
 
         self.validate_env_action_source(path_follower_info)
-
-        planner_feedback = self.build_planner_feedback(
-            index=index,
-            selected_target=selected_target,
-            planned_path=planned_path,
-            path_follower_info=path_follower_info
-        )
 
         self.memory_targets[index] = selected_target
         self.executable_viewpoints[index] = executable_viewpoint
@@ -800,6 +857,105 @@ class ONAir(BaseModelWrapper):
 
         return False
 
+    def run_viewpoint_plan(self, index, selected_target, fixed):
+        executable_viewpoint = self.build_executable_viewpoint(index, selected_target)
+        planned_path = self.plan_local_path(index, executable_viewpoint)
+        action, value, done, path_follower_info = self.follow_local_path(
+            index=index,
+            planned_path=planned_path,
+            fixed=fixed
+        )
+
+        return (
+            executable_viewpoint,
+            planned_path,
+            action,
+            value,
+            done,
+            path_follower_info,
+        )
+
+    def reject_executable_viewpoint(self, index, executable_viewpoint, planner_feedback):
+        if not isinstance(executable_viewpoint, dict):
+            return
+
+        viewpoint_id = executable_viewpoint.get("viewpoint_id", "")
+        if not viewpoint_id:
+            executable_info = executable_viewpoint.get("executable_viewpoint", {})
+            if isinstance(executable_info, dict):
+                viewpoint_id = executable_info.get("viewpoint_id", "")
+
+        if not viewpoint_id:
+            return
+
+        self.rejected_viewpoint_ids[index].add(viewpoint_id)
+
+        if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
+            print(
+                "[Viewpoint Reselect] "
+                f"Episode {index}: reject={viewpoint_id}, "
+                f"reason={planner_feedback.get('reason', '')}, "
+                f"path_reason={planner_feedback.get('path_follower_reason', '')}"
+            )
+
+    def build_observe_viewpoint_target(self, index, reason="observe viewpoint"):
+        current_pose = self.current_poses[index]
+        x, y, z, yaw = current_pose
+        target_yaw = self.normalize_relative_angle(float(yaw) + 45.0)
+
+        viewpoint_position = (
+            round(float(x), 2),
+            round(float(y), 2),
+            round(float(z), 2)
+        )
+        viewpoint_id = (
+            f"observe_"
+            f"{round(float(x), 1)}_"
+            f"{round(float(y), 1)}_"
+            f"{round(float(z), 1)}_"
+            f"{round(float(target_yaw), 1)}"
+        )
+
+        executable_viewpoint = {
+            "valid": True,
+            "viewpoint_id": viewpoint_id,
+            "viewpoint_type": "observe",
+            "position": viewpoint_position,
+            "yaw": round(float(target_yaw), 2),
+            "anchor_target_id": "",
+            "anchor_position": viewpoint_position,
+            "expected_observation_direction": "front",
+            "safety_score": 0.5,
+            "information_gain": 0.0,
+            "reason": reason,
+            "debug": {
+                "policy": "planner_feedback_observe_viewpoint"
+            }
+        }
+
+        target = self.default_memory_target()
+        target.update({
+            "valid": True,
+            "target_type": "observe_viewpoint",
+            "source": "planner_feedback",
+            "position": viewpoint_position,
+            "viewpoint_position": viewpoint_position,
+            "viewpoint_type": "observe",
+            "viewpoint_id": viewpoint_id,
+            "viewpoint_yaw": round(float(target_yaw), 2),
+            "target_yaw": round(float(target_yaw), 2),
+            "anchor_position": viewpoint_position,
+            "score": 0.0,
+            "confidence": 0.0,
+            "safety_score": 0.5,
+            "information_gain": 0.0,
+            "viewpoint_reason": reason,
+            "reason": reason,
+            "observation_region": "front",
+            "executable_viewpoint": executable_viewpoint,
+        })
+        return target
+
     def build_executable_viewpoint(self, index, selected_target):
         """
         Convert selected semantic target into executable viewpoint.
@@ -820,7 +976,8 @@ class ONAir(BaseModelWrapper):
             viewpoint = viewpoint_planner.build_executable_viewpoint(
                 navigation_target=selected_target,
                 current_pose=self.current_poses[index],
-                navigation_info=self.navigation_infos[index]
+                navigation_info=self.navigation_infos[index],
+                rejected_viewpoint_ids=self.rejected_viewpoint_ids[index]
             )
             self.executable_viewpoints[index] = viewpoint
             return viewpoint
@@ -936,7 +1093,6 @@ class ONAir(BaseModelWrapper):
         allowed_sources = {
             "path_follower",
             "navigation_stop_candidate",
-            "planner_interface_guard",
             "path_follower_error",
         }
 
@@ -975,33 +1131,6 @@ class ONAir(BaseModelWrapper):
             }
             return None, 0.0, False, info
 
-    def no_executable_path_action(self, index, fixed, selected_target, planned_path):
-        """
-        Compatibility guard for the current UAV-ON evaluation interface.
-
-        This is not a semantic fallback. It is only used when no executable path
-        action can be produced after trying the selected target and semantic region
-        target. PlannerFeedback records the failure so later steps can feed it back
-        into viewpoint reselection instead of keeping this guard as policy.
-        """
-        if fixed:
-            value = 0
-        else:
-            value = 15
-
-        info = {
-            "valid": False,
-            "action": "rotl",
-            "step_size": value,
-            "done": False,
-            "reason": "no_executable_path_after_replanning",
-            "action_source": "planner_interface_guard",
-            "path_reason": planned_path.get("reason", "unknown") if isinstance(planned_path, dict) else "unknown",
-            "path_len": planned_path.get("path_len", 0) if isinstance(planned_path, dict) else 0,
-            "path_length": planned_path.get("path_length", 0.0) if isinstance(planned_path, dict) else 0.0,
-        }
-
-        return "rotl", value, False, info
 
     def build_planner_feedback(self, index, selected_target, planned_path, path_follower_info):
         try:
@@ -1200,43 +1329,6 @@ class ONAir(BaseModelWrapper):
 
         return semantic_result
 
-    def semantic_to_legacy_action(self, semantic_result, fixed):
-        region_scores = semantic_result["region_scores"]
-        safety_scores = semantic_result["safety_scores"]
-        best_region = semantic_result["best_region"]
-
-        max_safety = max(safety_scores.values())
-
-        if max_safety < 0.25:
-            if fixed:
-                return "rotl", 0, False
-            else:
-                return "rotl", 30, False
-
-        if best_region not in ["front", "left", "right"]:
-            best_region = max(region_scores, key=region_scores.get)
-
-        if best_region == "front":
-            action = "forward"
-        elif best_region == "left":
-            action = "left"
-        elif best_region == "right":
-            action = "right"
-        else:
-            action = "forward"
-
-        if fixed:
-            value = 0
-        else:
-            value = self.estimate_unfixed_step_size(
-                region_score=region_scores[best_region],
-                safety_score=safety_scores[best_region],
-                target_visible=False,
-                target_confidence=0.0
-            )
-
-        done = False
-        return action, value, done
 
     def estimate_unfixed_step_size(self, region_score, safety_score, target_visible, target_confidence):
         if target_visible or target_confidence >= 0.6:

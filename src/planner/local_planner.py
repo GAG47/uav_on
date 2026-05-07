@@ -123,6 +123,17 @@ class LocalPlanner:
             )
 
         if self.is_same_position(current_position, target_position):
+            yaw_only_plan = self.build_yaw_only_plan(
+                current_pose=current_pose,
+                current_position=current_position,
+                target_position=target_position,
+                memory_target=memory_target,
+                start_grid=start_grid,
+                goal_grid=goal_grid
+            )
+            if yaw_only_plan is not None:
+                return yaw_only_plan
+
             return self.default_plan(
                 reason=PathReason.SAME_AS_CURRENT,
                 start_grid=start_grid,
@@ -221,6 +232,86 @@ class LocalPlanner:
         )
 
         return plan.to_dict()
+
+    def build_yaw_only_plan(
+        self,
+        current_pose,
+        current_position,
+        target_position,
+        memory_target,
+        start_grid,
+        goal_grid,
+    ):
+        target_yaw = self.get_target_yaw(memory_target)
+        if target_yaw is None:
+            return None
+
+        if len(current_pose) < 4:
+            return None
+
+        yaw_error = abs(self.normalize_angle(float(target_yaw) - float(current_pose[3])))
+        if yaw_error < 3.0:
+            return None
+
+        plan = PathPlan(
+            valid=True,
+            reason=PathReason.OK,
+            path=[current_position],
+            grid_path=[start_grid],
+            path_len=1,
+            raw_grid_path_len=1,
+            path_length=0.0,
+            start_grid=start_grid,
+            goal_grid=goal_grid,
+            target_position=target_position,
+            next_waypoint=current_position,
+            debug={
+                "path_kind": "yaw_only",
+                "viewpoint_type": memory_target.get("viewpoint_type", ""),
+                "viewpoint_position": memory_target.get("viewpoint_position", None),
+                "viewpoint_yaw": target_yaw,
+                "anchor_position": memory_target.get("anchor_position", None),
+                "yaw_error": round(yaw_error, 2),
+            }
+        )
+
+        data = plan.to_dict()
+        data["viewpoint"] = memory_target.get("executable_viewpoint", memory_target)
+        data["viewpoint_position"] = memory_target.get("viewpoint_position", None)
+        data["viewpoint_type"] = memory_target.get("viewpoint_type", "")
+        return data
+
+    def get_target_yaw(self, memory_target):
+        if not isinstance(memory_target, dict):
+            return None
+
+        executable_viewpoint = memory_target.get("executable_viewpoint", None)
+        if isinstance(executable_viewpoint, dict):
+            yaw = executable_viewpoint.get("yaw", None)
+            if yaw is not None:
+                try:
+                    return float(yaw)
+                except Exception:
+                    pass
+
+        for key in ["viewpoint_yaw", "target_yaw"]:
+            yaw = memory_target.get(key, None)
+            if yaw is None:
+                continue
+            try:
+                return float(yaw)
+            except Exception:
+                continue
+
+        return None
+
+    def normalize_angle(self, angle):
+        angle = float(angle)
+        while angle > 180.0:
+            angle -= 360.0
+        while angle < -180.0:
+            angle += 360.0
+        return angle
 
     def get_target_position(self, memory_target):
         if not isinstance(memory_target, dict):

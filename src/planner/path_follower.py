@@ -26,6 +26,7 @@ class PathFollower:
         arrival_distance=0.8,
         yaw_align_threshold=55.0,
         vertical_threshold=1.5,
+        viewpoint_yaw_threshold=5.0,
     ):
         self.max_translation_step = float(max_translation_step)
         self.max_rotation_step = float(max_rotation_step)
@@ -33,24 +34,9 @@ class PathFollower:
         self.arrival_distance = float(arrival_distance)
         self.yaw_align_threshold = float(yaw_align_threshold)
         self.vertical_threshold = float(vertical_threshold)
+        self.viewpoint_yaw_threshold = float(viewpoint_yaw_threshold)
 
     def follow(self, current_pose, path_plan):
-        """
-        Args:
-            current_pose:
-                [x, y, z, yaw_degree], consistent with ONAir.current_poses.
-            path_plan:
-                PathPlan or dict returned by LocalPlanner.
-
-        Returns:
-            dict with:
-                valid: whether an executable action is produced
-                action: UAV-ON action name when valid
-                step_size: action magnitude when valid
-                done: always False here. Stop must be decided by StopGate.
-                reason: why action is valid/invalid
-                action_source: path_follower
-        """
         current_pose = self.normalize_current_pose(current_pose)
         if current_pose is None:
             return self.invalid_result("invalid_current_pose")
@@ -73,16 +59,6 @@ class PathFollower:
         )
 
     def follow_as_tuple(self, current_pose, path_plan):
-        """
-        Compatibility helper for ON_Air_2.py.
-
-        Returns:
-            action, step_size, done, info
-
-        When valid is False, action is None. The caller must not silently convert
-        this invalid result into rotate/hold/stop. It should feed the reason back
-        to viewpoint reselection or replanning.
-        """
         info = self.follow(current_pose=current_pose, path_plan=path_plan)
         if not info.get("valid", False):
             return None, 0.0, False, info
@@ -106,6 +82,15 @@ class PathFollower:
         distance = math.sqrt(dx * dx + dy * dy + dz * dz)
 
         if distance <= self.arrival_distance:
+            yaw_result = self.align_viewpoint_yaw_if_needed(
+                current_pose=current_pose,
+                path_plan=path_plan,
+                waypoint=waypoint,
+                distance=distance,
+            )
+            if yaw_result is not None:
+                return yaw_result
+
             return self.invalid_result(
                 "arrived_at_next_waypoint",
                 path_plan=path_plan,
@@ -132,6 +117,15 @@ class PathFollower:
             )
 
         if horizontal_distance <= self.arrival_distance:
+            yaw_result = self.align_viewpoint_yaw_if_needed(
+                current_pose=current_pose,
+                path_plan=path_plan,
+                waypoint=waypoint,
+                distance=distance,
+            )
+            if yaw_result is not None:
+                return yaw_result
+
             return self.invalid_result(
                 "arrived_at_horizontal_waypoint",
                 path_plan=path_plan,
@@ -200,6 +194,57 @@ class PathFollower:
             yaw_error=yaw_error,
             path_plan=path_plan,
         )
+
+    def align_viewpoint_yaw_if_needed(self, current_pose, path_plan, waypoint, distance):
+        desired_yaw = self.get_viewpoint_yaw(path_plan)
+        if desired_yaw is None:
+            return None
+
+        current_yaw = float(current_pose[3])
+        yaw_error = self.normalize_angle(float(desired_yaw) - current_yaw)
+
+        if abs(yaw_error) < self.viewpoint_yaw_threshold:
+            return None
+
+        if yaw_error > 0:
+            action = "rotr"
+        else:
+            action = "rotl"
+
+        step_size = self.bound_rotation_step(abs(yaw_error))
+        return self.valid_result(
+            action=action,
+            step_size=step_size,
+            reason="align_viewpoint_yaw",
+            waypoint=waypoint,
+            distance=distance,
+            horizontal_distance=0.0,
+            yaw_error=yaw_error,
+            path_plan=path_plan,
+        )
+
+    def get_viewpoint_yaw(self, path_plan):
+        if path_plan is None:
+            return None
+
+        viewpoint = getattr(path_plan, "viewpoint", None)
+        if viewpoint is not None and getattr(viewpoint, "yaw", None) is not None:
+            return viewpoint.yaw
+
+        if isinstance(path_plan, dict):
+            viewpoint = path_plan.get("viewpoint", None)
+            if isinstance(viewpoint, dict):
+                if viewpoint.get("yaw", None) is not None:
+                    return viewpoint.get("yaw", None)
+                if viewpoint.get("viewpoint_yaw", None) is not None:
+                    return viewpoint.get("viewpoint_yaw", None)
+
+        debug = getattr(path_plan, "debug", {})
+        if isinstance(debug, dict):
+            if debug.get("viewpoint_yaw", None) is not None:
+                return debug.get("viewpoint_yaw", None)
+
+        return None
 
     def select_next_waypoint(self, current_pose, path_plan):
         if path_plan.next_waypoint is not None:

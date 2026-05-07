@@ -33,7 +33,7 @@ class ViewpointPlanner:
         self.max_approach_distance = float(max_approach_distance)
         self.min_safety_score = float(min_safety_score)
 
-    def build_executable_viewpoint(self, navigation_target, current_pose, navigation_info=None):
+    def build_executable_viewpoint(self, navigation_target, current_pose, navigation_info=None, rejected_viewpoint_ids=None):
         """
         Convert a selected semantic target into an executable viewpoint.
 
@@ -71,7 +71,8 @@ class ViewpointPlanner:
         if self.is_approach_target(navigation_target, navigation_info):
             return self.build_approach_viewpoint(
                 navigation_target=navigation_target,
-                current_pose=current_pose
+                current_pose=current_pose,
+                rejected_viewpoint_ids=rejected_viewpoint_ids
             )
 
         return self.build_explore_viewpoint(
@@ -131,7 +132,7 @@ class ViewpointPlanner:
             reason="explore viewpoint from semantic memory"
         )
 
-    def build_approach_viewpoint(self, navigation_target, current_pose):
+    def build_approach_viewpoint(self, navigation_target, current_pose, rejected_viewpoint_ids=None):
         """
         Verified target position is only a semantic anchor. Generate an approach
         viewpoint around it and face the target from a safe, reachable position.
@@ -148,6 +149,13 @@ class ViewpointPlanner:
             anchor_position=anchor,
             current_pose=current_pose
         )
+
+        rejected_viewpoint_ids = set(rejected_viewpoint_ids or [])
+        if len(rejected_viewpoint_ids) > 0:
+            candidates = [
+                candidate for candidate in candidates
+                if candidate.get("viewpoint_id", "") not in rejected_viewpoint_ids
+            ]
 
         if len(candidates) == 0:
             return self.invalid_viewpoint(
@@ -369,11 +377,17 @@ class ViewpointPlanner:
                     to_position=anchor_position
                 )
 
+                viewpoint_id = self.make_viewpoint_id(
+                    "approach",
+                    (cx, cy, cz)
+                )
+
                 candidates.append({
                     "x": cx,
                     "y": cy,
                     "z": cz,
                     "yaw": yaw_to_anchor,
+                    "viewpoint_id": viewpoint_id,
                     "grid": grid,
                     "radius": radius,
                     "distance_to_current": distance_to_current,
