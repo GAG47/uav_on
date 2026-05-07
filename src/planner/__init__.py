@@ -22,3 +22,16 @@ try:
     from .target_verifier import TargetVerifier
 except Exception:
     pass
+
+try:
+    from .planning_types import NavigationTarget
+    from .planning_types import ExecutableViewpoint
+    from .planning_types import PathPlan
+    from .planning_types import PlannerFeedback
+except Exception:
+    pass
+
+try:
+    from .path_follower import PathFollower
+except Exception:
+    pass
