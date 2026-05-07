@@ -785,34 +785,17 @@ class ONAir(BaseModelWrapper):
 
     def validate_env_action_source(self, path_follower_info):
         """
-        Guard the planner-driven invariant.
+        Guard the planner-driven execution invariant.
 
-        High-level semantic targets, relative regions, or legacy action adapters
-        must not directly produce UAV-ON executable actions. The only normal
-        action source before StopGate refactor is PathFollower. The current
-        planner_interface_guard is kept only as a temporary interface guard and
-        will be removed when PlannerFeedback-driven viewpoint reselection is
-        introduced.
+        High-level semantic modules are no longer allowed to produce UAV-ON
+        executable actions. At this stage, normal actions should come from
+        PathFollower. Temporary interface guards are kept only until
+        PlannerFeedback reselection and StopGate are fully connected.
         """
         if not isinstance(path_follower_info, dict):
             raise RuntimeError("invalid path follower info")
 
         action_source = str(path_follower_info.get("action_source", ""))
-        forbidden_sources = {
-            "semantic_result",
-            "semantic_region",
-            "relative_region",
-            "llm_action",
-            "memory_to_legacy_action",
-            "target_to_legacy_action",
-            "select_navigation_action",
-        }
-
-        if action_source in forbidden_sources:
-            raise RuntimeError(
-                "semantic or legacy action source is forbidden in planner-driven execution: "
-                + action_source
-            )
 
         allowed_sources = {
             "path_follower",
@@ -822,9 +805,9 @@ class ONAir(BaseModelWrapper):
         }
 
         if action_source not in allowed_sources:
-            print(
-                "[WARNING] unexpected action source in planner-driven execution: "
-                f"{action_source}"
+            raise RuntimeError(
+                "unexpected action source in planner-driven execution: "
+                + action_source
             )
 
     def follow_local_path(self, index, planned_path, fixed):
