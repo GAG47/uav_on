@@ -10,6 +10,7 @@ from common.prompts import fixed_system_prompt, fixed_user_prompt_template, unfi
 try:
     from src.planner.semantic_memory import SemanticMemory
     from src.planner.local_planner import LocalPlanner
+    from src.planner.viewpoint_planner import ViewpointPlanner
     from src.planner.navigation_state import NavigationState
     from src.planner.target_tracker import TargetTracker
     from src.planner.target_verifier import TargetVerifier
@@ -19,6 +20,7 @@ try:
 except Exception:
     from planner.semantic_memory import SemanticMemory
     from planner.local_planner import LocalPlanner
+    from planner.viewpoint_planner import ViewpointPlanner
     from planner.navigation_state import NavigationState
     from planner.target_tracker import TargetTracker
     from planner.target_verifier import TargetVerifier
@@ -55,7 +57,9 @@ class ONAir(BaseModelWrapper):
         self.memory_targets = [{} for _ in range(batch_size)]
 
         self.local_planners = [None for _ in range(batch_size)]
+        self.viewpoint_planners = [None for _ in range(batch_size)]
         self.planned_paths = [{} for _ in range(batch_size)]
+        self.executable_viewpoints = [{} for _ in range(batch_size)]
         self.path_followers = [PathFollower() for _ in range(batch_size)]
         self.path_follower_infos = [{} for _ in range(batch_size)]
         self.planner_feedback_infos = [{} for _ in range(batch_size)]
@@ -316,8 +320,12 @@ class ONAir(BaseModelWrapper):
             self.local_planners[index] = LocalPlanner(
                 memory=self.semantic_memories[index]
             )
+            self.viewpoint_planners[index] = ViewpointPlanner(
+                memory=self.semantic_memories[index]
+            )
 
             self.planned_paths[index] = {}
+            self.executable_viewpoints[index] = {}
             self.path_follower_infos[index] = {}
             self.planner_feedback_infos[index] = {}
             self.memory_targets[index] = {}
@@ -392,6 +400,7 @@ class ONAir(BaseModelWrapper):
             self.print_semantic_result(semantic_result, action, value)
             self.print_memory_summary(index, memory_summary)
             self.print_selected_target(index, selected_target)
+            self.print_executable_viewpoint(index, planner_step.get("executable_viewpoint", {}))
             self.print_local_plan(index, planned_path)
             self.print_path_follower(index, planner_step.get("path_follower_info", {}))
             self.print_planner_feedback(index, planner_step.get("planner_feedback", {}))
@@ -447,6 +456,7 @@ class ONAir(BaseModelWrapper):
 
         if self.is_stop_candidate(selected_target):
             planned_path = self.default_local_plan("stop candidate selected")
+            executable_viewpoint = {}
             path_follower_info = {
                 "valid": True,
                 "action": "stop",
@@ -463,6 +473,7 @@ class ONAir(BaseModelWrapper):
             )
 
             self.memory_targets[index] = selected_target
+            self.executable_viewpoints[index] = executable_viewpoint
             self.planned_paths[index] = planned_path
             self.path_follower_infos[index] = path_follower_info
             self.planner_feedback_infos[index] = planner_feedback
@@ -472,12 +483,14 @@ class ONAir(BaseModelWrapper):
                 "value": 0,
                 "done": True,
                 "selected_target": selected_target,
+                "executable_viewpoint": executable_viewpoint,
                 "planned_path": planned_path,
                 "path_follower_info": path_follower_info,
                 "planner_feedback": planner_feedback,
             }
 
-        planned_path = self.plan_local_path(index, selected_target)
+        executable_viewpoint = self.build_executable_viewpoint(index, selected_target)
+        planned_path = self.plan_local_path(index, executable_viewpoint)
         action, value, done, path_follower_info = self.follow_local_path(
             index=index,
             planned_path=planned_path,
@@ -492,7 +505,8 @@ class ONAir(BaseModelWrapper):
                 reason="primary target path is not executable"
             )
             if semantic_target.get("valid", False):
-                retry_path = self.plan_local_path(index, semantic_target)
+                semantic_viewpoint = self.build_executable_viewpoint(index, semantic_target)
+                retry_path = self.plan_local_path(index, semantic_viewpoint)
                 retry_action, retry_value, retry_done, retry_follower_info = self.follow_local_path(
                     index=index,
                     planned_path=retry_path,
@@ -500,6 +514,7 @@ class ONAir(BaseModelWrapper):
                 )
                 if retry_action is not None:
                     selected_target = semantic_target
+                    executable_viewpoint = semantic_viewpoint
                     planned_path = retry_path
                     action = retry_action
                     value = retry_value
@@ -524,6 +539,7 @@ class ONAir(BaseModelWrapper):
         )
 
         self.memory_targets[index] = selected_target
+        self.executable_viewpoints[index] = executable_viewpoint
         self.planned_paths[index] = planned_path
         self.path_follower_infos[index] = path_follower_info
         self.planner_feedback_infos[index] = planner_feedback
@@ -533,6 +549,7 @@ class ONAir(BaseModelWrapper):
             "value": value,
             "done": done,
             "selected_target": selected_target,
+            "executable_viewpoint": executable_viewpoint,
             "planned_path": planned_path,
             "path_follower_info": path_follower_info,
             "planner_feedback": planner_feedback,
@@ -782,6 +799,125 @@ class ONAir(BaseModelWrapper):
             return True
 
         return False
+
+    def build_executable_viewpoint(self, index, selected_target):
+        """
+        Convert selected semantic target into executable viewpoint.
+
+        Selected target is only a semantic anchor. LocalPlanner should receive
+        this executable viewpoint dict instead of raw verified target position.
+        """
+        try:
+            viewpoint_planner = self.viewpoint_planners[index]
+            if viewpoint_planner is None:
+                viewpoint = self.default_viewpoint_target(
+                    selected_target=selected_target,
+                    reason="viewpoint planner is None"
+                )
+                self.executable_viewpoints[index] = viewpoint
+                return viewpoint
+
+            viewpoint = viewpoint_planner.build_executable_viewpoint(
+                navigation_target=selected_target,
+                current_pose=self.current_poses[index],
+                navigation_info=self.navigation_infos[index]
+            )
+            self.executable_viewpoints[index] = viewpoint
+            return viewpoint
+        except Exception as e:
+            print(f"[WARNING] failed to build executable viewpoint for episode {index}: {e}")
+            viewpoint = self.default_viewpoint_target(
+                selected_target=selected_target,
+                reason=str(e)
+            )
+            self.executable_viewpoints[index] = viewpoint
+            return viewpoint
+
+    def default_viewpoint_target(self, selected_target=None, reason="invalid viewpoint"):
+        target = copy.deepcopy(selected_target) if isinstance(selected_target, dict) else {}
+        target["valid"] = False
+        target["viewpoint_type"] = "invalid"
+        target["viewpoint_reason"] = reason
+        target["reason"] = reason
+        target["viewpoint_position"] = None
+        target["position"] = None
+        target["executable_viewpoint"] = {
+            "valid": False,
+            "reason": reason,
+        }
+        return target
+
+    def plan_local_path(self, index, selected_target):
+        """
+        Plan a path to executable viewpoint.
+
+        At this stage selected_target is expected to be an executable viewpoint
+        dict produced by ViewpointPlanner. LocalPlanner still keeps its old dict
+        interface; Step 6 will convert it to a structured PathPlan return.
+        """
+        try:
+            local_planner = self.local_planners[index]
+            current_pose = self.current_poses[index]
+
+            if local_planner is None:
+                return self.default_local_plan("local planner is None")
+
+            if not isinstance(selected_target, dict):
+                return self.default_local_plan("local planner target is not dict")
+
+            if not selected_target.get("valid", False):
+                plan = self.default_local_plan(
+                    selected_target.get(
+                        "viewpoint_reason",
+                        selected_target.get("reason", "invalid executable viewpoint")
+                    )
+                )
+                plan["viewpoint"] = selected_target.get("executable_viewpoint", selected_target)
+                plan["viewpoint_position"] = selected_target.get("viewpoint_position", None)
+                plan["viewpoint_type"] = selected_target.get("viewpoint_type", "")
+                self.planned_paths[index] = plan
+                return plan
+
+            planned_path = local_planner.plan_path(
+                current_pose=current_pose,
+                memory_target=selected_target
+            )
+
+            if isinstance(planned_path, dict):
+                planned_path["viewpoint"] = selected_target.get("executable_viewpoint", selected_target)
+                planned_path["viewpoint_position"] = selected_target.get("viewpoint_position", None)
+                planned_path["viewpoint_type"] = selected_target.get("viewpoint_type", "")
+
+            self.planned_paths[index] = planned_path
+            return planned_path
+        except Exception as e:
+            print(f"[WARNING] failed to plan local path for episode {index}: {e}")
+            return self.default_local_plan(str(e))
+
+    def print_executable_viewpoint(self, index, executable_viewpoint):
+        if not isinstance(executable_viewpoint, dict):
+            return
+
+        if not executable_viewpoint.get("valid", False):
+            print(
+                "[Executable Viewpoint] "
+                f"Episode {index}: invalid, "
+                f"type={executable_viewpoint.get('viewpoint_type', 'invalid')}, "
+                f"reason={executable_viewpoint.get('viewpoint_reason', executable_viewpoint.get('reason', ''))}"
+            )
+            return
+
+        print(
+            "[Executable Viewpoint] "
+            f"Episode {index}: "
+            f"type={executable_viewpoint.get('viewpoint_type', 'unknown')}, "
+            f"pos={executable_viewpoint.get('viewpoint_position', None)}, "
+            f"yaw={executable_viewpoint.get('viewpoint_yaw', None)}, "
+            f"anchor={executable_viewpoint.get('anchor_position', None)}, "
+            f"safety={executable_viewpoint.get('safety_score', 0.0):.2f}, "
+            f"gain={executable_viewpoint.get('information_gain', 0.0):.3f}, "
+            f"reason={executable_viewpoint.get('viewpoint_reason', '')}"
+        )
 
     def validate_env_action_source(self, path_follower_info):
         """
@@ -1147,7 +1283,10 @@ class ONAir(BaseModelWrapper):
             "target_position": None,
             "path": [],
             "path_len": 0,
-            "path_length": 0.0
+            "path_length": 0.0,
+            "viewpoint": None,
+            "viewpoint_position": None,
+            "viewpoint_type": ""
         }
         return plan
 
