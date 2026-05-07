@@ -620,7 +620,7 @@ class ONAir(BaseModelWrapper):
         LocalPlanner interface. It must be planned into a path before action output.
         """
         navigation_info = self.navigation_infos[index]
-        mode = navigation_info.get("mode", "explore")
+        mode = navigation_info.get("mode", NavigationState.MODE_SEARCH)
         planner_target = navigation_info.get("planner_target", None)
 
         if isinstance(planner_target, dict):
@@ -630,10 +630,10 @@ class ONAir(BaseModelWrapper):
                     source="navigation_state_stop_candidate"
                 )
 
-        if mode == NavigationState.MODE_STOP:
+        if mode in [NavigationState.MODE_STOP, NavigationState.MODE_FINAL_CHECK]:
             return self.make_stop_candidate(index, navigation_info)
 
-        if mode in [NavigationState.MODE_NAVIGATE, NavigationState.MODE_RECOVER]:
+        if mode == NavigationState.MODE_APPROACH:
             if isinstance(planner_target, dict) and planner_target.get("valid", False):
                 return self.prepare_target_for_planning(
                     target=planner_target,
@@ -1567,17 +1567,31 @@ class ONAir(BaseModelWrapper):
             verbose_eval
             or stop_trace
             or changed
-            or mode != "explore"
+            or mode != NavigationState.MODE_SEARCH
         )
 
         if not should_print:
             return
+
+        target_evidence = navigation_info.get("target_evidence", {})
+        planner_policy = navigation_info.get("planner_policy", {})
+
+        evidence_status = "none"
+        policy = "normal"
+
+        if isinstance(target_evidence, dict):
+            evidence_status = target_evidence.get("status", "none")
+
+        if isinstance(planner_policy, dict):
+            policy = planner_policy.get("policy", "normal")
 
         if changed:
             print(
                 "[NavMode] "
                 f"Episode {index}: "
                 f"{prev_mode} -> {mode}, "
+                f"evidence={evidence_status}, "
+                f"policy={policy}, "
                 f"reason={reason}"
             )
         else:
@@ -1585,6 +1599,8 @@ class ONAir(BaseModelWrapper):
                 "[NavMode] "
                 f"Episode {index}: "
                 f"mode={mode}, "
+                f"evidence={evidence_status}, "
+                f"policy={policy}, "
                 f"reason={reason}"
             )
 
