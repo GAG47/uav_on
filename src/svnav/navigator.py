@@ -22,16 +22,18 @@ class SearchNavigatorConfig:
 
     semantic_weight_clear: float = 1.20
     exploration_weight_clear: float = 0.25
+    heading_weight_clear: float = 0.10
 
     semantic_weight_unclear: float = 0.35
     exploration_weight_unclear: float = 1.00
+    heading_weight_unclear: float = 0.45
 
     distance_weight: float = 0.30
     revisit_weight: float = 0.45
     boundary_weight: float = 0.10
 
     revisit_norm: int = 6
-    min_target_distance: float = 3.0
+    min_target_distance: float = 5.0
 
     unknown_bonus: float = 0.25
     high_value_bonus: float = 0.15
@@ -40,13 +42,19 @@ class SearchNavigatorConfig:
     def __post_init__(self) -> None:
         self.semantic_clear_threshold = float(self.semantic_clear_threshold)
         self.semantic_margin = float(self.semantic_margin)
+
         self.semantic_weight_clear = float(self.semantic_weight_clear)
         self.exploration_weight_clear = float(self.exploration_weight_clear)
+        self.heading_weight_clear = float(self.heading_weight_clear)
+
         self.semantic_weight_unclear = float(self.semantic_weight_unclear)
         self.exploration_weight_unclear = float(self.exploration_weight_unclear)
+        self.heading_weight_unclear = float(self.heading_weight_unclear)
+
         self.distance_weight = float(self.distance_weight)
         self.revisit_weight = float(self.revisit_weight)
         self.boundary_weight = float(self.boundary_weight)
+
         self.revisit_norm = int(self.revisit_norm)
         self.min_target_distance = float(self.min_target_distance)
 
@@ -59,6 +67,7 @@ class SearchTarget:
     score: float
     semantic_score: float
     exploration_gain: float
+    heading_alignment: float
     distance_cost: float
     revisit_penalty: float
     boundary_risk: float
@@ -75,6 +84,7 @@ class SearchTarget:
             "score": float(self.score),
             "semantic_score": float(self.semantic_score),
             "exploration_gain": float(self.exploration_gain),
+            "heading_alignment": float(self.heading_alignment),
             "distance_cost": float(self.distance_cost),
             "revisit_penalty": float(self.revisit_penalty),
             "boundary_risk": float(self.boundary_risk),
@@ -200,12 +210,32 @@ class SearchNavigator:
                 current_step=current_step,
                 semantic_map=semantic_map,
                 semantic_clear=semantic_clear,
+                allow_close_target=False,
             )
 
             if target is None:
                 continue
 
             candidates.append(target)
+
+        if not candidates:
+            for cell in semantic_map.iter_cells():
+                if cell.status == MapCellStatus.REJECTED:
+                    continue
+
+                target = self._score_cell(
+                    cell=cell,
+                    current_pose=current_pose,
+                    current_step=current_step,
+                    semantic_map=semantic_map,
+                    semantic_clear=semantic_clear,
+                    allow_close_target=True,
+                )
+
+                if target is None:
+                    continue
+
+                candidates.append(target)
 
         if not candidates:
             return None
@@ -223,16 +253,27 @@ class SearchNavigator:
         semantic_map: SemanticMap,
     ) -> Tuple[bool, Dict[str, Any]]:
         values = []
+        high_value_count = 0
+
         for cell in semantic_map.iter_cells():
             if cell.status == MapCellStatus.REJECTED:
                 continue
-            values.append(cell.semantic_value * cell.semantic_conf)
+
+            effective = cell.semantic_value * cell.semantic_conf
+            values.append(effective)
+
+            if (
+                cell.status == MapCellStatus.HIGH_VALUE
+                and effective >= self.config.semantic_clear_threshold
+            ):
+                high_value_count += 1
 
         if not values:
             return False, {
                 "best": 0.0,
                 "second": 0.0,
                 "margin": 0.0,
+                "high_value_count": 0,
                 "clear": False,
             }
 
@@ -241,15 +282,19 @@ class SearchNavigator:
         second = float(values[1]) if len(values) > 1 else 0.0
         margin = best - second
 
-        clear = (
-            best >= self.config.semantic_clear_threshold
-            and margin >= self.config.semantic_margin
-        )
+        clear = False
+
+        if best >= self.config.semantic_clear_threshold:
+            if high_value_count > 0:
+                clear = True
+            elif margin >= self.config.semantic_margin:
+                clear = True
 
         return clear, {
             "best": best,
             "second": second,
             "margin": margin,
+            "high_value_count": high_value_count,
             "clear": clear,
         }
 
@@ -260,11 +305,12 @@ class SearchNavigator:
         current_step: int,
         semantic_map: SemanticMap,
         semantic_clear: bool,
+        allow_close_target: bool,
     ) -> Optional[SearchTarget]:
         wx, wy, wz = semantic_map.grid_to_world(cell.gx, cell.gy, current_pose.z)
         dist = math.hypot(wx - current_pose.x, wy - current_pose.y)
 
-        if dist < self.config.min_target_distance and cell.visited_count > 0:
+        if not allow_close_target and dist < self.config.min_target_distance:
             return None
 
         max_dist = max(
@@ -276,6 +322,11 @@ class SearchNavigator:
 
         semantic_score = cell.semantic_value * cell.semantic_conf
         exploration_gain = self._exploration_gain(cell)
+        heading_alignment = self._heading_alignment(
+            current_pose=current_pose,
+            target_x=wx,
+            target_y=wy,
+        )
         revisit_penalty = min(
             1.0,
             float(cell.visited_count) / float(max(1, self.config.revisit_norm)),
@@ -285,13 +336,16 @@ class SearchNavigator:
         if semantic_clear:
             semantic_weight = self.config.semantic_weight_clear
             exploration_weight = self.config.exploration_weight_clear
+            heading_weight = self.config.heading_weight_clear
         else:
             semantic_weight = self.config.semantic_weight_unclear
             exploration_weight = self.config.exploration_weight_unclear
+            heading_weight = self.config.heading_weight_unclear
 
         score = (
             semantic_weight * semantic_score
             + exploration_weight * exploration_gain
+            + heading_weight * heading_alignment
             - self.config.distance_weight * distance_cost
             - self.config.revisit_weight * revisit_penalty
             - self.config.boundary_weight * boundary_risk
@@ -299,15 +353,19 @@ class SearchNavigator:
 
         reason = (
             "semantic_clear={}, semantic={:.3f}, explore={:.3f}, "
-            "dist={:.3f}, revisit={:.3f}, boundary={:.3f}"
+            "heading={:.3f}, dist={:.3f}, revisit={:.3f}, boundary={:.3f}"
         ).format(
             semantic_clear,
             semantic_score,
             exploration_gain,
+            heading_alignment,
             distance_cost,
             revisit_penalty,
             boundary_risk,
         )
+
+        if allow_close_target:
+            reason = "{}; allow_close_target=True".format(reason)
 
         return SearchTarget(
             gx=cell.gx,
@@ -316,6 +374,7 @@ class SearchNavigator:
             score=float(score),
             semantic_score=float(semantic_score),
             exploration_gain=float(exploration_gain),
+            heading_alignment=float(heading_alignment),
             distance_cost=float(distance_cost),
             revisit_penalty=float(revisit_penalty),
             boundary_risk=float(boundary_risk),
@@ -339,6 +398,25 @@ class SearchNavigator:
 
         return max(0.0, gain)
 
+    def _heading_alignment(
+        self,
+        current_pose: PoseRecord,
+        target_x: float,
+        target_y: float,
+    ) -> float:
+        dx = float(target_x) - float(current_pose.x)
+        dy = float(target_y) - float(current_pose.y)
+
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return 0.0
+
+        yaw = self._yaw_to_rad(current_pose.yaw)
+        target_angle = math.atan2(dy, dx)
+        diff = abs(self._angle_diff(target_angle, yaw))
+
+        # front: 1.0, side: 0.5, back: 0.0
+        return max(0.0, (math.cos(diff) + 1.0) * 0.5)
+
     def _boundary_risk(
         self,
         x: float,
@@ -356,6 +434,22 @@ class SearchNavigator:
         norm = min_dist / max(semantic_map.config.cell_size * 2.0, semantic_map.config.eps)
 
         return max(0.0, 1.0 - min(1.0, norm))
+
+    @staticmethod
+    def _yaw_to_rad(yaw: float) -> float:
+        yaw = float(yaw)
+        if abs(yaw) > 2.0 * math.pi + 1e-3:
+            return math.radians(yaw)
+        return yaw
+
+    @staticmethod
+    def _angle_diff(a: float, b: float) -> float:
+        diff = a - b
+        while diff > math.pi:
+            diff -= 2.0 * math.pi
+        while diff <= -math.pi:
+            diff += 2.0 * math.pi
+        return diff
 
 
 __all__ = [
