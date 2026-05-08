@@ -655,7 +655,9 @@ class Task1KeyframeManager:
 
     @staticmethod
     def _frame_has_task1_content(frame: FrameRecord) -> bool:
-        return bool(frame.has_image() or frame.rgb_caption)
+        # SVNav Task1 directly uses image input to VLM.
+        # Caption fallback is intentionally not used here.
+        return bool(frame.has_image())
 
     @staticmethod
     def _angle_diff_deg(a: float, b: float) -> float:
