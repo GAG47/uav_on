@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from svnav.action_adapter import ActionAdapter, ActionAdapterConfig
-from svnav.semantic_map import MapCellStatus, SemanticMap, SemanticMapCell
+from svnav.semantic_map import SemanticMap
 from svnav.types import (
     ActionSource,
     NavDecision,
@@ -13,107 +13,77 @@ from svnav.types import (
     ObservationRecord,
     PoseRecord,
 )
+from svnav.viewpoint_planner import (
+    SearchViewpoint,
+    SearchViewpointPlanner,
+    SearchViewpointPlannerConfig,
+)
 
 
 @dataclass
 class SearchNavigatorConfig:
-    semantic_clear_threshold: float = 0.28
-    semantic_margin: float = 0.08
+    max_active_viewpoint_steps: int = 12
+    no_progress_limit: int = 4
+    progress_epsilon: float = 0.5
 
-    semantic_weight_clear: float = 1.20
-    exploration_weight_clear: float = 0.25
-    heading_weight_clear: float = 0.10
-
-    semantic_weight_unclear: float = 0.35
-    exploration_weight_unclear: float = 1.00
-    heading_weight_unclear: float = 0.45
-
-    distance_weight: float = 0.30
-    revisit_weight: float = 0.45
-    boundary_weight: float = 0.10
-
-    revisit_norm: int = 6
-    min_target_distance: float = 5.0
-
-    unknown_bonus: float = 0.25
-    high_value_bonus: float = 0.15
-    explored_penalty: float = 0.20
+    replan_score_margin: float = 0.15
 
     def __post_init__(self) -> None:
-        self.semantic_clear_threshold = float(self.semantic_clear_threshold)
-        self.semantic_margin = float(self.semantic_margin)
-
-        self.semantic_weight_clear = float(self.semantic_weight_clear)
-        self.exploration_weight_clear = float(self.exploration_weight_clear)
-        self.heading_weight_clear = float(self.heading_weight_clear)
-
-        self.semantic_weight_unclear = float(self.semantic_weight_unclear)
-        self.exploration_weight_unclear = float(self.exploration_weight_unclear)
-        self.heading_weight_unclear = float(self.heading_weight_unclear)
-
-        self.distance_weight = float(self.distance_weight)
-        self.revisit_weight = float(self.revisit_weight)
-        self.boundary_weight = float(self.boundary_weight)
-
-        self.revisit_norm = int(self.revisit_norm)
-        self.min_target_distance = float(self.min_target_distance)
+        self.max_active_viewpoint_steps = int(self.max_active_viewpoint_steps)
+        self.no_progress_limit = int(self.no_progress_limit)
+        self.progress_epsilon = float(self.progress_epsilon)
+        self.replan_score_margin = float(self.replan_score_margin)
 
 
 @dataclass
-class SearchTarget:
-    gx: int
-    gy: int
-    world_position: Tuple[float, float, float]
-    score: float
-    semantic_score: float
-    exploration_gain: float
-    heading_alignment: float
-    distance_cost: float
-    revisit_penalty: float
-    boundary_risk: float
-    status: MapCellStatus
-    visited_count: int
-    semantic_clear: bool
-    reason: str
+class ActiveViewpointState:
+    viewpoint: SearchViewpoint
+    start_step: int
+    last_distance: Optional[float] = None
+    last_progress_metric: Optional[float] = None
+    no_progress_count: int = 0
+    last_replan_reason: str = "new_viewpoint"
 
     def to_log_dict(self) -> Dict[str, Any]:
         return {
-            "gx": self.gx,
-            "gy": self.gy,
-            "world_position": list(self.world_position),
-            "score": float(self.score),
-            "semantic_score": float(self.semantic_score),
-            "exploration_gain": float(self.exploration_gain),
-            "heading_alignment": float(self.heading_alignment),
-            "distance_cost": float(self.distance_cost),
-            "revisit_penalty": float(self.revisit_penalty),
-            "boundary_risk": float(self.boundary_risk),
-            "status": self.status.value,
-            "visited_count": int(self.visited_count),
-            "semantic_clear": bool(self.semantic_clear),
-            "reason": self.reason,
+            "viewpoint": self.viewpoint.to_log_dict(),
+            "start_step": int(self.start_step),
+            "last_distance": self.last_distance,
+            "last_progress_metric": self.last_progress_metric,
+            "no_progress_count": int(self.no_progress_count),
+            "last_replan_reason": self.last_replan_reason,
         }
 
 
 class SearchNavigator:
     """
-    Search-stage navigator.
+    Search-stage navigator with viewpoint / waypoint tracking.
 
-    It selects a region target from SemanticMap and asks ActionAdapter to
-    convert the selected target into a UAV-ON executable action.
+    It does not call VLM, GDINO, Task2, or StopGate.
 
-    It does not call VLM, does not call GDINO, does not verify targets,
-    and does not decide stop.
+    Planning loop:
+        current SemanticMap
+            -> select SearchRegion
+            -> generate SearchViewpoint
+            -> keep active_viewpoint until reached / invalid / preempted
+            -> ActionAdapter follows active_viewpoint.position
     """
 
     def __init__(
         self,
         config: Optional[SearchNavigatorConfig] = None,
+        viewpoint_planner: Optional[SearchViewpointPlanner] = None,
+        viewpoint_planner_config: Optional[SearchViewpointPlannerConfig] = None,
         action_adapter: Optional[ActionAdapter] = None,
         action_adapter_config: Optional[ActionAdapterConfig] = None,
     ) -> None:
         self.config = config or SearchNavigatorConfig()
+        self.viewpoint_planner = viewpoint_planner or SearchViewpointPlanner(
+            viewpoint_planner_config
+        )
         self.action_adapter = action_adapter or ActionAdapter(action_adapter_config)
+
+        self.active_by_episode: Dict[str, ActiveViewpointState] = {}
 
     def decide_search(
         self,
@@ -123,9 +93,12 @@ class SearchNavigator:
         semantic_map: SemanticMap,
     ) -> NavDecision:
         current_pose = observation.pose
+        episode_id = str(episode_id)
 
         if not semantic_map.is_pose_in_bounds(current_pose):
             target_position = semantic_map.nearest_in_bounds_position(current_pose)
+            self.active_by_episode.pop(episode_id, None)
+
             return self.action_adapter.target_to_action(
                 episode_id=episode_id,
                 step_id=step_id,
@@ -143,297 +116,314 @@ class SearchNavigator:
                 },
             )
 
-        target = self.select_search_target(
+        active = self.active_by_episode.get(episode_id)
+        replan_reason = self._need_replan(
+            active=active,
             current_pose=current_pose,
-            current_step=step_id,
             semantic_map=semantic_map,
+            step_id=step_id,
         )
 
-        if target is None:
-            return NavDecision(
-                episode_id=episode_id,
-                step_id=step_id,
-                mode=NavMode.SEARCH,
-                target_type="none",
-                action="rotl",
-                step_size=self.action_adapter.config.yaw_step_size,
-                action_source=ActionSource.GEOMETRIC_EXPLORE,
-                reason="no valid search target; rotate to observe",
-                debug_info={"navigator_reason": "no_valid_target"},
+        created_new = False
+
+        if active is None or replan_reason is not None:
+            viewpoint = self.viewpoint_planner.plan_best_viewpoint(
+                current_pose=current_pose,
+                semantic_map=semantic_map,
+                current_step=step_id,
             )
 
+            if viewpoint is None:
+                self.active_by_episode.pop(episode_id, None)
+                return NavDecision(
+                    episode_id=episode_id,
+                    step_id=step_id,
+                    mode=NavMode.SEARCH,
+                    target_type="none",
+                    action="rotl",
+                    step_size=self.action_adapter.config.rotation_step_min,
+                    action_source=ActionSource.GEOMETRIC_EXPLORE,
+                    reason="no valid search viewpoint; rotate to observe",
+                    debug_info={
+                        "navigator_reason": "no_valid_viewpoint",
+                        "replan_reason": replan_reason,
+                    },
+                )
+
+            active = ActiveViewpointState(
+                viewpoint=viewpoint,
+                start_step=step_id,
+                last_distance=self._distance_to_viewpoint(current_pose, viewpoint),
+                last_progress_metric=self._progress_metric(current_pose, viewpoint),
+                last_replan_reason=replan_reason or "new_viewpoint",
+            )
+            self.active_by_episode[episode_id] = active
+            created_new = True
+
+        if not created_new and int(step_id) > int(active.start_step):
+            self._update_progress(active, current_pose)
+
+        viewpoint = active.viewpoint
         source = (
             ActionSource.SEMANTIC_MAP
-            if target.semantic_clear
+            if viewpoint.region.source == "semantic"
             else ActionSource.GEOMETRIC_EXPLORE
         )
 
-        return self.action_adapter.target_to_action(
+        return self.action_adapter.follow_viewpoint(
             episode_id=episode_id,
             step_id=step_id,
             current_pose=current_pose,
-            target_position=target.world_position,
+            viewpoint=viewpoint,
             observation=observation,
             semantic_map=semantic_map,
             mode=NavMode.SEARCH,
-            target_type="region",
+            target_type="search_viewpoint",
             action_source=source,
-            reason=target.reason,
+            reason="follow active search viewpoint",
             debug_info={
-                "navigator_reason": "semantic_search" if target.semantic_clear else "geometric_explore",
-                "search_target": target.to_log_dict(),
+                "navigator_reason": "follow_active_viewpoint",
+                "active_viewpoint": active.to_log_dict(),
+                "viewpoint_distance": self._distance_to_viewpoint(
+                    current_pose,
+                    viewpoint,
+                ),
+                "viewpoint_yaw_error": self._view_yaw_error(
+                    current_pose,
+                    viewpoint,
+                ),
+                "progress_metric": self._progress_metric(
+                    current_pose,
+                    viewpoint,
+                ),
+                "map_debug": self._build_map_debug(
+                    semantic_map,
+                    top_k=3,
+                ),
+                "region_debug": self._build_region_debug(
+                    current_pose,
+                    semantic_map,
+                    top_k=3,
+                ),
             },
         )
 
-    # ------------------------------------------------------------------
-    # Target selection
-    # ------------------------------------------------------------------
-
-    def select_search_target(
+    def _need_replan(
         self,
+        active: Optional[ActiveViewpointState],
         current_pose: PoseRecord,
-        current_step: int,
         semantic_map: SemanticMap,
-    ) -> Optional[SearchTarget]:
-        semantic_clear, semantic_stats = self._is_semantic_preference_clear(
-            semantic_map=semantic_map
-        )
+        step_id: int,
+    ) -> Optional[str]:
+        if active is None:
+            return "no_active_viewpoint"
 
-        candidates: List[SearchTarget] = []
-        for cell in semantic_map.iter_cells():
-            if cell.status == MapCellStatus.REJECTED:
-                continue
+        viewpoint = active.viewpoint
 
-            target = self._score_cell(
-                cell=cell,
-                current_pose=current_pose,
-                current_step=current_step,
-                semantic_map=semantic_map,
-                semantic_clear=semantic_clear,
-                allow_close_target=False,
+        if not semantic_map.is_pose_in_bounds(
+            PoseRecord(
+                x=viewpoint.position[0],
+                y=viewpoint.position[1],
+                z=viewpoint.position[2],
+                yaw=viewpoint.yaw,
             )
+        ):
+            return "active_viewpoint_out_of_bounds"
 
-            if target is None:
-                continue
+        if self._is_viewpoint_reached(current_pose, viewpoint):
+            return "active_viewpoint_reached"
 
-            candidates.append(target)
+        age = int(step_id) - int(active.start_step)
+        if age >= self.config.max_active_viewpoint_steps:
+            return "active_viewpoint_timeout"
 
-        if not candidates:
-            for cell in semantic_map.iter_cells():
-                if cell.status == MapCellStatus.REJECTED:
-                    continue
+        if active.no_progress_count >= self.config.no_progress_limit:
+            return "active_viewpoint_no_progress"
 
-                target = self._score_cell(
-                    cell=cell,
-                    current_pose=current_pose,
-                    current_step=current_step,
-                    semantic_map=semantic_map,
-                    semantic_clear=semantic_clear,
-                    allow_close_target=True,
-                )
-
-                if target is None:
-                    continue
-
-                candidates.append(target)
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda item: item.score, reverse=True)
-        best = candidates[0]
-        best.reason = "{}; {}".format(
-            best.reason,
-            "semantic_stats={}".format(semantic_stats),
+        new_best_score = self.viewpoint_planner.best_region_score(
+            current_pose=current_pose,
+            semantic_map=semantic_map,
         )
-        return best
+        active_score = float(viewpoint.region.score)
 
-    def _is_semantic_preference_clear(
+        if new_best_score > active_score + self.config.replan_score_margin:
+            return "significantly_better_region"
+
+        return None
+
+    def _is_viewpoint_reached(
+        self,
+        pose: PoseRecord,
+        viewpoint: SearchViewpoint,
+    ) -> bool:
+        # Search viewpoint completion is position-based.
+        # Exact view-yaw alignment is not required in Search stage; otherwise
+        # UAV-ON's coarse rotation easily causes in-place yaw oscillation.
+        distance = self._distance_to_viewpoint(pose, viewpoint)
+        return distance <= self.action_adapter.config.position_tolerance
+
+    def _update_progress(
+        self,
+        active: ActiveViewpointState,
+        current_pose: PoseRecord,
+    ) -> None:
+        distance = self._distance_to_viewpoint(
+            current_pose,
+            active.viewpoint,
+        )
+        metric = self._progress_metric(
+            current_pose,
+            active.viewpoint,
+        )
+
+        if active.last_progress_metric is None:
+            active.last_progress_metric = metric
+            active.last_distance = distance
+            return
+
+        if metric < active.last_progress_metric - self.config.progress_epsilon:
+            active.no_progress_count = 0
+        else:
+            active.no_progress_count += 1
+
+        active.last_distance = distance
+        active.last_progress_metric = metric
+
+    def _progress_metric(
+        self,
+        pose: PoseRecord,
+        viewpoint: SearchViewpoint,
+    ) -> float:
+        # Composite navigation progress:
+        # - distance to waypoint should decrease during translation;
+        # - heading error to waypoint should decrease during turning.
+        distance = self._distance_to_viewpoint(pose, viewpoint)
+        yaw_error = abs(self._yaw_to_waypoint_error(pose, viewpoint))
+
+        yaw_equivalent_distance = 0.05 * yaw_error
+        return float(distance + yaw_equivalent_distance)
+
+
+    def _build_map_debug(
         self,
         semantic_map: SemanticMap,
-    ) -> Tuple[bool, Dict[str, Any]]:
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
         values = []
         high_value_count = 0
+        top_cells = []
 
         for cell in semantic_map.iter_cells():
-            if cell.status == MapCellStatus.REJECTED:
-                continue
-
-            effective = cell.semantic_value * cell.semantic_conf
+            effective = float(cell.semantic_value * cell.semantic_conf)
             values.append(effective)
 
-            if (
-                cell.status == MapCellStatus.HIGH_VALUE
-                and effective >= self.config.semantic_clear_threshold
-            ):
+            status = getattr(cell.status, "value", str(cell.status))
+            if status == "high_value":
                 high_value_count += 1
 
-        if not values:
-            return False, {
-                "best": 0.0,
-                "second": 0.0,
-                "margin": 0.0,
-                "high_value_count": 0,
-                "clear": False,
-            }
+            top_cells.append(
+                {
+                    "gx": int(cell.gx),
+                    "gy": int(cell.gy),
+                    "semantic_value": float(cell.semantic_value),
+                    "semantic_conf": float(cell.semantic_conf),
+                    "effective_value": effective,
+                    "visited_count": int(cell.visited_count),
+                    "status": status,
+                }
+            )
 
         values.sort(reverse=True)
-        best = float(values[0])
+        best = float(values[0]) if values else 0.0
         second = float(values[1]) if len(values) > 1 else 0.0
-        margin = best - second
 
-        clear = False
+        top_cells.sort(
+            key=lambda item: item["effective_value"],
+            reverse=True,
+        )
 
-        if best >= self.config.semantic_clear_threshold:
-            if high_value_count > 0:
-                clear = True
-            elif margin >= self.config.semantic_margin:
-                clear = True
+        try:
+            summary = semantic_map.get_summary(top_k=top_k)
+            status_counts = summary.get("status_counts", {})
+        except Exception:
+            status_counts = {}
 
-        return clear, {
-            "best": best,
-            "second": second,
-            "margin": margin,
-            "high_value_count": high_value_count,
-            "clear": clear,
+        return {
+            "best_semantic": best,
+            "second_semantic": second,
+            "semantic_margin": best - second,
+            "high_value_count": int(high_value_count),
+            "status_counts": status_counts,
+            "top_semantic_cells": top_cells[:top_k],
         }
 
-    def _score_cell(
-        self,
-        cell: SemanticMapCell,
-        current_pose: PoseRecord,
-        current_step: int,
-        semantic_map: SemanticMap,
-        semantic_clear: bool,
-        allow_close_target: bool,
-    ) -> Optional[SearchTarget]:
-        wx, wy, wz = semantic_map.grid_to_world(cell.gx, cell.gy, current_pose.z)
-        dist = math.hypot(wx - current_pose.x, wy - current_pose.y)
-
-        if not allow_close_target and dist < self.config.min_target_distance:
-            return None
-
-        max_dist = max(
-            semantic_map.search_bounds.width,
-            semantic_map.search_bounds.height,
-            semantic_map.config.eps,
-        )
-        distance_cost = min(1.0, dist / max_dist)
-
-        semantic_score = cell.semantic_value * cell.semantic_conf
-        exploration_gain = self._exploration_gain(cell)
-        heading_alignment = self._heading_alignment(
-            current_pose=current_pose,
-            target_x=wx,
-            target_y=wy,
-        )
-        revisit_penalty = min(
-            1.0,
-            float(cell.visited_count) / float(max(1, self.config.revisit_norm)),
-        )
-        boundary_risk = self._boundary_risk(wx, wy, semantic_map)
-
-        if semantic_clear:
-            semantic_weight = self.config.semantic_weight_clear
-            exploration_weight = self.config.exploration_weight_clear
-            heading_weight = self.config.heading_weight_clear
-        else:
-            semantic_weight = self.config.semantic_weight_unclear
-            exploration_weight = self.config.exploration_weight_unclear
-            heading_weight = self.config.heading_weight_unclear
-
-        score = (
-            semantic_weight * semantic_score
-            + exploration_weight * exploration_gain
-            + heading_weight * heading_alignment
-            - self.config.distance_weight * distance_cost
-            - self.config.revisit_weight * revisit_penalty
-            - self.config.boundary_weight * boundary_risk
-        )
-
-        reason = (
-            "semantic_clear={}, semantic={:.3f}, explore={:.3f}, "
-            "heading={:.3f}, dist={:.3f}, revisit={:.3f}, boundary={:.3f}"
-        ).format(
-            semantic_clear,
-            semantic_score,
-            exploration_gain,
-            heading_alignment,
-            distance_cost,
-            revisit_penalty,
-            boundary_risk,
-        )
-
-        if allow_close_target:
-            reason = "{}; allow_close_target=True".format(reason)
-
-        return SearchTarget(
-            gx=cell.gx,
-            gy=cell.gy,
-            world_position=(wx, wy, wz),
-            score=float(score),
-            semantic_score=float(semantic_score),
-            exploration_gain=float(exploration_gain),
-            heading_alignment=float(heading_alignment),
-            distance_cost=float(distance_cost),
-            revisit_penalty=float(revisit_penalty),
-            boundary_risk=float(boundary_risk),
-            status=cell.status,
-            visited_count=cell.visited_count,
-            semantic_clear=semantic_clear,
-            reason=reason,
-        )
-
-    def _exploration_gain(self, cell: SemanticMapCell) -> float:
-        gain = 1.0 / (1.0 + float(cell.visited_count))
-
-        if cell.status == MapCellStatus.UNKNOWN:
-            gain += self.config.unknown_bonus
-
-        if cell.status == MapCellStatus.HIGH_VALUE:
-            gain += self.config.high_value_bonus
-
-        if cell.status == MapCellStatus.EXPLORED:
-            gain -= self.config.explored_penalty
-
-        return max(0.0, gain)
-
-    def _heading_alignment(
+    def _build_region_debug(
         self,
         current_pose: PoseRecord,
-        target_x: float,
-        target_y: float,
-    ) -> float:
-        dx = float(target_x) - float(current_pose.x)
-        dy = float(target_y) - float(current_pose.y)
-
-        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
-            return 0.0
-
-        yaw = self._yaw_to_rad(current_pose.yaw)
-        target_angle = math.atan2(dy, dx)
-        diff = abs(self._angle_diff(target_angle, yaw))
-
-        # front: 1.0, side: 0.5, back: 0.0
-        return max(0.0, (math.cos(diff) + 1.0) * 0.5)
-
-    def _boundary_risk(
-        self,
-        x: float,
-        y: float,
         semantic_map: SemanticMap,
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
+        try:
+            regions = self.viewpoint_planner.build_search_regions(
+                current_pose=current_pose,
+                semantic_map=semantic_map,
+            )
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "top_regions": [],
+                "top_semantic_regions": [],
+            }
+
+        top_regions = []
+        top_semantic_regions = []
+
+        for region in regions[:top_k]:
+            top_regions.append(region.to_log_dict())
+
+        for region in regions:
+            if region.source == "semantic":
+                top_semantic_regions.append(region.to_log_dict())
+            if len(top_semantic_regions) >= top_k:
+                break
+
+        return {
+            "top_regions": top_regions,
+            "top_semantic_regions": top_semantic_regions,
+            "region_count": len(regions),
+        }
+
+
+    @staticmethod
+    def _distance_to_viewpoint(
+        pose: PoseRecord,
+        viewpoint: SearchViewpoint,
     ) -> float:
-        bounds = semantic_map.search_bounds
+        return math.hypot(
+            float(viewpoint.position[0]) - float(pose.x),
+            float(viewpoint.position[1]) - float(pose.y),
+        )
 
-        dist_left = abs(float(x) - bounds.x_min)
-        dist_right = abs(bounds.x_max - float(x))
-        dist_bottom = abs(float(y) - bounds.y_min)
-        dist_top = abs(bounds.y_max - float(y))
+    def _yaw_to_waypoint_error(
+        self,
+        pose: PoseRecord,
+        viewpoint: SearchViewpoint,
+    ) -> float:
+        current_yaw = self._yaw_to_rad(pose.yaw)
+        target_angle = math.atan2(
+            float(viewpoint.position[1]) - float(pose.y),
+            float(viewpoint.position[0]) - float(pose.x),
+        )
+        return math.degrees(self._angle_diff(target_angle, current_yaw))
 
-        min_dist = min(dist_left, dist_right, dist_bottom, dist_top)
-        norm = min_dist / max(semantic_map.config.cell_size * 2.0, semantic_map.config.eps)
-
-        return max(0.0, 1.0 - min(1.0, norm))
+    def _view_yaw_error(
+        self,
+        pose: PoseRecord,
+        viewpoint: SearchViewpoint,
+    ) -> float:
+        current_yaw = self._yaw_to_rad(pose.yaw)
+        desired_yaw = self._yaw_to_rad(viewpoint.yaw)
+        return math.degrees(self._angle_diff(desired_yaw, current_yaw))
 
     @staticmethod
     def _yaw_to_rad(yaw: float) -> float:
@@ -455,5 +445,5 @@ class SearchNavigator:
 __all__ = [
     "SearchNavigator",
     "SearchNavigatorConfig",
-    "SearchTarget",
+    "ActiveViewpointState",
 ]

@@ -19,8 +19,15 @@ from svnav.types import (
 
 @dataclass
 class ActionAdapterConfig:
-    horizontal_step_size: float = 5.0
-    yaw_step_size: float = 30.0
+    translation_step_min: float = 2.0
+    translation_step_max: float = 5.0
+
+    rotation_step_min: float = 15.0
+    rotation_step_max: float = 30.0
+
+    position_tolerance: float = 5.0
+    move_yaw_tolerance_deg: float = 45.0
+    observe_yaw_tolerance_deg: float = 45.0
 
     forward_action: str = "forward"
     left_action: str = "left"
@@ -28,44 +35,222 @@ class ActionAdapterConfig:
     rotate_left_action: str = "rotl"
     rotate_right_action: str = "rotr"
 
-    rotate_threshold_deg: float = 45.0
-    strafe_threshold_deg: float = 15.0
-    arrive_distance: float = 4.0
+    strafe_yaw_threshold_deg: float = 20.0
 
     min_safe_depth: float = 2.0
     depth_percentile: float = 20.0
     use_depth_safety: bool = True
 
     def __post_init__(self) -> None:
-        self.horizontal_step_size = float(self.horizontal_step_size)
-        self.yaw_step_size = float(self.yaw_step_size)
-        self.rotate_threshold_deg = float(self.rotate_threshold_deg)
-        self.strafe_threshold_deg = float(self.strafe_threshold_deg)
-        self.arrive_distance = float(self.arrive_distance)
+        self.translation_step_min = float(self.translation_step_min)
+        self.translation_step_max = float(self.translation_step_max)
+        self.rotation_step_min = float(self.rotation_step_min)
+        self.rotation_step_max = float(self.rotation_step_max)
+
+        self.position_tolerance = float(self.position_tolerance)
+        self.move_yaw_tolerance_deg = float(self.move_yaw_tolerance_deg)
+        self.observe_yaw_tolerance_deg = float(self.observe_yaw_tolerance_deg)
+        self.strafe_yaw_threshold_deg = float(self.strafe_yaw_threshold_deg)
+
         self.min_safe_depth = float(self.min_safe_depth)
         self.depth_percentile = float(self.depth_percentile)
 
-        if self.horizontal_step_size <= 0:
-            raise ValueError("horizontal_step_size must be positive")
-        if self.yaw_step_size <= 0:
-            raise ValueError("yaw_step_size must be positive")
+        if self.translation_step_min <= 0:
+            self.translation_step_min = 1.0
+        if self.translation_step_max < self.translation_step_min:
+            self.translation_step_max = self.translation_step_min
+
+        if self.rotation_step_min <= 0:
+            self.rotation_step_min = 5.0
+        if self.rotation_step_max < self.rotation_step_min:
+            self.rotation_step_max = self.rotation_step_min
 
 
 class ActionAdapter:
     """
-    Convert a selected world-space target position into a UAV-ON executable action.
+    Convert a waypoint/viewpoint into a UAV-ON executable action.
 
-    This class does not select semantic targets and does not call VLM.
-    It only converts:
-        current_pose + target_position -> action + step_size
+    Search mode:
+        Track the waypoint position. Once the position is reached, do not
+        force precise view-yaw alignment. Search viewpoints are for obtaining
+        new observations, not for final target-facing precision.
 
-    Safety handled here:
-        - simple search-boundary check
-        - simple depth check for obvious collision risk
+    Future Approach mode:
+        Can use yaw alignment more strictly around verified target positions.
     """
 
     def __init__(self, config: Optional[ActionAdapterConfig] = None) -> None:
         self.config = config or ActionAdapterConfig()
+
+    def follow_viewpoint(
+        self,
+        episode_id: str,
+        step_id: int,
+        current_pose: PoseRecord,
+        viewpoint: Any,
+        observation: Optional[ObservationRecord] = None,
+        semantic_map: Optional[SemanticMap] = None,
+        mode: NavMode = NavMode.SEARCH,
+        target_type: str = "viewpoint",
+        action_source: ActionSource = ActionSource.GEOMETRIC_EXPLORE,
+        reason: str = "",
+        debug_info: Optional[Dict[str, Any]] = None,
+    ) -> NavDecision:
+        position = tuple(viewpoint.position)
+        desired_yaw = float(viewpoint.yaw)
+
+        dx = float(position[0]) - float(current_pose.x)
+        dy = float(position[1]) - float(current_pose.y)
+        distance_xy = math.hypot(dx, dy)
+
+        yaw_rad = self._yaw_to_rad(current_pose.yaw)
+        target_angle = math.atan2(dy, dx)
+        yaw_to_waypoint = self._angle_diff(target_angle, yaw_rad)
+        yaw_to_waypoint_deg = math.degrees(yaw_to_waypoint)
+
+        desired_yaw_rad = self._yaw_to_rad(desired_yaw)
+        observe_yaw_error = self._angle_diff(desired_yaw_rad, yaw_rad)
+        observe_yaw_error_deg = math.degrees(observe_yaw_error)
+
+        debug = dict(debug_info or {})
+        debug.update(
+            {
+                "viewpoint_id": getattr(viewpoint, "viewpoint_id", None),
+                "region_id": getattr(viewpoint, "region_id", None),
+                "waypoint": list(position),
+                "desired_yaw": desired_yaw,
+                "distance_to_waypoint": distance_xy,
+                "yaw_to_waypoint_deg": yaw_to_waypoint_deg,
+                "observe_yaw_error_deg": observe_yaw_error_deg,
+            }
+        )
+
+        if distance_xy <= self.config.position_tolerance:
+            if self._is_search_mode(mode):
+                debug["adapter_phase"] = "viewpoint_reached"
+                return NavDecision(
+                    episode_id=episode_id,
+                    step_id=step_id,
+                    mode=mode,
+                    target_type=target_type,
+                    target_position=position,
+                    target_id=getattr(viewpoint, "viewpoint_id", None),
+                    action=self.config.rotate_left_action,
+                    step_size=self.config.rotation_step_min,
+                    action_source=action_source,
+                    reason=reason or "search viewpoint position reached",
+                    debug_info=debug,
+                )
+
+            if abs(observe_yaw_error_deg) <= self.config.observe_yaw_tolerance_deg:
+                debug["adapter_phase"] = "viewpoint_reached"
+                return NavDecision(
+                    episode_id=episode_id,
+                    step_id=step_id,
+                    mode=mode,
+                    target_type=target_type,
+                    target_position=position,
+                    target_id=getattr(viewpoint, "viewpoint_id", None),
+                    action=self.config.rotate_left_action,
+                    step_size=self.config.rotation_step_min,
+                    action_source=action_source,
+                    reason=reason or "viewpoint reached",
+                    debug_info=debug,
+                )
+
+            action = (
+                self.config.rotate_left_action
+                if observe_yaw_error_deg > 0.0
+                else self.config.rotate_right_action
+            )
+            step_size = self._rotation_step(abs(observe_yaw_error_deg))
+            debug["adapter_phase"] = "align_view"
+
+            return NavDecision(
+                episode_id=episode_id,
+                step_id=step_id,
+                mode=mode,
+                target_type=target_type,
+                target_position=position,
+                target_id=getattr(viewpoint, "viewpoint_id", None),
+                action=action,
+                step_size=step_size,
+                action_source=action_source,
+                reason=reason or "align yaw to observe target region",
+                debug_info=debug,
+            )
+
+        if abs(yaw_to_waypoint_deg) > self.config.move_yaw_tolerance_deg:
+            action = (
+                self.config.rotate_left_action
+                if yaw_to_waypoint_deg > 0.0
+                else self.config.rotate_right_action
+            )
+            step_size = self._rotation_step(abs(yaw_to_waypoint_deg))
+            debug["adapter_phase"] = "turn_to_waypoint"
+
+            return NavDecision(
+                episode_id=episode_id,
+                step_id=step_id,
+                mode=mode,
+                target_type=target_type,
+                target_position=position,
+                target_id=getattr(viewpoint, "viewpoint_id", None),
+                action=action,
+                step_size=step_size,
+                action_source=action_source,
+                reason=reason or "turn toward waypoint",
+                debug_info=debug,
+            )
+
+        preferred_actions = self._translation_actions(yaw_to_waypoint_deg)
+        for action in preferred_actions:
+            if self._is_action_safe(
+                action=action,
+                current_pose=current_pose,
+                observation=observation,
+                semantic_map=semantic_map,
+            ):
+                step_size = self._translation_step(distance_xy)
+                debug["adapter_phase"] = "move_to_waypoint"
+                debug["preferred_actions"] = preferred_actions
+
+                return NavDecision(
+                    episode_id=episode_id,
+                    step_id=step_id,
+                    mode=mode,
+                    target_type=target_type,
+                    target_position=position,
+                    target_id=getattr(viewpoint, "viewpoint_id", None),
+                    action=action,
+                    step_size=step_size,
+                    action_source=action_source,
+                    reason=reason or "move toward waypoint",
+                    debug_info=debug,
+                )
+
+        action, step_size, safe_reason = self._safe_scan_action(
+            current_pose=current_pose,
+            observation=observation,
+            semantic_map=semantic_map,
+        )
+        debug["adapter_phase"] = "translation_unsafe"
+        debug["safe_reason"] = safe_reason
+        debug["preferred_actions"] = preferred_actions
+
+        return NavDecision(
+            episode_id=episode_id,
+            step_id=step_id,
+            mode=mode,
+            target_type=target_type,
+            target_position=position,
+            target_id=getattr(viewpoint, "viewpoint_id", None),
+            action=action,
+            step_size=step_size,
+            action_source=ActionSource.SAFETY_HOLD,
+            reason=safe_reason,
+            debug_info=debug,
+        )
 
     def target_to_action(
         self,
@@ -83,130 +268,38 @@ class ActionAdapter:
         reason: str = "",
         debug_info: Optional[Dict[str, Any]] = None,
     ) -> NavDecision:
-        dx = float(target_position[0]) - float(current_pose.x)
-        dy = float(target_position[1]) - float(current_pose.y)
-        distance_xy = math.hypot(dx, dy)
+        class _TargetViewpoint:
+            pass
 
-        debug = dict(debug_info or {})
-        debug.update(
-            {
-                "target_position": list(target_position),
-                "distance_xy": distance_xy,
-            }
-        )
+        vp = _TargetViewpoint()
+        vp.viewpoint_id = target_id
+        vp.region_id = target_id
+        vp.position = tuple(target_position)
+        vp.yaw = current_pose.yaw
 
-        if distance_xy <= self.config.arrive_distance:
-            action, step_size, safe_reason = self._safe_scan_action(
-                current_pose=current_pose,
-                observation=observation,
-                semantic_map=semantic_map,
-            )
-            debug["adapter_reason"] = "target_region_reached_scan"
-            debug["safe_reason"] = safe_reason
-
-            return NavDecision(
-                episode_id=episode_id,
-                step_id=step_id,
-                mode=mode,
-                target_type=target_type,
-                target_position=target_position,
-                target_id=target_id,
-                candidate_id=candidate_id,
-                action=action,
-                step_size=step_size,
-                action_source=action_source,
-                reason=reason or "target region reached; scan for new observation",
-                debug_info=debug,
-            )
-
-        yaw = self._yaw_to_rad(current_pose.yaw)
-        target_angle = math.atan2(dy, dx)
-        angle_diff = self._angle_diff(target_angle, yaw)
-        angle_diff_deg = math.degrees(angle_diff)
-
-        debug["target_angle_deg"] = math.degrees(target_angle)
-        debug["current_yaw_deg"] = math.degrees(yaw)
-        debug["angle_diff_deg"] = angle_diff_deg
-
-        preferred_actions = self._preferred_actions_from_angle(angle_diff_deg)
-
-        for action in preferred_actions:
-            if self._is_action_safe(
-                action=action,
-                current_pose=current_pose,
-                observation=observation,
-                semantic_map=semantic_map,
-            ):
-                step_size = self._step_size_for_action(action)
-                debug["adapter_reason"] = "selected_preferred_action"
-                debug["preferred_actions"] = preferred_actions
-
-                return NavDecision(
-                    episode_id=episode_id,
-                    step_id=step_id,
-                    mode=mode,
-                    target_type=target_type,
-                    target_position=target_position,
-                    target_id=target_id,
-                    candidate_id=candidate_id,
-                    action=action,
-                    step_size=step_size,
-                    action_source=action_source,
-                    reason=reason or "move toward selected search target",
-                    debug_info=debug,
-                )
-
-        action, step_size, safe_reason = self._safe_scan_action(
-            current_pose=current_pose,
-            observation=observation,
-            semantic_map=semantic_map,
-        )
-        debug["adapter_reason"] = "preferred_actions_unsafe"
-        debug["preferred_actions"] = preferred_actions
-        debug["safe_reason"] = safe_reason
-
-        return NavDecision(
+        return self.follow_viewpoint(
             episode_id=episode_id,
             step_id=step_id,
+            current_pose=current_pose,
+            viewpoint=vp,
+            observation=observation,
+            semantic_map=semantic_map,
             mode=mode,
             target_type=target_type,
-            target_position=target_position,
-            target_id=target_id,
-            candidate_id=candidate_id,
-            action=action,
-            step_size=step_size,
-            action_source=ActionSource.SAFETY_HOLD,
-            reason=safe_reason,
-            debug_info=debug,
+            action_source=action_source,
+            reason=reason,
+            debug_info=debug_info,
         )
 
-    # ------------------------------------------------------------------
-    # Action choice
-    # ------------------------------------------------------------------
-
-    def _preferred_actions_from_angle(self, angle_diff_deg: float) -> List[str]:
-        if angle_diff_deg > self.config.rotate_threshold_deg:
-            return [
-                self.config.rotate_left_action,
-                self.config.left_action,
-                self.config.forward_action,
-            ]
-
-        if angle_diff_deg < -self.config.rotate_threshold_deg:
-            return [
-                self.config.rotate_right_action,
-                self.config.right_action,
-                self.config.forward_action,
-            ]
-
-        if angle_diff_deg > self.config.strafe_threshold_deg:
+    def _translation_actions(self, yaw_error_deg: float) -> List[str]:
+        if yaw_error_deg > self.config.strafe_yaw_threshold_deg:
             return [
                 self.config.left_action,
                 self.config.forward_action,
                 self.config.rotate_left_action,
             ]
 
-        if angle_diff_deg < -self.config.strafe_threshold_deg:
+        if yaw_error_deg < -self.config.strafe_yaw_threshold_deg:
             return [
                 self.config.right_action,
                 self.config.forward_action,
@@ -242,16 +335,30 @@ class ActionAdapter:
             ):
                 return action, self._step_size_for_action(action), "safe scan action selected"
 
-        return self.config.rotate_left_action, self.config.yaw_step_size, "no safe translation; rotate for observation"
+        return (
+            self.config.rotate_left_action,
+            self.config.rotation_step_min,
+            "no safe translation; rotate for observation",
+        )
+
+    def _translation_step(self, distance: float) -> float:
+        return self._clamp(
+            distance,
+            self.config.translation_step_min,
+            self.config.translation_step_max,
+        )
+
+    def _rotation_step(self, angle_deg: float) -> float:
+        return self._clamp(
+            angle_deg,
+            self.config.rotation_step_min,
+            self.config.rotation_step_max,
+        )
 
     def _step_size_for_action(self, action: str) -> float:
         if action in (self.config.rotate_left_action, self.config.rotate_right_action):
-            return self.config.yaw_step_size
-        return self.config.horizontal_step_size
-
-    # ------------------------------------------------------------------
-    # Safety
-    # ------------------------------------------------------------------
+            return self.config.rotation_step_min
+        return self.config.translation_step_min
 
     def _is_action_safe(
         self,
@@ -283,7 +390,7 @@ class ActionAdapter:
 
     def _predict_next_pose(self, action: str, pose: PoseRecord) -> PoseRecord:
         yaw = self._yaw_to_rad(pose.yaw)
-        step = self.config.horizontal_step_size
+        step = self.config.translation_step_max
 
         dx = 0.0
         dy = 0.0
@@ -364,9 +471,11 @@ class ActionAdapter:
         values = values[values > 0.0]
         return values.astype(np.float32)
 
-    # ------------------------------------------------------------------
-    # Angle helpers
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_search_mode(mode: Any) -> bool:
+        if mode == NavMode.SEARCH:
+            return True
+        return str(mode).lower() == "search"
 
     @staticmethod
     def _yaw_to_rad(yaw: float) -> float:
@@ -383,6 +492,13 @@ class ActionAdapter:
         while diff <= -math.pi:
             diff += 2.0 * math.pi
         return diff
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        value = float(value)
+        low = float(low)
+        high = float(high)
+        return max(low, min(high, value))
 
 
 __all__ = [

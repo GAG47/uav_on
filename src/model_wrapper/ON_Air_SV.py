@@ -232,16 +232,7 @@ class ONAirSV(ONAir):
                 steps_size.append(float(step_size))
                 predict_dones.append(False)
 
-                print(
-                    "[SVNavSearch] episode={} step={} action={} step_size={} source={} reason={}".format(
-                        episode_id,
-                        step_id,
-                        action,
-                        step_size,
-                        decision.action_source.value,
-                        decision.reason,
-                    )
-                )
+                self._print_svnav_search_debug(decision)
 
             except Exception as exc:
                 actions.append("rotl")
@@ -250,6 +241,168 @@ class ONAirSV(ONAir):
                 print("[SVNavSearch] run error: {}".format(exc))
 
         return actions, steps_size, predict_dones
+
+
+    def _print_svnav_search_debug(self, decision) -> None:
+        debug = decision.debug_info or {}
+
+        active = debug.get("active_viewpoint") or {}
+        viewpoint = active.get("viewpoint") or {}
+        region = viewpoint.get("region") or {}
+
+        action_source = getattr(decision.action_source, "value", decision.action_source)
+
+        adapter_phase = debug.get("adapter_phase")
+        viewpoint_id = debug.get("viewpoint_id") or viewpoint.get("viewpoint_id")
+        region_id = debug.get("region_id") or viewpoint.get("region_id")
+        region_source = viewpoint.get("region_source") or region.get("source")
+
+        distance_to_waypoint = debug.get("distance_to_waypoint")
+        yaw_to_waypoint_deg = debug.get("yaw_to_waypoint_deg")
+        observe_yaw_error_deg = debug.get("observe_yaw_error_deg")
+        viewpoint_yaw_error = debug.get("viewpoint_yaw_error")
+
+        desired_yaw = debug.get("desired_yaw")
+        waypoint = debug.get("waypoint")
+
+        active_start_step = active.get("start_step")
+        no_progress_count = active.get("no_progress_count")
+        last_replan_reason = active.get("last_replan_reason")
+
+        region_score = region.get("score")
+        region_semantic = region.get("semantic_score")
+        region_explore = region.get("exploration_score")
+        viewpoint_score = viewpoint.get("score")
+
+        print(
+            "[SVNavSearch] episode={} step={} action={} step_size={} source={} "
+            "phase={} reason={}".format(
+                decision.episode_id,
+                decision.step_id,
+                decision.action,
+                decision.step_size,
+                action_source,
+                adapter_phase,
+                decision.reason,
+            )
+        )
+
+        print(
+            "[SVNavSearchDebug] vp={} region={} region_source={} "
+            "active_start={} no_progress={} replan_reason={}".format(
+                viewpoint_id,
+                region_id,
+                region_source,
+                active_start_step,
+                no_progress_count,
+                last_replan_reason,
+            )
+        )
+
+        print(
+            "[SVNavSearchDebug] waypoint={} desired_yaw={} "
+            "dist_to_wp={} yaw_to_wp={} observe_yaw_err={} view_yaw_err={}".format(
+                self._svnav_debug_fmt(waypoint),
+                self._svnav_debug_fmt(desired_yaw),
+                self._svnav_debug_fmt(distance_to_waypoint),
+                self._svnav_debug_fmt(yaw_to_waypoint_deg),
+                self._svnav_debug_fmt(observe_yaw_error_deg),
+                self._svnav_debug_fmt(viewpoint_yaw_error),
+            )
+        )
+
+        print(
+            "[SVNavSearchDebug] region_score={} semantic={} explore={} "
+            "viewpoint_score={}".format(
+                self._svnav_debug_fmt(region_score),
+                self._svnav_debug_fmt(region_semantic),
+                self._svnav_debug_fmt(region_explore),
+                self._svnav_debug_fmt(viewpoint_score),
+            )
+        )
+
+
+
+        map_debug = debug.get("map_debug") or {}
+        if map_debug:
+            top_cells = map_debug.get("top_semantic_cells") or []
+            top_cell = top_cells[0] if top_cells else {}
+
+            print(
+                "[SVNavMapDebug] best={} second={} margin={} high_value={} "
+                "top_cell=({}, {}, eff={}, status={})".format(
+                    self._svnav_debug_fmt(map_debug.get("best_semantic")),
+                    self._svnav_debug_fmt(map_debug.get("second_semantic")),
+                    self._svnav_debug_fmt(map_debug.get("semantic_margin")),
+                    map_debug.get("high_value_count"),
+                    top_cell.get("gx"),
+                    top_cell.get("gy"),
+                    self._svnav_debug_fmt(top_cell.get("effective_value")),
+                    top_cell.get("status"),
+                )
+            )
+
+        region_debug = debug.get("region_debug") or {}
+        if region_debug:
+            top_regions = region_debug.get("top_regions") or []
+            top_semantic_regions = region_debug.get("top_semantic_regions") or []
+
+            best_region = top_regions[0] if top_regions else {}
+            best_semantic_region = top_semantic_regions[0] if top_semantic_regions else {}
+
+            best_region_center = best_region.get("center")
+            best_semantic_center = best_semantic_region.get("center")
+
+            print(
+                "[SVNavRegionDebug] count={} best_source={} best_score={} "
+                "best_sem={} best_exp={} best_center={} semantic_region_count={} "
+                "best_semantic_score={} best_semantic_center={}".format(
+                    region_debug.get("region_count"),
+                    best_region.get("source"),
+                    self._svnav_debug_fmt(best_region.get("score")),
+                    self._svnav_debug_fmt(best_region.get("semantic_score")),
+                    self._svnav_debug_fmt(best_region.get("exploration_score")),
+                    self._svnav_debug_fmt(best_region_center),
+                    len(top_semantic_regions),
+                    self._svnav_debug_fmt(best_semantic_region.get("score")),
+                    self._svnav_debug_fmt(best_semantic_center),
+                )
+            )
+
+
+    @staticmethod
+    def _svnav_debug_shorten(value, limit: int = 800) -> str:
+        if value is None:
+            return "None"
+
+        text = str(value)
+        limit = int(limit)
+
+        if len(text) <= limit:
+            return text
+
+        return text[:limit] + "...<truncated>"
+
+
+    @staticmethod
+    def _svnav_debug_fmt(value) -> str:
+        if value is None:
+            return "None"
+
+        if isinstance(value, float):
+            return "{:.3f}".format(value)
+
+        if isinstance(value, (list, tuple)):
+            parts = []
+            for item in value:
+                if isinstance(item, float):
+                    parts.append("{:.2f}".format(item))
+                else:
+                    parts.append(str(item))
+            return "[" + ", ".join(parts) + "]"
+
+        return str(value)
+
 
     # ------------------------------------------------------------------
     # SVNav step update
