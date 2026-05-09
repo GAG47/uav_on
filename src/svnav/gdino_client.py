@@ -10,6 +10,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
+from .candidate_filter import GDINOCandidateFilter, GDINOCandidateFilterConfig
 from .types import (
     BBox,
     FrameRecord,
@@ -141,6 +142,7 @@ class SVNavGDINOClient:
 
     def __init__(self, config: Optional[GDINOClientConfig] = None) -> None:
         self.config = config or GDINOClientConfig.from_env()
+        self.candidate_filter = GDINOCandidateFilter(GDINOCandidateFilterConfig())
 
     @property
     def enabled(self) -> bool:
@@ -396,7 +398,7 @@ class SVNavGDINOClient:
                 },
             )
 
-        candidates = []
+        raw_candidates = []
         detections = response.get("detections", []) or []
 
         for detection in detections:
@@ -409,7 +411,10 @@ class SVNavGDINOClient:
                 trigger_reason=trigger_reason,
             )
             if candidate is not None:
-                candidates.append(candidate)
+                raw_candidates.append(candidate)
+
+        filter_output = self.candidate_filter.filter_candidates(raw_candidates)
+        candidates = filter_output.kept
 
         latency_ms = (time.time() - started_at) * 1000.0
 
@@ -430,6 +435,10 @@ class SVNavGDINOClient:
                 "box_threshold": self.config.box_threshold,
                 "text_threshold": self.config.text_threshold,
                 "raw_num_detections": response.get("num_detections", len(detections)),
+                "raw_candidate_count": len(raw_candidates),
+                "kept_candidate_count": len(filter_output.kept),
+                "rejected_candidate_count": len(filter_output.rejected),
+                "candidate_filter": filter_output.summary.to_log_dict(),
                 "best_score": response.get("best_score", 0.0),
             },
         )

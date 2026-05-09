@@ -511,10 +511,15 @@ class ONAirSV(ONAir):
             best_score = float(best.score)
             best_label = best.label
 
+        filter_meta = (result.metadata or {}).get("candidate_filter", {})
         return {
             "request_id": request.request_id,
             "success": bool(result.success),
             "candidate_count": len(candidates),
+            "raw_candidate_count": (result.metadata or {}).get("raw_candidate_count"),
+            "kept_candidate_count": (result.metadata or {}).get("kept_candidate_count"),
+            "rejected_candidate_count": (result.metadata or {}).get("rejected_candidate_count"),
+            "candidate_filter": filter_meta,
             "best_score": best_score,
             "best_label": best_label,
             "latency_ms": result.latency_ms,
@@ -548,8 +553,8 @@ class ONAirSV(ONAir):
 
         print(
             "[SVNavGDINO] episode={} step={} request={} views={} "
-            "keyframe={} reason={} admission={} candidates={} best={:.3f} "
-            "label={} success={} latency_ms={} error={}".format(
+            "keyframe={} reason={} admission={} raw={} kept={} rejected={} "
+            "best={:.3f} label={} success={} latency_ms={} error={}".format(
                 state.episode_id,
                 request.submit_step,
                 request.request_id,
@@ -557,7 +562,9 @@ class ONAirSV(ONAir):
                 keyframe_id,
                 reason,
                 self._svnav_debug_fmt(admission_score),
+                (result.metadata or {}).get("raw_candidate_count", len(candidates)),
                 len(candidates),
+                (result.metadata or {}).get("rejected_candidate_count", 0),
                 best_score,
                 self._svnav_debug_shorten(best_label, limit=80),
                 result.success,
