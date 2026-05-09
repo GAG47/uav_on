@@ -122,3 +122,91 @@ __all__ = [
     "SVNAV_TASK1_SYSTEM_PROMPT",
     "build_task1_user_prompt",
 ]
+
+
+def build_task2_batch_prompt(target_info, candidates):
+    """
+    Build Task2 verification prompt.
+
+    Task2 verifies whether each candidate crop corresponds to the target object.
+    It must not output navigation action, stop decision, or approach decision.
+    """
+    target_text = target_info.text if hasattr(target_info, "text") else str(target_info)
+
+    candidate_lines = []
+    for idx, item in enumerate(candidates, start=1):
+        candidate_lines.append(
+            "Candidate {idx}:\n"
+            "- candidate_id: {candidate_id}\n"
+            "- view: {view_id}\n"
+            "- step: {step_id}\n"
+            "- GDINO label: {label}\n"
+            "- GDINO score: {score}\n"
+            "- bbox: {bbox}\n"
+            "- bbox area ratio: {area_ratio}\n"
+            "- quality_score: {quality_score}\n"
+            "- position_3d: {position_3d}\n"
+            "- position_confidence: {position_confidence}\n"
+            "- depth_valid: {depth_valid}\n"
+            "- geometry_summary: {geometry_summary}\n".format(
+                idx=idx,
+                candidate_id=item.get("candidate_id"),
+                view_id=item.get("view_id"),
+                step_id=item.get("step_id"),
+                label=item.get("label"),
+                score=item.get("score"),
+                bbox=item.get("bbox"),
+                area_ratio=item.get("area_ratio"),
+                quality_score=item.get("quality_score"),
+                position_3d=item.get("position_3d"),
+                position_confidence=item.get("position_confidence"),
+                depth_valid=item.get("depth_valid"),
+                geometry_summary=item.get("geometry_summary"),
+            )
+        )
+
+    return """
+You are verifying object candidates for an open-world UAV navigation task.
+
+Target object:
+{target_text}
+
+You will receive, for each candidate, a context image and a cropped candidate image.
+The context image shows where the candidate appears in the scene.
+The crop image shows the exact candidate region proposed by GroundingDINO.
+
+Your task:
+For each candidate_id, decide whether the CROP corresponds to the target object.
+
+Important rules:
+- Judge only the candidate crop and its marked candidate, not other objects in the full image.
+- Do not output any navigation action.
+- Do not output stop.
+- Do not decide whether the UAV has arrived.
+- Do not use bbox size as arrival evidence.
+- If the crop is unclear, partially visible, background, roof, wall, shadow, tree, terrain, or a wrong object, return "no" or "maybe".
+- Return "match" only when the crop visually matches the target object well.
+- Use "maybe" when it is plausible but not reliable enough.
+- Use "no" when it is likely not the target.
+
+Candidate metadata:
+{candidate_text}
+
+Return JSON only, with this schema:
+{{
+  "results": [
+    {{
+      "candidate_id": "string",
+      "verdict": "match | maybe | no",
+      "confidence": 0.0,
+      "reason": "brief reason",
+      "matched_attributes": ["short visual attributes that match"],
+      "failed_attributes": ["short visual attributes that do not match or are unclear"]
+    }}
+  ]
+}}
+""".format(
+        target_text=target_text,
+        candidate_text="\n".join(candidate_lines),
+    ).strip()
+

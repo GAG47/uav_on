@@ -21,6 +21,7 @@ from svnav.keyframe_manager import (
 from svnav.navigator import SearchNavigator, SearchNavigatorConfig
 from svnav.semantic_map import SemanticMap, SemanticMapConfig
 from svnav.task1_reasoner import Task1Reasoner, Task1ReasonerConfig
+from svnav.target_verifier import TargetVerifier, TargetVerifierConfig
 from svnav.types import (
     FrameRecord,
     GDINOResult,
@@ -29,6 +30,7 @@ from svnav.types import (
     PoseRecord,
     TargetInfo,
     Task1Result,
+    Task2Result,
     ViewID,
     now_ts,
 )
@@ -42,6 +44,7 @@ class SVNAVEpisodeState:
     semantic_map: SemanticMap
     keyframe_manager: Task1KeyframeManager
     gdino_keyframe_manager: GDINOKeyframeManager
+    target_verifier: TargetVerifier
     navigator: SearchNavigator
 
     created_at: float = field(default_factory=now_ts)
@@ -58,6 +61,11 @@ class SVNAVEpisodeState:
     last_gdino_cleanup_summary: Optional[Dict[str, Any]] = None
     latest_gdino_result: Optional[GDINOResult] = None
     gdino_history: List[GDINOResult] = field(default_factory=list)
+    latest_task2_results: List[Task2Result] = field(default_factory=list)
+    task2_history: List[Task2Result] = field(default_factory=list)
+    last_task2_batch_id: Optional[str] = None
+    last_task2_summary: Optional[Dict[str, Any]] = None
+    last_task2_cleanup_summary: Optional[Dict[str, Any]] = None
 
     def to_log_dict(self) -> Dict[str, Any]:
         return {
@@ -79,6 +87,10 @@ class SVNAVEpisodeState:
             "semantic_map": self.semantic_map.get_summary(),
             "keyframe_manager": self.keyframe_manager.to_log_dict(),
             "gdino_keyframe_manager": self.gdino_keyframe_manager.to_log_dict(),
+            "target_verifier": self.target_verifier.to_log_dict(),
+            "last_task2_batch_id": self.last_task2_batch_id,
+            "last_task2_summary": self.last_task2_summary,
+            "last_task2_cleanup_summary": self.last_task2_cleanup_summary,
         }
 
 
@@ -478,6 +490,13 @@ class ONAirSV(ONAir):
         state.last_gdino_request_id = request.request_id
 
         gdino_result = self.gdino_client.detect_request(request)
+
+        self._update_task2_from_gdino_result(
+            state=state,
+            gdino_result=gdino_result,
+            step_id=step_id,
+        )
+
         cleanup_summary = state.gdino_keyframe_manager.mark_request_completed(
             request.request_id
         )
@@ -577,6 +596,130 @@ class ONAirSV(ONAir):
                 result.success,
                 self._svnav_debug_fmt(result.latency_ms),
                 result.error,
+            )
+        )
+
+
+    # ------------------------------------------------------------------
+    # Task2 target candidate verification
+    # ------------------------------------------------------------------
+
+    def _update_task2_from_gdino_result(
+        self,
+        state: SVNAVEpisodeState,
+        gdino_result: GDINOResult,
+        step_id: int,
+    ) -> None:
+        """
+        Add filtered/geometrically-completed GDINO candidates into Task2 pending,
+        optionally verify a small batch, and store Task2Result.
+
+        Task2 does not change action, semantic_map, navigation mode, Approach,
+        or Stop. TargetEvidence will consume Task2Result in the next step.
+        """
+        try:
+            update = state.target_verifier.observe_gdino_result(
+                gdino_result=gdino_result,
+                current_step=step_id,
+                target_info=state.target_info,
+                build_batch=True,
+            )
+        except Exception as exc:
+            print(
+                "[SVNavTask2] episode={} step={} update_error={}".format(
+                    state.episode_id,
+                    step_id,
+                    exc,
+                )
+            )
+            return
+
+        batch = update.task2_batch
+        if batch is None:
+            return
+
+        state.last_task2_batch_id = batch.batch_id
+
+        results = state.target_verifier.verify_batch(
+            batch=batch,
+            return_step=step_id,
+        )
+        cleanup = state.target_verifier.mark_batch_completed(batch.batch_id)
+
+        state.latest_task2_results = results
+        state.task2_history.extend(results)
+        if len(state.task2_history) > 80:
+            state.task2_history = state.task2_history[-80:]
+
+        state.last_task2_cleanup_summary = cleanup
+        state.last_task2_summary = self._build_task2_summary(
+            batch=batch,
+            results=results,
+            update=update,
+        )
+
+        self._print_svnav_task2_summary(
+            state=state,
+            batch=batch,
+            results=results,
+            update=update,
+        )
+
+    def _build_task2_summary(self, batch, results, update) -> Dict[str, Any]:
+        counts = {
+            "match": 0,
+            "maybe": 0,
+            "no": 0,
+            "unknown": 0,
+        }
+
+        for result in results:
+            decision = getattr(result.decision, "value", str(result.decision))
+            if decision == "yes":
+                counts["match"] += 1
+            elif decision == "maybe":
+                counts["maybe"] += 1
+            elif decision == "no":
+                counts["no"] += 1
+            else:
+                counts["unknown"] += 1
+
+        return {
+            "batch_id": batch.batch_id,
+            "candidate_ids": batch.candidate_ids,
+            "result_count": len(results),
+            "decision_counts": counts,
+            "accepted_count": len(update.accepted),
+            "rejected_count": len(update.rejected),
+            "pending_count": len(update.accepted),
+        }
+
+    def _print_svnav_task2_summary(self, state, batch, results, update) -> None:
+        parts = []
+        for result in results:
+            decision = getattr(result.decision, "value", str(result.decision))
+            if decision == "yes":
+                decision = "match"
+            parts.append(
+                "{}:{}:{:.2f}".format(
+                    result.candidate_id,
+                    decision,
+                    float(result.confidence),
+                )
+            )
+
+        print(
+            "[SVNavTask2] episode={} step={} batch={} candidates={} results={} "
+            "accepted={} rejected={} pending={} inflight={}".format(
+                state.episode_id,
+                batch.submit_step,
+                batch.batch_id,
+                ",".join(batch.candidate_ids),
+                ";".join(parts),
+                len(update.accepted),
+                len(update.rejected),
+                state.target_verifier.pending_count,
+                state.target_verifier.inflight_count,
             )
         )
 
@@ -763,6 +906,11 @@ class ONAirSV(ONAir):
         )
         gdino_keyframe_manager.reset_episode(episode_id)
 
+        target_verifier = TargetVerifier(
+            config=TargetVerifierConfig.from_env()
+        )
+        target_verifier.reset_episode(episode_id)
+
         navigator = SearchNavigator(
             config=navigator_config or SearchNavigatorConfig()
         )
@@ -774,6 +922,7 @@ class ONAirSV(ONAir):
             semantic_map=semantic_map,
             keyframe_manager=keyframe_manager,
             gdino_keyframe_manager=gdino_keyframe_manager,
+            target_verifier=target_verifier,
             navigator=navigator,
         )
 
@@ -1053,6 +1202,10 @@ class ONAirSV(ONAir):
         lines.append("pending_gdino_keyframes: {}".format(gdino_summary.get("pending_count")))
         lines.append("inflight_gdino: {}".format(gdino_summary.get("inflight_count")))
         lines.append("last_gdino_summary: {}".format(state.last_gdino_summary))
+        task2_summary = state.target_verifier.to_log_dict()
+        lines.append("pending_task2_candidates: {}".format(task2_summary.get("pending_count")))
+        lines.append("inflight_task2: {}".format(task2_summary.get("inflight_count")))
+        lines.append("last_task2_summary: {}".format(state.last_task2_summary))
         lines.append("last_task1_request_id: {}".format(state.last_task1_request_id))
         lines.append("last_task1_update_summary: {}".format(state.last_task1_update_summary))
         lines.append("last_nav_decision: {}".format(state.last_nav_decision))
