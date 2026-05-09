@@ -22,6 +22,7 @@ from svnav.navigator import SearchNavigator, SearchNavigatorConfig
 from svnav.semantic_map import SemanticMap, SemanticMapConfig
 from svnav.task1_reasoner import Task1Reasoner, Task1ReasonerConfig
 from svnav.target_verifier import TargetVerifier, TargetVerifierConfig
+from svnav.target_evidence import TargetEvidenceManager, TargetEvidenceManagerConfig
 from svnav.types import (
     FrameRecord,
     GDINOResult,
@@ -45,6 +46,7 @@ class SVNAVEpisodeState:
     keyframe_manager: Task1KeyframeManager
     gdino_keyframe_manager: GDINOKeyframeManager
     target_verifier: TargetVerifier
+    target_evidence_manager: TargetEvidenceManager
     navigator: SearchNavigator
 
     created_at: float = field(default_factory=now_ts)
@@ -66,6 +68,8 @@ class SVNAVEpisodeState:
     last_task2_batch_id: Optional[str] = None
     last_task2_summary: Optional[Dict[str, Any]] = None
     last_task2_cleanup_summary: Optional[Dict[str, Any]] = None
+    last_target_evidence_summary: Optional[Dict[str, Any]] = None
+    best_target_evidence: Optional[Dict[str, Any]] = None
 
     def to_log_dict(self) -> Dict[str, Any]:
         return {
@@ -88,9 +92,12 @@ class SVNAVEpisodeState:
             "keyframe_manager": self.keyframe_manager.to_log_dict(),
             "gdino_keyframe_manager": self.gdino_keyframe_manager.to_log_dict(),
             "target_verifier": self.target_verifier.to_log_dict(),
+            "target_evidence_manager": self.target_evidence_manager.to_log_dict(),
             "last_task2_batch_id": self.last_task2_batch_id,
             "last_task2_summary": self.last_task2_summary,
             "last_task2_cleanup_summary": self.last_task2_cleanup_summary,
+            "last_target_evidence_summary": self.last_target_evidence_summary,
+            "best_target_evidence": self.best_target_evidence,
         }
 
 
@@ -600,6 +607,80 @@ class ONAirSV(ONAir):
         )
 
 
+
+    # ------------------------------------------------------------------
+    # Target evidence update
+    # ------------------------------------------------------------------
+
+    def _update_target_evidence_from_task2_results(
+        self,
+        state: SVNAVEpisodeState,
+        results: List[Task2Result],
+        step_id: int,
+    ) -> None:
+        """
+        Fuse Task2Result into multi-frame TargetEvidence.
+
+        This method only updates evidence state. It does not change action,
+        semantic_map, navigation mode, Approach state, or Stop decision.
+        """
+        if not results:
+            return
+
+        try:
+            update = state.target_evidence_manager.update_from_task2_results(
+                results=results,
+                current_step=step_id,
+            )
+        except Exception as exc:
+            print(
+                "[SVNavEvidence] episode={} step={} update_error={}".format(
+                    state.episode_id,
+                    step_id,
+                    exc,
+                )
+            )
+            return
+
+        state.last_target_evidence_summary = update.to_log_dict()
+        state.best_target_evidence = (
+            None if update.best_evidence is None else update.best_evidence.to_log_dict()
+        )
+
+        self._print_svnav_evidence_summary(
+            state=state,
+            update=update,
+        )
+
+    def _print_svnav_evidence_summary(self, state, update) -> None:
+        summary = update.summary or {}
+        status_counts = summary.get("status_counts", {}) or {}
+        best = update.best_evidence
+
+        if best is None:
+            best_text = "none"
+        else:
+            best_text = "{}:{}:{:.3f}".format(
+                best.target_id,
+                best.status.value,
+                float(best.metadata.get("evidence_score", 0.0)),
+            )
+
+        print(
+            "[SVNavEvidence] episode={} step={} updated={} tentative={} "
+            "verified={} rejected={} best={} created={} ignored={}".format(
+                state.episode_id,
+                update.step_id,
+                len(update.updated_track_ids),
+                status_counts.get("tentative", 0),
+                status_counts.get("verified", 0),
+                status_counts.get("rejected", 0),
+                best_text,
+                len(update.created_track_ids),
+                len(update.ignored_results),
+            )
+        )
+
     # ------------------------------------------------------------------
     # Task2 target candidate verification
     # ------------------------------------------------------------------
@@ -656,6 +737,12 @@ class ONAirSV(ONAir):
             batch=batch,
             results=results,
             update=update,
+        )
+
+        self._update_target_evidence_from_task2_results(
+            state=state,
+            results=results,
+            step_id=step_id,
         )
 
         self._print_svnav_task2_summary(
@@ -911,6 +998,11 @@ class ONAirSV(ONAir):
         )
         target_verifier.reset_episode(episode_id)
 
+        target_evidence_manager = TargetEvidenceManager(
+            config=TargetEvidenceManagerConfig()
+        )
+        target_evidence_manager.reset_episode(episode_id)
+
         navigator = SearchNavigator(
             config=navigator_config or SearchNavigatorConfig()
         )
@@ -923,6 +1015,7 @@ class ONAirSV(ONAir):
             keyframe_manager=keyframe_manager,
             gdino_keyframe_manager=gdino_keyframe_manager,
             target_verifier=target_verifier,
+            target_evidence_manager=target_evidence_manager,
             navigator=navigator,
         )
 
@@ -1206,6 +1299,9 @@ class ONAirSV(ONAir):
         lines.append("pending_task2_candidates: {}".format(task2_summary.get("pending_count")))
         lines.append("inflight_task2: {}".format(task2_summary.get("inflight_count")))
         lines.append("last_task2_summary: {}".format(state.last_task2_summary))
+        evidence_summary = state.target_evidence_manager.to_log_dict().get("summary", {})
+        lines.append("target_evidence: {}".format(evidence_summary))
+        lines.append("best_target_evidence: {}".format(state.best_target_evidence))
         lines.append("last_task1_request_id: {}".format(state.last_task1_request_id))
         lines.append("last_task1_update_summary: {}".format(state.last_task1_update_summary))
         lines.append("last_nav_decision: {}".format(state.last_nav_decision))
