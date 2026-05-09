@@ -11,12 +11,20 @@ import numpy as np
 from common.param import args
 from model_wrapper.ON_Air_2 import ONAir
 
-from svnav.keyframe_manager import KeyframeManagerConfig, Task1KeyframeManager
+from svnav.gdino_client import GDINOClientConfig, SVNavGDINOClient
+from svnav.keyframe_manager import (
+    GDINOKeyframeManager,
+    GDINOKeyframeManagerConfig,
+    KeyframeManagerConfig,
+    Task1KeyframeManager,
+)
 from svnav.navigator import SearchNavigator, SearchNavigatorConfig
 from svnav.semantic_map import SemanticMap, SemanticMapConfig
 from svnav.task1_reasoner import Task1Reasoner, Task1ReasonerConfig
 from svnav.types import (
     FrameRecord,
+    GDINOResult,
+    NavMode,
     ObservationRecord,
     PoseRecord,
     TargetInfo,
@@ -33,6 +41,7 @@ class SVNAVEpisodeState:
     target_info: TargetInfo
     semantic_map: SemanticMap
     keyframe_manager: Task1KeyframeManager
+    gdino_keyframe_manager: GDINOKeyframeManager
     navigator: SearchNavigator
 
     created_at: float = field(default_factory=now_ts)
@@ -43,6 +52,12 @@ class SVNAVEpisodeState:
     last_task1_update_summary: Optional[Dict[str, Any]] = None
     last_task1_cleanup_summary: Optional[Dict[str, Any]] = None
     last_nav_decision: Optional[Dict[str, Any]] = None
+    last_gdino_request_id: Optional[str] = None
+    last_gdino_result_id: Optional[str] = None
+    last_gdino_summary: Optional[Dict[str, Any]] = None
+    last_gdino_cleanup_summary: Optional[Dict[str, Any]] = None
+    latest_gdino_result: Optional[GDINOResult] = None
+    gdino_history: List[GDINOResult] = field(default_factory=list)
 
     def to_log_dict(self) -> Dict[str, Any]:
         return {
@@ -57,8 +72,13 @@ class SVNAVEpisodeState:
             "last_task1_update_summary": self.last_task1_update_summary,
             "last_task1_cleanup_summary": self.last_task1_cleanup_summary,
             "last_nav_decision": self.last_nav_decision,
+            "last_gdino_request_id": self.last_gdino_request_id,
+            "last_gdino_result_id": self.last_gdino_result_id,
+            "last_gdino_summary": self.last_gdino_summary,
+            "last_gdino_cleanup_summary": self.last_gdino_cleanup_summary,
             "semantic_map": self.semantic_map.get_summary(),
             "keyframe_manager": self.keyframe_manager.to_log_dict(),
+            "gdino_keyframe_manager": self.gdino_keyframe_manager.to_log_dict(),
         }
 
 
@@ -92,6 +112,7 @@ class ONAirSV(ONAir):
                 retry_sleep=0.5,
             )
         )
+        self.gdino_client = SVNavGDINOClient(GDINOClientConfig.from_env())
 
     # ------------------------------------------------------------------
     # Main eval interface
@@ -222,6 +243,13 @@ class ONAirSV(ONAir):
                 )
 
                 state.last_nav_decision = decision.to_log_dict()
+
+                self._update_gdino_from_observation(
+                    state=state,
+                    observation=observation,
+                    step_id=step_id,
+                    nav_decision=decision,
+                )
 
                 action = decision.action or "rotl"
                 step_size = decision.step_size
@@ -404,6 +432,140 @@ class ONAirSV(ONAir):
         return str(value)
 
 
+
+    # ------------------------------------------------------------------
+    # GDINO Search keyframe update
+    # ------------------------------------------------------------------
+
+    def _update_gdino_from_observation(
+        self,
+        state: SVNAVEpisodeState,
+        observation: ObservationRecord,
+        step_id: int,
+        nav_decision: Any,
+    ) -> None:
+        """
+        Search-stage GDINO keyframe selection and candidate generation.
+
+        This method intentionally does not change semantic_map, navigation
+        action, mode, Approach state, or Stop decision. It only asks the
+        GDINOKeyframeManager whether any admitted keyframe should be consumed,
+        calls the GDINO client when a request is built, and stores the result.
+        """
+        try:
+            update = state.gdino_keyframe_manager.observe(
+                observation=observation,
+                semantic_map=state.semantic_map,
+                nav_mode=NavMode.SEARCH,
+                nav_decision=nav_decision,
+                build_request=True,
+                gdino_enabled=self.gdino_client.enabled,
+            )
+        except Exception as exc:
+            print(
+                "[SVNavGDINO] episode={} step={} keyframe_update_error={}".format(
+                    state.episode_id,
+                    step_id,
+                    exc,
+                )
+            )
+            return
+
+        request = update.gdino_request
+        if request is None:
+            return
+
+        state.last_gdino_request_id = request.request_id
+
+        gdino_result = self.gdino_client.detect_request(request)
+        cleanup_summary = state.gdino_keyframe_manager.mark_request_completed(
+            request.request_id
+        )
+
+        state.latest_gdino_result = gdino_result
+        state.gdino_history.append(gdino_result)
+        if len(state.gdino_history) > 50:
+            state.gdino_history = state.gdino_history[-50:]
+
+        state.last_gdino_result_id = gdino_result.request_id
+        state.last_gdino_cleanup_summary = cleanup_summary
+        state.last_gdino_summary = self._build_gdino_summary(
+            request=request,
+            result=gdino_result,
+            update=update,
+        )
+
+        self._print_svnav_gdino_summary(
+            state=state,
+            request=request,
+            result=gdino_result,
+            update=update,
+        )
+
+    def _build_gdino_summary(self, request, result, update) -> Dict[str, Any]:
+        candidates = result.candidates or []
+        best_score = 0.0
+        best_label = ""
+        if candidates:
+            best = max(candidates, key=lambda item: float(item.score))
+            best_score = float(best.score)
+            best_label = best.label
+
+        return {
+            "request_id": request.request_id,
+            "success": bool(result.success),
+            "candidate_count": len(candidates),
+            "best_score": best_score,
+            "best_label": best_label,
+            "latency_ms": result.latency_ms,
+            "frame_ids": request.frame_ids,
+            "view_ids": request.view_ids,
+            "accepted_count": len(update.accepted),
+            "rejected_count": len(update.rejected),
+            "pending_count": update.gdino_request.metadata.get("pending_count")
+            if update.gdino_request is not None
+            else None,
+            "error": result.error,
+        }
+
+    def _print_svnav_gdino_summary(self, state, request, result, update) -> None:
+        candidates = result.candidates or []
+        best_score = 0.0
+        best_label = ""
+        if candidates:
+            best = max(candidates, key=lambda item: float(item.score))
+            best_score = float(best.score)
+            best_label = best.label
+
+        metadata = request.metadata or {}
+        keyframe_ids = metadata.get("gdino_keyframe_ids", [])
+        reasons = metadata.get("keyframe_reasons", {})
+        scores = metadata.get("admission_scores", {})
+
+        keyframe_id = keyframe_ids[0] if keyframe_ids else ""
+        reason = reasons.get(keyframe_id, "")
+        admission_score = scores.get(keyframe_id, None)
+
+        print(
+            "[SVNavGDINO] episode={} step={} request={} views={} "
+            "keyframe={} reason={} admission={} candidates={} best={:.3f} "
+            "label={} success={} latency_ms={} error={}".format(
+                state.episode_id,
+                request.submit_step,
+                request.request_id,
+                ",".join(request.view_ids),
+                keyframe_id,
+                reason,
+                self._svnav_debug_fmt(admission_score),
+                len(candidates),
+                best_score,
+                self._svnav_debug_shorten(best_label, limit=80),
+                result.success,
+                self._svnav_debug_fmt(result.latency_ms),
+                result.error,
+            )
+        )
+
     # ------------------------------------------------------------------
     # SVNav step update
     # ------------------------------------------------------------------
@@ -582,6 +744,11 @@ class ONAirSV(ONAir):
         )
         keyframe_manager.reset_episode(episode_id)
 
+        gdino_keyframe_manager = GDINOKeyframeManager(
+            config=GDINOKeyframeManagerConfig()
+        )
+        gdino_keyframe_manager.reset_episode(episode_id)
+
         navigator = SearchNavigator(
             config=navigator_config or SearchNavigatorConfig()
         )
@@ -592,6 +759,7 @@ class ONAirSV(ONAir):
             target_info=target,
             semantic_map=semantic_map,
             keyframe_manager=keyframe_manager,
+            gdino_keyframe_manager=gdino_keyframe_manager,
             navigator=navigator,
         )
 
@@ -867,6 +1035,10 @@ class ONAirSV(ONAir):
         lines.append("top_high_value_cells: {}".format(map_summary.get("top_high_value_cells")))
         lines.append("pending_keyframes: {}".format(manager_summary.get("pending_count")))
         lines.append("inflight_task1: {}".format(manager_summary.get("inflight_count")))
+        gdino_summary = state.gdino_keyframe_manager.to_log_dict()
+        lines.append("pending_gdino_keyframes: {}".format(gdino_summary.get("pending_count")))
+        lines.append("inflight_gdino: {}".format(gdino_summary.get("inflight_count")))
+        lines.append("last_gdino_summary: {}".format(state.last_gdino_summary))
         lines.append("last_task1_request_id: {}".format(state.last_task1_request_id))
         lines.append("last_task1_update_summary: {}".format(state.last_task1_update_summary))
         lines.append("last_nav_decision: {}".format(state.last_nav_decision))

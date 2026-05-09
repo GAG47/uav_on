@@ -611,6 +611,71 @@ class Task1Result:
         }
 
 
+
+@dataclass
+class GDINORequest:
+    """
+    Request built from selected SVNav GDINO keyframes.
+
+    A GDINORequest is not a target confirmation request. It only asks the
+    GroundingDINO server to produce open-vocabulary detection candidates for
+    selected FrameRecord images.
+
+    Every request keeps the source frames and metadata snapshot so asynchronous
+    GDINO results can be safely traced back to the original step, pose, view,
+    semantic context, and navigation context.
+    """
+
+    request_id: str
+    episode_id: str
+    submit_step: int
+    target_info: TargetInfo
+    frames: List[FrameRecord]
+    prompt: Optional[str] = None
+    created_at: float = field(default_factory=now_ts)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @staticmethod
+    def create(
+        episode_id: str,
+        submit_step: int,
+        target_info: TargetInfo,
+        frames: List[FrameRecord],
+        prompt: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "GDINORequest":
+        return GDINORequest(
+            request_id=new_id("gdino"),
+            episode_id=str(episode_id),
+            submit_step=int(submit_step),
+            target_info=target_info,
+            frames=list(frames or []),
+            prompt=prompt,
+            metadata=metadata or {},
+        )
+
+    @property
+    def frame_ids(self) -> List[str]:
+        return [frame.frame_id for frame in self.frames]
+
+    @property
+    def view_ids(self) -> List[str]:
+        return [frame.view_id.value for frame in self.frames]
+
+    def to_log_dict(self) -> Dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "episode_id": self.episode_id,
+            "submit_step": int(self.submit_step),
+            "target_info": self.target_info.to_log_dict(),
+            "frame_ids": self.frame_ids,
+            "view_ids": self.view_ids,
+            "prompt": self.prompt,
+            "frames": [frame.to_log_dict() for frame in self.frames],
+            "created_at": float(self.created_at),
+            "metadata": _json_safe(self.metadata),
+        }
+
 @dataclass
 class GDINOCandidate:
     """
