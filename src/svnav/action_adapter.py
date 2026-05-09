@@ -159,9 +159,9 @@ class ActionAdapter:
                 )
 
             action = (
-                self.config.rotate_left_action
+                self.config.rotate_right_action
                 if observe_yaw_error_deg > 0.0
-                else self.config.rotate_right_action
+                else self.config.rotate_left_action
             )
             step_size = self._rotation_step(abs(observe_yaw_error_deg))
             debug["adapter_phase"] = "align_view"
@@ -182,9 +182,9 @@ class ActionAdapter:
 
         if abs(yaw_to_waypoint_deg) > self.config.move_yaw_tolerance_deg:
             action = (
-                self.config.rotate_left_action
+                self.config.rotate_right_action
                 if yaw_to_waypoint_deg > 0.0
-                else self.config.rotate_right_action
+                else self.config.rotate_left_action
             )
             step_size = self._rotation_step(abs(yaw_to_waypoint_deg))
             debug["adapter_phase"] = "turn_to_waypoint"
