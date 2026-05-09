@@ -622,12 +622,30 @@ class TargetVerifier:
         )
 
     def _candidate_snapshot(self, candidate: GDINOCandidate) -> Dict[str, Any]:
+        frame = getattr(candidate, "frame", None)
+        pose = getattr(frame, "pose", None) if frame is not None else None
+
+        source_pose = {}
+        if pose is not None:
+            source_pose = {
+                "x": float(getattr(pose, "x", 0.0)),
+                "y": float(getattr(pose, "y", 0.0)),
+                "z": float(getattr(pose, "z", 0.0)),
+                "yaw": float(getattr(pose, "yaw", 0.0)),
+            }
+
+        frame_step_id = getattr(frame, "step_id", None) if frame is not None else None
+        frame_view_id = getattr(frame, "view_id", None) if frame is not None else None
+
         return {
             "candidate_id": candidate.candidate_id,
             "episode_id": candidate.episode_id,
             "step_id": int(candidate.step_id),
             "view_id": candidate.view_id.value,
             "frame_id": candidate.frame_id,
+            "frame_step_id": frame_step_id,
+            "frame_view_id": None if frame_view_id is None else getattr(frame_view_id, "value", str(frame_view_id)),
+            "source_pose": source_pose,
             "bbox": candidate.bbox.to_log_dict(),
             "label": candidate.label,
             "score": float(candidate.score),
@@ -637,6 +655,7 @@ class TargetVerifier:
             "depth_valid": bool(candidate.depth_valid),
             "geometry": (candidate.metadata or {}).get("geometry", {}),
         }
+
 
     # ------------------------------------------------------------------
     # VLM call and parsing

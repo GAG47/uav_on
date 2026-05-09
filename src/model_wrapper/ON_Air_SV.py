@@ -254,11 +254,11 @@ class ONAirSV(ONAir):
                 episode_id = item["episode_id"]
                 step_id = item["step_id"]
 
-                decision = state.navigator.decide_search(
+                decision = self._select_svnav_navigation_decision(
+                    state=state,
                     episode_id=episode_id,
                     step_id=step_id,
                     observation=observation,
-                    semantic_map=state.semantic_map,
                 )
 
                 state.last_nav_decision = decision.to_log_dict()
@@ -279,7 +279,10 @@ class ONAirSV(ONAir):
                 steps_size.append(float(step_size))
                 predict_dones.append(False)
 
-                self._print_svnav_search_debug(decision)
+                if decision.mode in (NavMode.APPROACH, NavMode.FINAL_CHECK):
+                    self._print_svnav_approach_debug(decision)
+                else:
+                    self._print_svnav_search_debug(decision)
 
             except Exception as exc:
                 actions.append("rotl")
@@ -288,6 +291,102 @@ class ONAirSV(ONAir):
                 print("[SVNavSearch] run error: {}".format(exc))
 
         return actions, steps_size, predict_dones
+
+
+
+    # ------------------------------------------------------------------
+    # Search / Approach mode selection
+    # ------------------------------------------------------------------
+
+    def _select_svnav_navigation_decision(
+        self,
+        state: SVNAVEpisodeState,
+        episode_id: str,
+        step_id: int,
+        observation: ObservationRecord,
+    ):
+        """
+        Select Search or Approach.
+
+        Step 14 now uses TargetEvidenceManager.get_best_approach_candidate().
+        This means stable visual evidence can trigger Approach even when depth
+        has not produced a reliable 3D target position.
+
+        One-time GDINO detections and weak tentative evidence are still not used
+        directly; TargetEvidenceManager decides approach readiness.
+        """
+        approach_candidate = None
+
+        evidence_manager = getattr(state, "target_evidence_manager", None)
+        if evidence_manager is not None:
+            if hasattr(evidence_manager, "get_best_approach_candidate"):
+                approach_candidate = evidence_manager.get_best_approach_candidate()
+            else:
+                approach_candidate = evidence_manager.get_best_evidence(
+                    allow_tentative=False
+                )
+
+        if approach_candidate is not None:
+            return state.navigator.build_approach_decision(
+                episode_id=episode_id,
+                step_id=step_id,
+                observation=observation,
+                target_evidence=approach_candidate,
+            )
+
+        return state.navigator.decide_search(
+            episode_id=episode_id,
+            step_id=step_id,
+            observation=observation,
+            semantic_map=state.semantic_map,
+        )
+
+    def _print_svnav_approach_debug(self, decision) -> None:
+        debug = decision.debug_info or {}
+        action_source = getattr(decision.action_source, "value", decision.action_source)
+
+        print(
+            "[SVNavApproach] episode={} step={} mode={} target={} action={} "
+            "step_size={} source={} phase={} reason={}".format(
+                decision.episode_id,
+                decision.step_id,
+                decision.mode.value,
+                decision.target_id,
+                decision.action,
+                decision.step_size,
+                action_source,
+                debug.get("adapter_phase"),
+                decision.reason,
+            )
+        )
+
+        print(
+            "[SVNavApproachDebug] kind={} target_pos={} approach_vp={} "
+            "target_dist={} dist_to_vp={} yaw_to_vp={} observe_yaw_err={} "
+            "final_check_dist={}".format(
+                debug.get("approach_kind"),
+                self._svnav_debug_fmt(debug.get("target_position")),
+                self._svnav_debug_fmt(debug.get("approach_viewpoint")),
+                self._svnav_debug_fmt(debug.get("target_distance")),
+                self._svnav_debug_fmt(debug.get("dist_to_approach_viewpoint")),
+                self._svnav_debug_fmt(debug.get("yaw_to_viewpoint_deg")),
+                self._svnav_debug_fmt(debug.get("observe_yaw_error_deg")),
+                self._svnav_debug_fmt(debug.get("final_check_distance")),
+            )
+        )
+
+        print(
+            "[SVNavApproachDebug] approach_score={} visual_score={} evidence_kind={} "
+            "pos_conf={} pos_stability={} latest_view={} bbox_center={}".format(
+                self._svnav_debug_fmt(debug.get("approach_score")),
+                self._svnav_debug_fmt(debug.get("visual_score")),
+                debug.get("evidence_kind"),
+                self._svnav_debug_fmt(debug.get("position_confidence")),
+                self._svnav_debug_fmt(debug.get("position_stability")),
+                debug.get("latest_view_id"),
+                self._svnav_debug_fmt(debug.get("latest_bbox_center_norm")),
+            )
+        )
 
 
     def _print_svnav_search_debug(self, decision) -> None:
@@ -475,7 +574,7 @@ class ONAirSV(ONAir):
             update = state.gdino_keyframe_manager.observe(
                 observation=observation,
                 semantic_map=state.semantic_map,
-                nav_mode=NavMode.SEARCH,
+                nav_mode=getattr(nav_decision, "mode", NavMode.SEARCH),
                 nav_decision=nav_decision,
                 build_request=True,
                 gdino_enabled=self.gdino_client.enabled,
@@ -668,14 +767,19 @@ class ONAirSV(ONAir):
 
         print(
             "[SVNavEvidence] episode={} step={} updated={} tentative={} "
-            "verified={} rejected={} best={} created={} ignored={}".format(
+            "verified={} rejected={} approach_ready={} visual={} spatial={} "
+            "best={} approach_best={} created={} ignored={}".format(
                 state.episode_id,
                 update.step_id,
                 len(update.updated_track_ids),
                 status_counts.get("tentative", 0),
                 status_counts.get("verified", 0),
                 status_counts.get("rejected", 0),
+                summary.get("approach_ready_count", 0),
+                summary.get("visual_count", 0),
+                summary.get("spatial_count", 0),
                 best_text,
+                summary.get("best_approach_candidate_id"),
                 len(update.created_track_ids),
                 len(update.ignored_results),
             )
