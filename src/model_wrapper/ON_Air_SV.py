@@ -628,7 +628,7 @@ class ONAirSV(ONAir):
             size=None if size is None else str(size),
             description=None if description is None else str(description),
             instruction=None if instruction is None else str(instruction),
-            search_radius=float(source.get("search_radius", 50.0)),
+            search_radius=float(source.get("search_radius", 100.0)),
             success_threshold=float(source.get("success_threshold", 20.0)),
         )
 
