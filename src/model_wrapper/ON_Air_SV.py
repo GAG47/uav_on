@@ -298,6 +298,274 @@ class ONAirSV(ONAir):
     # Search / Approach mode selection
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # SVNav Step15 approach session helpers
+    # ------------------------------------------------------------------
+
+    def _svnav_get_active_approach_candidate(
+        self,
+        state,
+        evidence_manager,
+        step_id,
+    ):
+        active_target_id = getattr(state, "active_approach_target_id", None)
+        if not active_target_id:
+            return None
+
+        if evidence_manager is None or not hasattr(evidence_manager, "get_evidence_by_id"):
+            setattr(state, "active_approach_target_id", None)
+            return None
+
+        evidence = evidence_manager.get_evidence_by_id(active_target_id)
+        if evidence is None:
+            setattr(state, "active_approach_target_id", None)
+            return None
+
+        metadata = getattr(evidence, "metadata", {}) or {}
+        status = getattr(getattr(evidence, "status", None), "value", str(getattr(evidence, "status", "")))
+
+        if status in ("rejected", "lost"):
+            setattr(state, "active_approach_target_id", None)
+            return None
+
+        if metadata.get("task2_admission") != "passed":
+            setattr(state, "active_approach_target_id", None)
+            return None
+
+        blocked_until = metadata.get("approach_blocked_until_step")
+        if blocked_until is not None:
+            try:
+                if int(step_id) < int(blocked_until):
+                    setattr(state, "active_approach_target_id", None)
+                    return None
+            except Exception:
+                pass
+
+        return evidence
+
+    def _svnav_select_new_approach_candidate(
+        self,
+        state,
+        evidence_manager,
+        step_id,
+    ):
+        if evidence_manager is None:
+            return None
+
+        if not hasattr(evidence_manager, "get_best_approach_candidate"):
+            return None
+
+        candidate = evidence_manager.get_best_approach_candidate(current_step=step_id)
+        if candidate is None:
+            return None
+
+        setattr(state, "active_approach_target_id", candidate.target_id)
+
+        if hasattr(evidence_manager, "mark_approach_attempt"):
+            evidence_manager.mark_approach_attempt(
+                target_id=candidate.target_id,
+                step_id=step_id,
+                reason="selected_as_active_approach_target",
+            )
+
+        setattr(
+            state,
+            "svnav_approach_session",
+            {
+                "target_id": candidate.target_id,
+                "start_step": int(step_id),
+                "last_distance_to_anchor": None,
+                "last_action": None,
+                "no_progress_count": 0,
+                "rotate_loop_count": 0,
+                "last_feedback_decision": "start",
+            },
+        )
+
+        return candidate
+
+    def _svnav_update_approach_feedback(
+        self,
+        state,
+        evidence_manager,
+        target_evidence,
+        decision,
+        step_id,
+    ):
+        if evidence_manager is None or target_evidence is None:
+            return None
+
+        if not hasattr(evidence_manager, "apply_approach_feedback"):
+            return None
+
+        try:
+            from svnav.target_evidence import ApproachFeedback
+        except Exception:
+            return None
+
+        metadata = getattr(target_evidence, "metadata", {}) or {}
+        debug = getattr(decision, "debug_info", {}) or {}
+
+        target_id = getattr(target_evidence, "target_id", None)
+        if not target_id:
+            return None
+
+        session = getattr(state, "svnav_approach_session", None)
+        if not isinstance(session, dict) or session.get("target_id") != target_id:
+            session = {
+                "target_id": target_id,
+                "start_step": int(step_id),
+                "last_distance_to_anchor": None,
+                "last_action": None,
+                "no_progress_count": 0,
+                "rotate_loop_count": 0,
+                "last_feedback_decision": "reset",
+            }
+
+        current_distance = debug.get("dist_to_approach_viewpoint")
+        try:
+            current_distance = None if current_distance is None else float(current_distance)
+        except Exception:
+            current_distance = None
+
+        previous_distance = session.get("last_distance_to_anchor")
+        try:
+            previous_distance = None if previous_distance is None else float(previous_distance)
+        except Exception:
+            previous_distance = None
+
+        distance_progress = None
+        if previous_distance is not None and current_distance is not None:
+            distance_progress = previous_distance - current_distance
+
+        action = getattr(decision, "action", "") or ""
+        mode = getattr(getattr(decision, "mode", None), "value", str(getattr(decision, "mode", "")))
+        phase = debug.get("adapter_phase") or debug.get("phase") or ""
+
+        last_action = session.get("last_action")
+        no_progress_count = int(session.get("no_progress_count", 0))
+        rotate_loop_count = int(session.get("rotate_loop_count", 0))
+
+        # Progress is evaluated conservatively. Small numerical changes are not progress.
+        if distance_progress is not None and distance_progress > 0.50:
+            no_progress_count = 0
+        else:
+            # Rotation-only steps near the same anchor count as no progress.
+            if action in ("rotl", "rotr") or current_distance is not None:
+                no_progress_count += 1
+
+        if action in ("rotl", "rotr") and last_action in ("rotl", "rotr"):
+            # Alternating rotl/rotr or long rotation near anchor both indicate an
+            # approach attempt that is not producing useful new evidence.
+            rotate_loop_count += 1
+        elif action in ("rotl", "rotr") and "final_check" in str(phase):
+            rotate_loop_count += 1
+        else:
+            rotate_loop_count = 0
+
+        last_positive_step = metadata.get("last_positive_step")
+        if last_positive_step is None:
+            last_positive_step = getattr(target_evidence, "last_verified_step", None)
+
+        support_age = None
+        try:
+            if last_positive_step is not None:
+                support_age = int(step_id) - int(last_positive_step)
+        except Exception:
+            support_age = None
+
+        start_step = int(session.get("start_step", int(step_id)))
+        steps_since_attempt = int(step_id) - start_step
+
+        anchor_type = debug.get("anchor_type") or metadata.get("anchor_type") or metadata.get("evidence_kind") or ""
+        anchor_unreliable = False
+
+        # Do not reject spatial anchors merely because 3D is noisy. Demote only
+        # when the approach attempt itself becomes unproductive.
+        if anchor_type == "spatial":
+            pos_conf = getattr(target_evidence, "position_confidence", 0.0)
+            pos_stability = getattr(target_evidence, "position_stability", 0.0)
+            try:
+                if float(pos_conf) <= 0.05 and float(pos_stability) <= 0.05:
+                    anchor_unreliable = True
+            except Exception:
+                pass
+
+        feedback = ApproachFeedback(
+            target_id=target_id,
+            episode_id=getattr(target_evidence, "episode_id", getattr(state, "episode_id", "")),
+            step_id=int(step_id),
+            action=action,
+            mode=mode,
+            phase=str(phase),
+            distance_to_anchor=current_distance,
+            previous_distance_to_anchor=previous_distance,
+            distance_progress=distance_progress,
+            support_age_steps=support_age,
+            steps_since_attempt=steps_since_attempt,
+            no_progress_count=no_progress_count,
+            rotate_loop_count=rotate_loop_count,
+            negative_count=int(getattr(target_evidence, "negative_count", 0)),
+            positive_count=int(getattr(target_evidence, "positive_count", 0)),
+            maybe_count=int(getattr(target_evidence, "maybe_count", 0)),
+            anchor_type=str(anchor_type),
+            anchor_unreliable=anchor_unreliable,
+            reason="approach_step_feedback",
+            metadata={
+                "approach_score": metadata.get("approach_score"),
+                "task2_score": metadata.get("task2_score"),
+                "visual_score": metadata.get("visual_score"),
+                "latest_view_id": metadata.get("latest_view_id"),
+                "latest_bbox_center_norm": metadata.get("latest_bbox_center_norm"),
+            },
+        )
+
+        result = evidence_manager.apply_approach_feedback(
+            target_id=target_id,
+            feedback=feedback,
+        )
+
+        session["last_distance_to_anchor"] = current_distance
+        session["last_action"] = action
+        session["no_progress_count"] = no_progress_count
+        session["rotate_loop_count"] = rotate_loop_count
+        session["last_feedback_decision"] = getattr(result, "decision", None)
+        setattr(state, "svnav_approach_session", session)
+
+        decision_text = getattr(result, "decision", "unknown")
+        reason_text = getattr(result, "reason", "")
+        if decision_text != "keep" or no_progress_count >= 3 or rotate_loop_count >= 3:
+            print(
+                "[SVNavApproachFeedback] episode={} step={} target={} decision={} "
+                "reason={} action={} mode={} phase={} dist={} progress={} "
+                "support_age={} no_progress={} rotate_loop={}".format(
+                    getattr(state, "episode_id", ""),
+                    step_id,
+                    target_id,
+                    decision_text,
+                    reason_text,
+                    action,
+                    mode,
+                    phase,
+                    self._svnav_debug_fmt(current_distance) if hasattr(self, "_svnav_debug_fmt") else current_distance,
+                    self._svnav_debug_fmt(distance_progress) if hasattr(self, "_svnav_debug_fmt") else distance_progress,
+                    support_age,
+                    no_progress_count,
+                    rotate_loop_count,
+                )
+            )
+
+        if decision_text in ("demote", "reject", "missing"):
+            setattr(state, "active_approach_target_id", None)
+            session["target_id"] = None
+            setattr(state, "svnav_approach_session", session)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # End SVNav Step15 approach session helpers
+    # ------------------------------------------------------------------
+
     def _select_svnav_navigation_decision(
         self,
         state: SVNAVEpisodeState,
@@ -306,33 +574,56 @@ class ONAirSV(ONAir):
         observation: ObservationRecord,
     ):
         """
-        Select Search or Approach.
+        Step 15 selection policy.
 
-        Step 14 now uses TargetEvidenceManager.get_best_approach_candidate().
-        This means stable visual evidence can trigger Approach even when depth
-        has not produced a reliable 3D target position.
-
-        One-time GDINO detections and weak tentative evidence are still not used
-        directly; TargetEvidenceManager decides approach readiness.
+        The active approach target is sticky:
+            - A new candidate cannot directly steal control.
+            - The active target is kept until approach feedback demotes/rejects it.
+            - After demotion, this step returns Search. A new candidate can be
+              selected in a later step through the normal evidence pool.
         """
-        approach_candidate = None
-
         evidence_manager = getattr(state, "target_evidence_manager", None)
-        if evidence_manager is not None:
-            if hasattr(evidence_manager, "get_best_approach_candidate"):
-                approach_candidate = evidence_manager.get_best_approach_candidate()
-            else:
-                approach_candidate = evidence_manager.get_best_evidence(
-                    allow_tentative=False
-                )
+
+        approach_candidate = self._svnav_get_active_approach_candidate(
+            state=state,
+            evidence_manager=evidence_manager,
+            step_id=step_id,
+        )
+
+        if approach_candidate is None:
+            approach_candidate = self._svnav_select_new_approach_candidate(
+                state=state,
+                evidence_manager=evidence_manager,
+                step_id=step_id,
+            )
 
         if approach_candidate is not None:
-            return state.navigator.build_approach_decision(
+            decision = state.navigator.build_approach_decision(
                 episode_id=episode_id,
                 step_id=step_id,
                 observation=observation,
                 target_evidence=approach_candidate,
             )
+
+            feedback_result = self._svnav_update_approach_feedback(
+                state=state,
+                evidence_manager=evidence_manager,
+                target_evidence=approach_candidate,
+                decision=decision,
+                step_id=step_id,
+            )
+
+            # If feedback says this approach attempt failed, return to Search
+            # immediately instead of executing one more stale approach action.
+            if feedback_result is not None and getattr(feedback_result, "decision", None) in ("demote", "reject", "missing"):
+                return state.navigator.decide_search(
+                    episode_id=episode_id,
+                    step_id=step_id,
+                    observation=observation,
+                    semantic_map=state.semantic_map,
+                )
+
+            return decision
 
         return state.navigator.decide_search(
             episode_id=episode_id,

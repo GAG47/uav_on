@@ -194,6 +194,16 @@ class TargetEvidenceManagerConfig:
 
     position_history_size: int = 6
 
+    # Step 15: Approach rollback / failure feedback.
+    # These fields do not create new navigation states. They only decide when a
+    # currently active approach target should be demoted so that Search can resume.
+    approach_feedback_cooldown_steps: int = 8
+    approach_no_progress_limit: int = 6
+    approach_rotate_loop_limit: int = 8
+    approach_support_timeout_steps: int = 14
+    approach_max_steps_without_support: int = 18
+    approach_negative_reject_margin: int = 2
+
     def __post_init__(self) -> None:
         self.max_tracks = max(1, int(self.max_tracks))
         self.visual_match_pose_distance = float(self.visual_match_pose_distance)
@@ -209,6 +219,12 @@ class TargetEvidenceManagerConfig:
         self.recent_bonus_weight = float(self.recent_bonus_weight)
         self.bbox_bonus_weight = float(self.bbox_bonus_weight)
         self.position_history_size = max(1, int(self.position_history_size))
+        self.approach_feedback_cooldown_steps = max(1, int(self.approach_feedback_cooldown_steps))
+        self.approach_no_progress_limit = max(1, int(self.approach_no_progress_limit))
+        self.approach_rotate_loop_limit = max(1, int(self.approach_rotate_loop_limit))
+        self.approach_support_timeout_steps = max(1, int(self.approach_support_timeout_steps))
+        self.approach_max_steps_without_support = max(1, int(self.approach_max_steps_without_support))
+        self.approach_negative_reject_margin = max(1, int(self.approach_negative_reject_margin))
 
 
 @dataclass
@@ -376,6 +392,94 @@ class TargetEvidenceUpdate:
             "best_evidence": None if self.best_evidence is None else self.best_evidence.to_log_dict(),
             "best_approach_candidate": None if self.best_approach_candidate is None else self.best_approach_candidate.to_log_dict(),
             "summary": dict(self.summary),
+        }
+
+
+
+
+@dataclass
+class ApproachFeedback:
+    """
+    Feedback generated while a candidate is being approached.
+
+    This is not a navigation state. It is only evidence feedback:
+        keep   -> continue approaching the active target
+        demote -> active approach attempt failed; return to Search
+        reject -> strong negative evidence; do not approach this target again
+    """
+
+    target_id: str
+    episode_id: str
+    step_id: int
+
+    action: str = ""
+    mode: str = ""
+    phase: str = ""
+
+    distance_to_anchor: Optional[float] = None
+    previous_distance_to_anchor: Optional[float] = None
+    distance_progress: Optional[float] = None
+
+    support_age_steps: Optional[int] = None
+    steps_since_attempt: int = 0
+
+    no_progress_count: int = 0
+    rotate_loop_count: int = 0
+
+    negative_count: int = 0
+    positive_count: int = 0
+    maybe_count: int = 0
+
+    anchor_type: str = ""
+    anchor_unreliable: bool = False
+
+    reason: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_log_dict(self) -> Dict[str, Any]:
+        return {
+            "target_id": self.target_id,
+            "episode_id": self.episode_id,
+            "step_id": int(self.step_id),
+            "action": self.action,
+            "mode": self.mode,
+            "phase": self.phase,
+            "distance_to_anchor": self.distance_to_anchor,
+            "previous_distance_to_anchor": self.previous_distance_to_anchor,
+            "distance_progress": self.distance_progress,
+            "support_age_steps": self.support_age_steps,
+            "steps_since_attempt": int(self.steps_since_attempt),
+            "no_progress_count": int(self.no_progress_count),
+            "rotate_loop_count": int(self.rotate_loop_count),
+            "negative_count": int(self.negative_count),
+            "positive_count": int(self.positive_count),
+            "maybe_count": int(self.maybe_count),
+            "anchor_type": self.anchor_type,
+            "anchor_unreliable": bool(self.anchor_unreliable),
+            "reason": self.reason,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass
+class ApproachFeedbackResult:
+    target_id: str
+    episode_id: str
+    step_id: int
+    decision: str
+    reason: str
+    blocked_until_step: Optional[int] = None
+    feedback: Optional[ApproachFeedback] = None
+
+    def to_log_dict(self) -> Dict[str, Any]:
+        return {
+            "target_id": self.target_id,
+            "episode_id": self.episode_id,
+            "step_id": int(self.step_id),
+            "decision": self.decision,
+            "reason": self.reason,
+            "blocked_until_step": self.blocked_until_step,
+            "feedback": None if self.feedback is None else self.feedback.to_log_dict(),
         }
 
 
@@ -964,19 +1068,267 @@ class TargetEvidenceManager:
         self._write_admission_metadata(track)
 
     # ------------------------------------------------------------------
+    # Step 15: Approach feedback / rollback
+    # ------------------------------------------------------------------
+
+    def get_track_by_id(self, target_id: str) -> Optional[EvidenceTrack]:
+        return self.tracks.get(str(target_id))
+
+    def get_evidence_by_id(self, target_id: str) -> Optional[TargetEvidence]:
+        track = self.get_track_by_id(str(target_id))
+        if track is None:
+            return None
+        self._write_admission_metadata(track)
+        return track.evidence
+
+    def mark_approach_attempt(
+        self,
+        target_id: str,
+        step_id: int,
+        reason: str = "selected_for_approach",
+    ) -> Dict[str, Any]:
+        track = self.get_track_by_id(str(target_id))
+        if track is None:
+            return {
+                "target_id": target_id,
+                "step_id": int(step_id),
+                "updated": False,
+                "reason": "missing_target",
+            }
+
+        meta = track.evidence.metadata
+        meta["active_approach"] = True
+        meta["last_approach_attempt_step"] = int(step_id)
+        meta["approach_attempt_count"] = int(meta.get("approach_attempt_count", 0)) + 1
+        meta["last_approach_attempt_reason"] = reason
+
+        self._write_admission_metadata(track)
+
+        return {
+            "target_id": target_id,
+            "step_id": int(step_id),
+            "updated": True,
+            "reason": reason,
+            "approach_attempt_count": meta.get("approach_attempt_count", 0),
+        }
+
+    def apply_approach_feedback(
+        self,
+        target_id: str,
+        feedback: ApproachFeedback,
+    ) -> ApproachFeedbackResult:
+        track = self.get_track_by_id(str(target_id))
+        if track is None:
+            return ApproachFeedbackResult(
+                target_id=str(target_id),
+                episode_id=feedback.episode_id,
+                step_id=int(feedback.step_id),
+                decision="missing",
+                reason="target_not_found",
+                feedback=feedback,
+            )
+
+        evidence = track.evidence
+
+        # Strong negative Task2 evidence can reject the target.
+        positive_support = int(evidence.positive_count) + int(evidence.maybe_count)
+        negative_support = int(evidence.negative_count)
+
+        if negative_support >= positive_support + self.config.approach_negative_reject_margin:
+            result = self._reject_after_approach(
+                track=track,
+                feedback=feedback,
+                reason="negative_task2_evidence_dominates",
+            )
+            return result
+
+        # Spatial anchor is only an anchor. If it becomes unreliable during
+        # approach, demote to Search instead of forcing continued approach.
+        if feedback.anchor_unreliable:
+            result = self._demote_after_approach(
+                track=track,
+                feedback=feedback,
+                reason="anchor_unreliable",
+            )
+            return result
+
+        support_age = feedback.support_age_steps
+        if support_age is None:
+            support_age = 10 ** 6
+
+        # No progress without fresh Task2 support: rollback, not rejection.
+        if (
+            support_age >= self.config.approach_support_timeout_steps
+            and feedback.no_progress_count >= self.config.approach_no_progress_limit
+        ):
+            result = self._demote_after_approach(
+                track=track,
+                feedback=feedback,
+                reason="no_progress_without_recent_task2_support",
+            )
+            return result
+
+        # Rotation loop without fresh support: rollback.
+        if (
+            support_age >= self.config.approach_support_timeout_steps
+            and feedback.rotate_loop_count >= self.config.approach_rotate_loop_limit
+        ):
+            result = self._demote_after_approach(
+                track=track,
+                feedback=feedback,
+                reason="rotate_loop_without_recent_task2_support",
+            )
+            return result
+
+        # Active target has been pursued for too long without new support.
+        if (
+            support_age >= self.config.approach_support_timeout_steps
+            and feedback.steps_since_attempt >= self.config.approach_max_steps_without_support
+        ):
+            result = self._demote_after_approach(
+                track=track,
+                feedback=feedback,
+                reason="approach_timeout_without_recent_task2_support",
+            )
+            return result
+
+        evidence.metadata["last_approach_feedback"] = feedback.to_log_dict()
+        evidence.metadata["last_approach_feedback_decision"] = "keep"
+        evidence.metadata["last_approach_feedback_reason"] = "active_target_still_valid"
+        self._write_admission_metadata(track)
+
+        return ApproachFeedbackResult(
+            target_id=str(target_id),
+            episode_id=feedback.episode_id,
+            step_id=int(feedback.step_id),
+            decision="keep",
+            reason="active_target_still_valid",
+            feedback=feedback,
+        )
+
+    def _demote_after_approach(
+        self,
+        track: EvidenceTrack,
+        feedback: ApproachFeedback,
+        reason: str,
+    ) -> ApproachFeedbackResult:
+        evidence = track.evidence
+
+        blocked_until = int(feedback.step_id) + self.config.approach_feedback_cooldown_steps
+
+        track.task2_admission = "pending"
+        track.approach_ready = False
+        track.rank_score = 0.0
+
+        # Keep the track tentative. Demotion means "this approach attempt failed",
+        # not "this object is definitely wrong".
+        if evidence.status != CandidateStatus.REJECTED:
+            evidence.status = CandidateStatus.TENTATIVE
+
+        meta = evidence.metadata
+        meta["active_approach"] = False
+        meta["approach_blocked_until_step"] = blocked_until
+        meta["approach_failure_count"] = int(meta.get("approach_failure_count", 0)) + 1
+        meta["last_approach_feedback"] = feedback.to_log_dict()
+        meta["last_approach_feedback_decision"] = "demote"
+        meta["last_approach_feedback_reason"] = reason
+
+        self._write_admission_metadata(track)
+
+        return ApproachFeedbackResult(
+            target_id=evidence.target_id,
+            episode_id=feedback.episode_id,
+            step_id=int(feedback.step_id),
+            decision="demote",
+            reason=reason,
+            blocked_until_step=blocked_until,
+            feedback=feedback,
+        )
+
+    def _reject_after_approach(
+        self,
+        track: EvidenceTrack,
+        feedback: ApproachFeedback,
+        reason: str,
+    ) -> ApproachFeedbackResult:
+        evidence = track.evidence
+
+        track.task2_admission = "rejected"
+        track.approach_ready = False
+        track.rank_score = 0.0
+
+        evidence.set_rejected(reason)
+
+        meta = evidence.metadata
+        meta["active_approach"] = False
+        meta["approach_blocked_until_step"] = None
+        meta["approach_failure_count"] = int(meta.get("approach_failure_count", 0)) + 1
+        meta["last_approach_feedback"] = feedback.to_log_dict()
+        meta["last_approach_feedback_decision"] = "reject"
+        meta["last_approach_feedback_reason"] = reason
+
+        self._write_admission_metadata(track)
+
+        return ApproachFeedbackResult(
+            target_id=evidence.target_id,
+            episode_id=feedback.episode_id,
+            step_id=int(feedback.step_id),
+            decision="reject",
+            reason=reason,
+            blocked_until_step=None,
+            feedback=feedback,
+        )
+
+    def _is_approach_blocked(
+        self,
+        track: EvidenceTrack,
+        current_step: Optional[int] = None,
+    ) -> bool:
+        blocked_until = track.evidence.metadata.get("approach_blocked_until_step")
+        if blocked_until is None:
+            return False
+
+        try:
+            blocked_until = int(blocked_until)
+        except Exception:
+            return False
+
+        if current_step is None:
+            return blocked_until > 0
+
+        return int(current_step) < blocked_until
+
+
+    # ------------------------------------------------------------------
     # Public selection
     # ------------------------------------------------------------------
 
-    def get_best_approach_candidate(self) -> Optional[TargetEvidence]:
+    def get_best_approach_candidate(
+        self,
+        exclude_target_ids: Optional[List[str]] = None,
+        current_step: Optional[int] = None,
+    ) -> Optional[TargetEvidence]:
+        exclude_set = set(exclude_target_ids or [])
+
         best_track = None
         best_score = -1.0
 
         for track in self.tracks.values():
+            target_id = track.evidence.target_id
+
+            if target_id in exclude_set:
+                continue
+
             if not track.approach_ready:
                 continue
+
             if track.task2_admission != "passed":
                 continue
+
             if track.evidence.status in (CandidateStatus.REJECTED, CandidateStatus.LOST):
+                continue
+
+            if self._is_approach_blocked(track, current_step=current_step):
                 continue
 
             score = float(track.rank_score)
