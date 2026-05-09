@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from .candidate_filter import GDINOCandidateFilter, GDINOCandidateFilterConfig
+from .candidate_geometry import CandidateGeometryEstimator, CandidateGeometryConfig
 from .types import (
     BBox,
     FrameRecord,
@@ -143,6 +144,9 @@ class SVNavGDINOClient:
     def __init__(self, config: Optional[GDINOClientConfig] = None) -> None:
         self.config = config or GDINOClientConfig.from_env()
         self.candidate_filter = GDINOCandidateFilter(GDINOCandidateFilterConfig())
+        self.candidate_geometry_estimator = CandidateGeometryEstimator(
+            CandidateGeometryConfig.from_env()
+        )
 
     @property
     def enabled(self) -> bool:
@@ -414,7 +418,10 @@ class SVNavGDINOClient:
                 raw_candidates.append(candidate)
 
         filter_output = self.candidate_filter.filter_candidates(raw_candidates)
-        candidates = filter_output.kept
+        geometry_output = self.candidate_geometry_estimator.estimate_candidates(
+            filter_output.kept
+        )
+        candidates = geometry_output.candidates
 
         latency_ms = (time.time() - started_at) * 1000.0
 
@@ -439,6 +446,9 @@ class SVNavGDINOClient:
                 "kept_candidate_count": len(filter_output.kept),
                 "rejected_candidate_count": len(filter_output.rejected),
                 "candidate_filter": filter_output.summary.to_log_dict(),
+                "candidate_geometry": geometry_output.summary.to_log_dict(),
+                "geometry_valid_count": geometry_output.summary.valid_position_count,
+                "geometry_invalid_count": geometry_output.summary.invalid_position_count,
                 "best_score": response.get("best_score", 0.0),
             },
         )
