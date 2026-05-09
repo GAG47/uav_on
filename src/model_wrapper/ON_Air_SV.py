@@ -525,6 +525,19 @@ class ONAirSV(ONAir):
             feedback=feedback,
         )
 
+        if current_distance is not None:
+            if session.get("start_distance_to_anchor") is None:
+                session["start_distance_to_anchor"] = current_distance
+
+            best_distance = session.get("best_distance_to_anchor")
+            try:
+                if best_distance is None:
+                    session["best_distance_to_anchor"] = current_distance
+                else:
+                    session["best_distance_to_anchor"] = min(float(best_distance), float(current_distance))
+            except Exception:
+                session["best_distance_to_anchor"] = current_distance
+
         session["last_distance_to_anchor"] = current_distance
         session["last_action"] = action
         session["no_progress_count"] = no_progress_count
@@ -564,6 +577,128 @@ class ONAirSV(ONAir):
 
     # ------------------------------------------------------------------
     # End SVNav Step15 approach session helpers
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # SVNav StopGate helpers
+    # ------------------------------------------------------------------
+
+    def _svnav_get_stop_gate(self, state):
+        stop_gate = getattr(state, "stop_gate", None)
+        if stop_gate is not None:
+            return stop_gate
+
+        try:
+            from svnav.stop_gate import StopGate, StopGateConfig
+        except Exception:
+            return None
+
+        config = StopGateConfig()
+        stop_gate = StopGate(config)
+        setattr(state, "stop_gate", stop_gate)
+        return stop_gate
+
+    def _svnav_get_current_active_target_evidence(self, state):
+        target_id = getattr(state, "active_approach_target_id", None)
+        if not target_id:
+            return None
+
+        evidence_manager = getattr(state, "target_evidence_manager", None)
+        if evidence_manager is None:
+            return None
+
+        if not hasattr(evidence_manager, "get_evidence_by_id"):
+            return None
+
+        return evidence_manager.get_evidence_by_id(target_id)
+
+    def _svnav_apply_stop_gate(
+        self,
+        state,
+        episode_id,
+        step_id,
+        observation,
+        decision,
+    ):
+        stop_gate = self._svnav_get_stop_gate(state)
+        if stop_gate is None:
+            return decision
+
+        target_evidence = self._svnav_get_current_active_target_evidence(state)
+        approach_session = getattr(state, "svnav_approach_session", None)
+
+        result = stop_gate.evaluate(
+            episode_id=episode_id,
+            step_id=step_id,
+            observation=observation,
+            nav_decision=decision,
+            target_evidence=target_evidence,
+            approach_session=approach_session,
+        )
+
+        setattr(state, "last_stop_gate_result", result)
+
+        should_print = bool(result.allow_stop)
+        if result.reason not in (
+            "not_in_approach_mode",
+            "missing_target_evidence",
+        ):
+            should_print = True
+
+        if should_print:
+            print(
+                "[SVNavStopGate] episode={} step={} allow={} reason={} "
+                "target={} mode={} action={} anchor={} dist={} hdist={} "
+                "task2_score={} support_age={} progress={} near_count={}".format(
+                    episode_id,
+                    step_id,
+                    result.allow_stop,
+                    result.reason,
+                    result.target_id,
+                    result.mode,
+                    result.action,
+                    result.anchor_type,
+                    self._svnav_debug_fmt(result.distance_to_target) if hasattr(self, "_svnav_debug_fmt") else result.distance_to_target,
+                    self._svnav_debug_fmt(result.horizontal_distance_to_target) if hasattr(self, "_svnav_debug_fmt") else result.horizontal_distance_to_target,
+                    self._svnav_debug_fmt(result.task2_score) if hasattr(self, "_svnav_debug_fmt") else result.task2_score,
+                    result.support_age_steps,
+                    self._svnav_debug_fmt(result.approach_progress) if hasattr(self, "_svnav_debug_fmt") else result.approach_progress,
+                    result.near_count,
+                )
+            )
+
+        if not result.allow_stop:
+            return decision
+
+        try:
+            decision.action = "stop"
+            decision.step_size = 0.0
+            decision.stop_allowed = True
+            decision.reason = "stop_gate_allowed:{}".format(result.reason)
+            debug_info = getattr(decision, "debug_info", None)
+            if isinstance(debug_info, dict):
+                debug_info["stop_gate"] = result.to_log_dict()
+                debug_info["adapter_phase"] = "stop_gate"
+        except Exception:
+            pass
+
+        print(
+            "[SVNavStopAction] episode={} step={} target={} reason={} hdist={} "
+            "support_age={} progress={}".format(
+                episode_id,
+                step_id,
+                result.target_id,
+                result.reason,
+                self._svnav_debug_fmt(result.horizontal_distance_to_target) if hasattr(self, "_svnav_debug_fmt") else result.horizontal_distance_to_target,
+                result.support_age_steps,
+                self._svnav_debug_fmt(result.approach_progress) if hasattr(self, "_svnav_debug_fmt") else result.approach_progress,
+            )
+        )
+
+        return decision
+
+    # ------------------------------------------------------------------
+    # End SVNav StopGate helpers
     # ------------------------------------------------------------------
 
     def _select_svnav_navigation_decision(
@@ -622,6 +757,14 @@ class ONAirSV(ONAir):
                     observation=observation,
                     semantic_map=state.semantic_map,
                 )
+
+            decision = self._svnav_apply_stop_gate(
+                state=state,
+                episode_id=episode_id,
+                step_id=step_id,
+                observation=observation,
+                decision=decision,
+            )
 
             return decision
 
