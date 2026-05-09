@@ -1,3 +1,4 @@
+import re
 SVNAV_TASK1_SYSTEM_PROMPT = """
 You are the Task1 semantic value reasoner for an open-world UAV visual-language navigation system.
 
@@ -209,4 +210,169 @@ Return JSON only, with this schema:
         target_text=target_text,
         candidate_text="\n".join(candidate_lines),
     ).strip()
+
+
+# ----------------------------------------------------------------------
+# GDINO detection prompt
+# ----------------------------------------------------------------------
+
+def _svnav_split_camel_case(text):
+    text = str(text or "")
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"[-_/\\]+", " ", text)
+    text = re.sub(r"[^A-Za-z0-9 ]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def _svnav_add_phrase(phrases, phrase, max_words=6):
+    phrase = _svnav_split_camel_case(phrase)
+    if not phrase:
+        return
+
+    words = phrase.split()
+    if len(words) > max_words:
+        return
+
+    # GroundingDINO works better with short object phrases.
+    normalized = " ".join(words)
+    if normalized not in phrases:
+        phrases.append(normalized)
+
+
+def _svnav_extract_visual_words(text):
+    text = _svnav_split_camel_case(text)
+
+    colors = {
+        "red", "blue", "green", "yellow", "black", "white", "gray", "grey",
+        "brown", "orange", "pink", "purple", "cyan", "silver", "golden",
+    }
+    materials = {
+        "wood", "wooden", "metal", "metallic", "plastic", "stone", "concrete",
+        "glass", "fabric", "cloth", "leather", "rope", "paper", "cardboard",
+    }
+    shapes = {
+        "small", "large", "big", "round", "square", "rectangular", "long",
+        "short", "tall", "flat", "stacked", "reinforced",
+    }
+
+    selected = []
+    for word in text.split():
+        if word in colors or word in materials or word in shapes:
+            if word not in selected:
+                selected.append(word)
+
+    return selected
+
+
+def _svnav_aliases_for_target_name(name):
+    compact = str(name or "").replace(" ", "").replace("_", "").replace("-", "").lower()
+    spaced = _svnav_split_camel_case(name)
+
+    aliases = []
+
+    if "woodenbox" in compact or "wooden box" in spaced or "wood box" in spaced:
+        aliases.extend([
+            "wooden box",
+            "wooden crate",
+            "wood box",
+            "storage box",
+            "crate",
+            "box",
+        ])
+    elif "trashbin" in compact or "trash bin" in spaced or "garbage bin" in spaced:
+        aliases.extend([
+            "trash bin",
+            "garbage bin",
+            "waste bin",
+            "dustbin",
+            "bin",
+        ])
+    elif "chair" in spaced:
+        aliases.extend([
+            "chair",
+            "seat",
+            "outdoor chair",
+        ])
+    elif "car" in spaced or "sedan" in spaced:
+        aliases.extend([
+            "car",
+            "sedan",
+            "vehicle",
+        ])
+    elif "tent" in spaced:
+        aliases.extend([
+            "tent",
+            "camping tent",
+        ])
+    elif "boat" in spaced:
+        aliases.extend([
+            "boat",
+            "small boat",
+            "watercraft",
+        ])
+    else:
+        aliases.append(spaced)
+
+        words = spaced.split()
+        if len(words) >= 2:
+            aliases.append(" ".join(words[-2:]))
+        if len(words) >= 1:
+            aliases.append(words[-1])
+
+    return aliases
+
+
+def build_gdino_detection_prompt(target_info, max_phrases=8, max_words=6):
+    """
+    Build short open-vocabulary detection phrases for GroundingDINO.
+
+    GDINO should receive compact noun phrases, not long reasoning instructions.
+    Detailed task description is still used by Task2 verification.
+    """
+    name = getattr(target_info, "name", "") if target_info is not None else ""
+    size = getattr(target_info, "size", None) if target_info is not None else None
+    description = getattr(target_info, "description", None) if target_info is not None else None
+    instruction = getattr(target_info, "instruction", None) if target_info is not None else None
+
+    phrases = []
+
+    spaced_name = _svnav_split_camel_case(name)
+    compact_name = str(name or "").lower().strip()
+
+    _svnav_add_phrase(phrases, spaced_name, max_words=max_words)
+
+    # Preserve compact class name as a fallback, e.g. WoodenBox -> woodenbox.
+    if compact_name and compact_name.replace(" ", "") != spaced_name.replace(" ", ""):
+        _svnav_add_phrase(phrases, compact_name, max_words=max_words)
+
+    for alias in _svnav_aliases_for_target_name(name):
+        _svnav_add_phrase(phrases, alias, max_words=max_words)
+
+    visual_text = " ".join(
+        str(x or "")
+        for x in [size, description, instruction]
+        if x
+    )
+    visual_words = _svnav_extract_visual_words(visual_text)
+
+    base_phrases = list(phrases[:4])
+    for attr in visual_words:
+        for base in base_phrases:
+            if attr in base.split():
+                continue
+            _svnav_add_phrase(
+                phrases,
+                "{} {}".format(attr, base),
+                max_words=max_words,
+            )
+            if len(phrases) >= max_phrases:
+                break
+        if len(phrases) >= max_phrases:
+            break
+
+    if not phrases:
+        _svnav_add_phrase(phrases, "object", max_words=max_words)
+
+    return ". ".join(phrases[:max_phrases]) + "."
 
