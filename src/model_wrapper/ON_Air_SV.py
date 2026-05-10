@@ -526,7 +526,11 @@ class ONAirSV(ONAir):
                 "last_feedback_decision": "reset",
             }
 
-        current_distance = debug.get("dist_to_approach_viewpoint")
+        current_distance = debug.get("distance_to_anchor")
+        if current_distance is None:
+            current_distance = debug.get("target_distance")
+        if current_distance is None:
+            current_distance = debug.get("dist_to_approach_viewpoint")
         try:
             current_distance = None if current_distance is None else float(current_distance)
         except Exception:
@@ -2011,7 +2015,7 @@ class ONAirSV(ONAir):
                 size=value.get("size"),
                 description=value.get("description"),
                 instruction=value.get("instruction") or value.get("prompt"),
-                search_radius=float(value.get("search_radius", 50.0)),
+                search_radius=float(value.get("search_radius", 100.0)),
                 success_threshold=float(value.get("success_threshold", 20.0)),
             )
 

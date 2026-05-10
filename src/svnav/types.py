@@ -225,7 +225,7 @@ class TargetInfo:
     size: Optional[str] = None
     description: Optional[str] = None
     instruction: Optional[str] = None
-    search_radius: float = 50.0
+    search_radius: float = 100.0
     success_threshold: float = 20.0
 
     @property

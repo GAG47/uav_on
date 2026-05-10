@@ -142,7 +142,7 @@ class SearchNavigator:
         episode_id = str(episode_id)
 
         if not semantic_map.is_pose_in_bounds(current_pose):
-            target_position = semantic_map.nearest_in_bounds_position(current_pose)
+            target_position = self._build_return_in_bounds_position(current_pose, semantic_map)
             self.active_by_episode.pop(episode_id, None)
             return NavigationWaypoint(
                 episode_id=episode_id,
@@ -155,8 +155,8 @@ class SearchNavigator:
                 target_type="in_bounds_region",
                 target_id=None,
                 region_id=None,
-                arrive_radius=self.action_adapter.config.position_tolerance,
-                reason="uav outside semantic map; return to nearest in-bounds position",
+                arrive_radius=1.0,
+                reason="uav outside semantic map; return to interior in-bounds waypoint",
                 debug_info={
                     "navigator_reason": "out_of_bounds",
                     "target_position": list(target_position),
@@ -265,6 +265,59 @@ class SearchNavigator:
             return ActionSource(source)
         except Exception:
             return ActionSource.GEOMETRIC_EXPLORE
+
+    def _build_return_in_bounds_position(
+        self,
+        current_pose: PoseRecord,
+        semantic_map: SemanticMap,
+    ) -> Tuple[float, float, float]:
+        """
+        Build an executable return-in-bounds waypoint.
+
+        nearest_in_bounds_position(...) lies exactly on the map boundary. If
+        the UAV is just outside the map, this point can be within the normal
+        waypoint tolerance and the controller may incorrectly output a
+        zero-step hold. We push the target further inside toward the map
+        center so returning in bounds becomes an actual translation.
+        """
+        nearest = semantic_map.nearest_in_bounds_position(current_pose)
+
+        try:
+            center_x, center_y = semantic_map.search_bounds.center
+            cell_size = float(semantic_map.config.cell_size)
+        except Exception:
+            return nearest
+
+        nx, ny, nz = nearest
+
+        vx = float(center_x) - float(current_pose.x)
+        vy = float(center_y) - float(current_pose.y)
+        norm = math.hypot(vx, vy)
+
+        if norm <= 1e-6:
+            vx = float(center_x) - float(nx)
+            vy = float(center_y) - float(ny)
+            norm = math.hypot(vx, vy)
+
+        if norm <= 1e-6:
+            return nearest
+
+        ux = vx / norm
+        uy = vy / norm
+
+        try:
+            tolerance = float(self.action_adapter.config.position_tolerance)
+        except Exception:
+            tolerance = cell_size
+
+        inside_margin = max(cell_size * 1.5, tolerance + cell_size * 0.5, 6.0)
+
+        tx = float(nx) + ux * inside_margin
+        ty = float(ny) + uy * inside_margin
+        tx, ty = semantic_map.search_bounds.clamp_xy(tx, ty)
+
+        return float(tx), float(ty), float(current_pose.z)
+
 
     def _need_replan(
         self,
@@ -529,6 +582,7 @@ from svnav.types import (
     ActionSource as _SVNavActionSource,
     NavDecision as _SVNavDecision,
     NavMode as _SVNavMode,
+    NavigationWaypoint as _SVNavNavigationWaypoint,
 )
 
 
@@ -802,6 +856,24 @@ def _svnav_build_approach_viewpoint(self, current_pose, target_evidence):
     return visual
 
 
+def _svnav_make_hold_decision(
+    episode_id,
+    step_id,
+    reason,
+    debug_info=None,
+):
+    decision = _SVNavDecision.hold(
+        episode_id=episode_id,
+        step_id=step_id,
+        reason=reason,
+    )
+    if debug_info:
+        if getattr(decision, "debug_info", None) is None:
+            decision.debug_info = {}
+        decision.debug_info.update(debug_info)
+    return decision
+
+
 def _svnav_build_approach_decision(
     self,
     episode_id,
@@ -809,9 +881,20 @@ def _svnav_build_approach_decision(
     observation,
     target_evidence,
 ):
+    """
+    Build Approach / FinalCheck decision through the same waypoint controller
+    used by Search.
+
+    Contract:
+    - visual-only evidence is not a valid Approach target;
+    - Approach requires a spatial target anchor;
+    - this function converts stable target_position into an executable
+      approach waypoint;
+    - low-level UAV-ON action is generated only by ActionAdapter.
+    """
     current_pose = getattr(observation, "pose", None)
     if current_pose is None:
-        return _SVNavDecision.hold(
+        return _svnav_make_hold_decision(
             episode_id=episode_id,
             step_id=step_id,
             reason="approach missing current pose",
@@ -819,10 +902,9 @@ def _svnav_build_approach_decision(
 
     metadata = _svnav_get_metadata(target_evidence)
 
-    # Defense in depth: Step 13 should already ensure this. Step 14 refuses to
-    # approach a candidate that is not Task2-passed.
+    # Defense in depth. TargetEvidenceManager should already ensure this.
     if metadata.get("task2_admission") not in (None, "passed"):
-        return _SVNavDecision.hold(
+        return _svnav_make_hold_decision(
             episode_id=episode_id,
             step_id=step_id,
             reason="approach candidate not Task2-passed",
@@ -833,139 +915,161 @@ def _svnav_build_approach_decision(
         current_pose=current_pose,
         target_evidence=target_evidence,
     )
-
     if approach_viewpoint is None:
-        return _SVNavDecision.hold(
+        return _svnav_make_hold_decision(
             episode_id=episode_id,
             step_id=step_id,
             reason="approach missing candidate anchor",
         )
 
-    current_x = _svnav_approach_float(getattr(current_pose, "x", 0.0))
-    current_y = _svnav_approach_float(getattr(current_pose, "y", 0.0))
-    current_yaw = _svnav_approach_float(getattr(current_pose, "yaw", 0.0))
-
-    vp_x, vp_y, vp_z = approach_viewpoint["viewpoint"]
-    to_vp_x = vp_x - current_x
-    to_vp_y = vp_y - current_y
-    dist_to_viewpoint = _svnav_approach_math.sqrt(to_vp_x * to_vp_x + to_vp_y * to_vp_y)
-
-    if dist_to_viewpoint > 1e-6:
-        desired_move_yaw = _svnav_approach_math.degrees(
-            _svnav_approach_math.atan2(to_vp_y, to_vp_x)
-        )
-    else:
-        desired_move_yaw = _svnav_approach_float(approach_viewpoint.get("observe_yaw"), current_yaw)
-
-    yaw_error = _svnav_approach_angle_diff_deg(desired_move_yaw, current_yaw)
-    observe_yaw = _svnav_approach_float(approach_viewpoint.get("observe_yaw"), desired_move_yaw)
-    observe_yaw_error = _svnav_approach_angle_diff_deg(observe_yaw, current_yaw)
-
-    step_size = _svnav_approach_default_step_size()
-    rotate_angle = _svnav_approach_default_rotate_angle()
-
-    yaw_threshold = _svnav_approach_float(
-        getattr(getattr(self, "config", None), "approach_yaw_threshold_deg", 18.0),
-        18.0,
-    )
-    waypoint_tolerance = _svnav_approach_float(
-        getattr(getattr(self, "config", None), "approach_waypoint_tolerance", 1.5),
-        1.5,
-    )
-
     approach_kind = approach_viewpoint.get("approach_kind", "visual")
     anchor_type = approach_viewpoint.get("anchor_type", approach_kind)
-    final_check_distance = _svnav_approach_float(approach_viewpoint.get("final_check_distance"), 7.0)
+    target_position = approach_viewpoint.get("target_position")
 
-    mode = _SVNavMode.APPROACH
-    action = "forward"
-    action_step = min(step_size, max(1.0, dist_to_viewpoint))
-    reason = "move_to_approach_candidate_viewpoint"
-    phase = "move_to_approach_viewpoint"
+    # The visual-anchor path must not execute Approach anymore.
+    # Visual evidence should have already been written into SemanticMap as
+    # target-aware Search cue.
+    if approach_kind != "spatial" or anchor_type != "spatial" or target_position is None:
+        return _svnav_make_hold_decision(
+            episode_id=episode_id,
+            step_id=step_id,
+            reason="approach requires stable spatial target_position",
+            debug_info={
+                "adapter_phase": "reject_visual_approach",
+                "approach_kind": approach_kind,
+                "anchor_type": anchor_type,
+                "target_id": getattr(target_evidence, "target_id", None),
+                "target_position": target_position,
+                "task2_admission": approach_viewpoint.get("task2_admission"),
+            },
+        )
+
+    viewpoint_position = approach_viewpoint.get("viewpoint")
+    if viewpoint_position is None:
+        return _svnav_make_hold_decision(
+            episode_id=episode_id,
+            step_id=step_id,
+            reason="approach missing executable viewpoint",
+        )
 
     target_distance = approach_viewpoint.get("target_distance")
+    final_check_distance = _svnav_approach_float(
+        approach_viewpoint.get("final_check_distance"),
+        7.0,
+    )
 
-    if approach_kind == "spatial" and target_distance is not None and target_distance <= final_check_distance:
+    try:
+        target_distance_float = None if target_distance is None else float(target_distance)
+    except Exception:
+        target_distance_float = None
+
+    if target_distance_float is not None and target_distance_float <= final_check_distance:
         mode = _SVNavMode.FINAL_CHECK
-        if abs(observe_yaw_error) > yaw_threshold:
-            action = "rotr" if observe_yaw_error > 0.0 else "rotl"
-            action_step = rotate_angle
-            reason = "near_spatial_candidate_align"
-            phase = "spatial_final_check_align"
-        else:
-            action = "rotl"
-            action_step = rotate_angle
-            reason = "near_spatial_candidate_observe"
-            phase = "spatial_final_check_observe"
-
-    elif dist_to_viewpoint <= waypoint_tolerance:
-        if abs(observe_yaw_error) > yaw_threshold:
-            action = "rotr" if observe_yaw_error > 0.0 else "rotl"
-            action_step = rotate_angle
-            reason = "{}_candidate_viewpoint_reached_align".format(approach_kind)
-            phase = "{}_align_candidate".format(approach_kind)
-        else:
-            action = "forward"
-            action_step = min(step_size, 3.0)
-            reason = "{}_candidate_viewpoint_reached_inspect_forward".format(approach_kind)
-            phase = "{}_inspect_forward".format(approach_kind)
-
-    elif abs(yaw_error) > yaw_threshold:
-        action = "rotr" if yaw_error > 0.0 else "rotl"
-        action_step = rotate_angle
-        reason = "turn_to_{}_approach_viewpoint".format(approach_kind)
-        phase = "turn_to_{}_approach_viewpoint".format(approach_kind)
-
+        target_type = "final_check_target"
     else:
-        action = "forward"
-        action_step = min(step_size, max(1.0, dist_to_viewpoint))
-        reason = "move_to_{}_candidate_viewpoint".format(approach_kind)
-        phase = "move_to_{}_approach_viewpoint".format(approach_kind)
+        mode = _SVNavMode.APPROACH
+        target_type = "approach_target"
 
-    debug_info = {
-        "adapter_phase": phase,
-        "approach_kind": approach_kind,
-        "anchor_type": anchor_type,
-        "task2_admission": approach_viewpoint.get("task2_admission"),
-        "target_id": getattr(target_evidence, "target_id", None),
-        "target_status": getattr(getattr(target_evidence, "status", None), "value", str(getattr(target_evidence, "status", ""))),
-        "target_position": approach_viewpoint.get("target_position"),
-        "approach_viewpoint": approach_viewpoint.get("viewpoint"),
-        "approach_anchor": approach_viewpoint.get("anchor"),
-        "target_distance": target_distance,
-        "dist_to_approach_viewpoint": float(dist_to_viewpoint),
-        "approach_distance": approach_viewpoint.get("approach_distance"),
-        "final_check_distance": final_check_distance,
-        "desired_yaw": float(desired_move_yaw),
-        "yaw_to_viewpoint_deg": float(yaw_error),
-        "observe_yaw": float(observe_yaw),
-        "observe_yaw_error_deg": float(observe_yaw_error),
-        "visual_score": metadata.get("visual_score"),
-        "task2_score": metadata.get("task2_score"),
-        "approach_score": metadata.get("approach_score"),
-        "rank_score": metadata.get("rank_score"),
-        "evidence_kind": metadata.get("evidence_kind"),
-        "latest_view_id": metadata.get("latest_view_id"),
-        "latest_bbox_center_norm": metadata.get("latest_bbox_center_norm"),
-        "latest_source_pose": metadata.get("latest_source_pose"),
-        "position_confidence": getattr(target_evidence, "position_confidence", 0.0),
-        "position_stability": getattr(target_evidence, "position_stability", 0.0),
-    }
+    waypoint_id = "approach_{}".format(getattr(target_evidence, "target_id", "target"))
+    waypoint = _SVNavNavigationWaypoint(
+        episode_id=str(episode_id),
+        step_id=int(step_id),
+        waypoint_id=waypoint_id,
+        mode=getattr(mode, "value", str(mode)),
+        position=tuple(viewpoint_position),
+        desired_yaw=float(approach_viewpoint.get("observe_yaw", getattr(current_pose, "yaw", 0.0))),
+        observe_position=tuple(target_position),
+        source=getattr(_SVNavActionSource.VERIFIED_TARGET, "value", "verified_target"),
+        target_type=target_type,
+        target_id=getattr(target_evidence, "target_id", None),
+        region_id=None,
+        arrive_radius=_svnav_approach_float(
+            getattr(getattr(self, "config", None), "approach_waypoint_tolerance", 1.5),
+            1.5,
+        ),
+        yaw_tolerance=_svnav_approach_float(
+            getattr(getattr(self, "config", None), "approach_yaw_threshold_deg", 18.0),
+            18.0,
+        ),
+        reason="follow stable spatial target approach waypoint",
+        debug_info={
+            "approach_kind": approach_kind,
+            "anchor_type": anchor_type,
+            "task2_admission": approach_viewpoint.get("task2_admission"),
+            "target_id": getattr(target_evidence, "target_id", None),
+            "target_position": target_position,
+            "approach_viewpoint": viewpoint_position,
+            "approach_anchor": approach_viewpoint.get("anchor"),
+            "target_distance": target_distance,
+            "approach_distance": approach_viewpoint.get("approach_distance"),
+            "final_check_distance": final_check_distance,
+            "visual_score": metadata.get("visual_score"),
+            "task2_score": metadata.get("task2_score"),
+            "approach_score": metadata.get("approach_score"),
+            "rank_score": metadata.get("rank_score"),
+            "evidence_kind": metadata.get("evidence_kind"),
+            "latest_view_id": metadata.get("latest_view_id"),
+            "latest_bbox_center_norm": metadata.get("latest_bbox_center_norm"),
+            "latest_source_pose": metadata.get("latest_source_pose"),
+            "position_confidence": getattr(target_evidence, "position_confidence", 0.0),
+            "position_stability": getattr(target_evidence, "position_stability", 0.0),
+        },
+    )
 
-    nav_target_position = approach_viewpoint.get("target_position")
-    if nav_target_position is None:
-        nav_target_position = approach_viewpoint.get("viewpoint")
+    action_adapter = getattr(self, "action_adapter", None)
+    if action_adapter is None or not hasattr(action_adapter, "follow_waypoint"):
+        return _svnav_make_hold_decision(
+            episode_id=episode_id,
+            step_id=step_id,
+            reason="approach missing waypoint controller",
+            debug_info=waypoint.debug_info,
+        )
+
+    command, feedback = action_adapter.follow_waypoint(
+        current_pose=current_pose,
+        waypoint=waypoint,
+        observation=observation,
+        semantic_map=None,
+    )
+
+    debug_info = dict(waypoint.debug_info or {})
+    debug_info.update(command.debug_info or {})
+    debug_info["adapter_phase"] = command.phase
+    debug_info["control_command"] = command.to_log_dict()
+    debug_info["controller_feedback"] = feedback.to_log_dict()
+    debug_info["continuous_approach_controller"] = True
+
+    # Keep old debug keys used by feedback / StopGate.
+    debug_info["approach_kind"] = approach_kind
+    debug_info["anchor_type"] = anchor_type
+    debug_info["target_position"] = target_position
+    debug_info["approach_viewpoint"] = viewpoint_position
+    debug_info["target_distance"] = target_distance
+    debug_info["distance_to_anchor"] = target_distance
+    debug_info["dist_to_approach_viewpoint"] = feedback.distance_to_waypoint
+    debug_info["yaw_to_viewpoint_deg"] = feedback.yaw_to_waypoint
+    debug_info["observe_yaw_error_deg"] = feedback.observe_yaw_error
+    debug_info["desired_yaw"] = waypoint.desired_yaw
+    debug_info["observe_yaw"] = waypoint.desired_yaw
+    debug_info["approach_distance"] = approach_viewpoint.get("approach_distance")
+    debug_info["final_check_distance"] = final_check_distance
+    debug_info["position_confidence"] = getattr(target_evidence, "position_confidence", 0.0)
+    debug_info["position_stability"] = getattr(target_evidence, "position_stability", 0.0)
+
+    reason = command.reason or "follow stable spatial target approach waypoint"
+    if mode == _SVNavMode.FINAL_CHECK:
+        reason = "final_check_" + reason
 
     return _SVNavDecision(
         episode_id=episode_id,
         step_id=int(step_id),
         mode=mode,
-        target_type="approach_candidate",
-        target_position=nav_target_position,
+        target_type=target_type,
+        target_position=tuple(target_position),
         target_id=getattr(target_evidence, "target_id", None),
         candidate_id=getattr(target_evidence, "latest_candidate_id", None),
-        action=action,
-        step_size=float(action_step),
+        action=command.action,
+        step_size=float(command.step_size),
         action_source=_SVNavActionSource.VERIFIED_TARGET,
         stop_allowed=False,
         reason=reason,

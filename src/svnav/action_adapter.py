@@ -155,6 +155,19 @@ class ActionAdapter:
         )
 
         reached = distance_xy <= float(waypoint.arrive_radius)
+
+        # Return-to-map-boundary should never become a zero-step hold while
+        # the UAV is still outside the semantic map. Otherwise the controller
+        # repeatedly emits rotl 0.0 with phase=waypoint_reached.
+        if reached and self._is_return_in_bounds_waypoint(waypoint) and semantic_map is not None:
+            try:
+                if not semantic_map.is_pose_in_bounds(current_pose):
+                    reached = False
+                    debug["return_in_bounds_still_outside"] = True
+                    debug["return_in_bounds_distance"] = distance_xy
+            except Exception:
+                pass
+
         if reached:
             command = ControlCommand(
                 action=self.config.rotate_left_action,
@@ -640,6 +653,21 @@ class ActionAdapter:
         values = values[np.isfinite(values)]
         values = values[values > 0.0]
         return values.astype(np.float32)
+
+    @staticmethod
+    def _is_return_in_bounds_waypoint(waypoint: NavigationWaypoint) -> bool:
+        target_type = str(getattr(waypoint, "target_type", "") or "").lower()
+        source = str(getattr(waypoint, "source", "") or "").lower()
+        reason = str(getattr(waypoint, "reason", "") or "").lower()
+        waypoint_id = str(getattr(waypoint, "waypoint_id", "") or "").lower()
+
+        return (
+            "in_bounds" in target_type
+            or "return_in_bounds" in source
+            or "return_in_bounds" in waypoint_id
+            or "outside semantic map" in reason
+            or "nearest in-bounds" in reason
+        )
 
     @staticmethod
     def _distance_xy_pose_to_position(
