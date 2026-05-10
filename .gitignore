@@ -32,3 +32,4 @@ logs/
 __pycache__/
 *.pyc
 debug/
+tmp_random_tasks/

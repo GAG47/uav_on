@@ -5,6 +5,8 @@ import os
 import sys
 import tempfile
 import traceback
+import gc
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from io import BytesIO
@@ -17,6 +19,8 @@ MODEL = None
 LOAD_IMAGE = None
 PREDICT = None
 SERVER_ARGS = None
+REQUEST_COUNT = 0
+PREDICT_LOCK = threading.Lock()
 
 
 def add_grounding_dino_path():
@@ -81,28 +85,65 @@ def load_grounding_model(config_path, checkpoint_path, device):
     )
 
 
-def run_predict(model, image, prompt, box_threshold, text_threshold, device):
+
+def cleanup_runtime(reason="", force=False):
+    """
+    Release temporary Python objects and CUDA cached memory after GDINO inference.
+
+    This does not unload the GroundingDINO model. It only clears objects that are
+    safe to release between requests, so GROUNDINGDINO_MAX_IMAGES can remain high.
+    """
+    if not force and os.getenv("GDINO_CLEANUP_EACH_REQUEST", "1") != "1":
+        return
+
     try:
-        boxes, logits, phrases = PREDICT(
-            model=model,
-            image=image,
-            caption=prompt,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-            device=device
-        )
-    except TypeError:
-        boxes, logits, phrases = PREDICT(
-            model=model,
-            image=image,
-            caption=prompt,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold
-        )
+        gc.collect()
+    except Exception:
+        pass
+
+    try:
+        import torch
+
+        if torch.cuda.is_available() and os.getenv("GDINO_CUDA_EMPTY_CACHE", "1") == "1":
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception as e:
+        if os.getenv("GDINO_VERBOSE_CLEANUP", "0") == "1":
+            print(f"[GroundingDINO Server] cleanup skipped: {e}", flush=True)
+
+    if os.getenv("GDINO_VERBOSE_CLEANUP", "0") == "1":
+        print(f"[GroundingDINO Server] cleanup done: {reason}", flush=True)
+
+def run_predict(model, image, prompt, box_threshold, text_threshold, device):
+    """
+    Run GroundingDINO prediction.
+
+    The lock avoids overlapping CUDA inference inside ThreadingHTTPServer if
+    multiple requests arrive at the same time.
+    """
+    with PREDICT_LOCK:
+        try:
+            boxes, logits, phrases = PREDICT(
+                model=model,
+                image=image,
+                caption=prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+                device=device
+            )
+        except TypeError:
+            boxes, logits, phrases = PREDICT(
+                model=model,
+                image=image,
+                caption=prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold
+            )
 
     return boxes, logits, phrases
-
-
 def decode_base64_image(image_base64):
     image_bytes = base64.b64decode(image_base64)
     image = Image.open(BytesIO(image_bytes)).convert("RGB")
@@ -119,9 +160,12 @@ def save_temp_image(image):
 
 
 def detect_images(payload):
+    global REQUEST_COUNT
+
+    REQUEST_COUNT += 1
+
     prompt = payload.get("text", "")
     images = payload.get("images", [])
-
     box_threshold = float(payload.get("box_threshold", SERVER_ARGS.box_threshold))
     text_threshold = float(payload.get("text_threshold", SERVER_ARGS.text_threshold))
     device = payload.get("device", SERVER_ARGS.device)
@@ -148,6 +192,12 @@ def detect_images(payload):
 
     for image_index, image_item in enumerate(images):
         image_path = None
+        image = None
+        image_source = None
+        image_tensor = None
+        boxes = None
+        logits = None
+        phrases = None
 
         try:
             image_base64 = image_item.get("data", "")
@@ -200,11 +250,30 @@ def detect_images(payload):
             traceback.print_exc()
 
         finally:
+            if image is not None:
+                try:
+                    image.close()
+                except Exception:
+                    pass
+
             if image_path is not None:
                 try:
                     os.remove(image_path)
                 except Exception:
                     pass
+
+            image = None
+            image_source = None
+            image_tensor = None
+            boxes = None
+            logits = None
+            phrases = None
+
+            if os.getenv("GDINO_CLEANUP_EACH_IMAGE", "0") == "1":
+                cleanup_runtime(
+                    reason=f"request={REQUEST_COUNT}, image={image_index}",
+                    force=True
+                )
 
     result["num_detections"] = len(result["detections"])
 
@@ -216,9 +285,12 @@ def detect_images(payload):
         result["best_detection"] = best_detection
         result["best_score"] = float(best_detection.get("score", 0.0))
 
+    cleanup_runtime(
+        reason=f"request={REQUEST_COUNT}, images={len(images)}",
+        force=True
+    )
+
     return result
-
-
 class GroundingDINOHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
@@ -260,6 +332,9 @@ class GroundingDINOHandler(BaseHTTPRequestHandler):
                 "best_score": 0.0,
                 "num_detections": 0
             }, status=500)
+
+        finally:
+            cleanup_runtime(reason="do_POST finally", force=True)
 
 
     def log_message(self, format, *args):
