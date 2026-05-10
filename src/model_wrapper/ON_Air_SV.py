@@ -197,6 +197,16 @@ class ONAirSV(ONAir):
 
                 state.last_step_id = step_id
                 state.last_observation_id = observation.observation_id
+                if not hasattr(state, "frame_lookup") or state.frame_lookup is None:
+                    state.frame_lookup = {}
+                for frame in observation.iter_frames():
+                    state.frame_lookup[frame.frame_id] = frame
+                if len(state.frame_lookup) > 160:
+                    items = sorted(
+                        state.frame_lookup.items(),
+                        key=lambda item: getattr(item[1], "step_id", 0),
+                    )
+                    state.frame_lookup = dict(items[-120:])
 
                 self._update_semantic_map_from_observation(
                     state=state,
