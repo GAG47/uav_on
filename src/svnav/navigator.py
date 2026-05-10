@@ -10,6 +10,7 @@ from svnav.types import (
     ActionSource,
     NavDecision,
     NavMode,
+    NavigationWaypoint,
     ObservationRecord,
     PoseRecord,
 )
@@ -92,27 +93,74 @@ class SearchNavigator:
         observation: ObservationRecord,
         semantic_map: SemanticMap,
     ) -> NavDecision:
+        waypoint = self.select_search_waypoint(
+            episode_id=episode_id,
+            step_id=step_id,
+            observation=observation,
+            semantic_map=semantic_map,
+        )
+        command, feedback = self.action_adapter.follow_waypoint(
+            current_pose=observation.pose,
+            waypoint=waypoint,
+            observation=observation,
+            semantic_map=semantic_map,
+        )
+
+        debug = dict(waypoint.debug_info or {})
+        debug.update(command.debug_info or {})
+        debug["adapter_phase"] = command.phase
+        debug["navigation_waypoint"] = waypoint.to_log_dict()
+        debug["control_command"] = command.to_log_dict()
+        debug["controller_feedback"] = feedback.to_log_dict()
+
+        action_source = self._source_to_action_source(waypoint.source)
+        if command.source == "safety_hold":
+            action_source = ActionSource.SAFETY_HOLD
+
+        return NavDecision(
+            episode_id=episode_id,
+            step_id=step_id,
+            mode=NavMode.SEARCH,
+            target_type=waypoint.target_type,
+            target_position=waypoint.position,
+            target_id=waypoint.target_id,
+            action=command.action,
+            step_size=command.step_size,
+            action_source=action_source,
+            reason=command.reason or waypoint.reason,
+            debug_info=debug,
+        )
+
+    def select_search_waypoint(
+        self,
+        episode_id: str,
+        step_id: int,
+        observation: ObservationRecord,
+        semantic_map: SemanticMap,
+    ) -> NavigationWaypoint:
         current_pose = observation.pose
         episode_id = str(episode_id)
 
         if not semantic_map.is_pose_in_bounds(current_pose):
             target_position = semantic_map.nearest_in_bounds_position(current_pose)
             self.active_by_episode.pop(episode_id, None)
-
-            return self.action_adapter.target_to_action(
+            return NavigationWaypoint(
                 episode_id=episode_id,
                 step_id=step_id,
-                current_pose=current_pose,
-                target_position=target_position,
-                observation=observation,
-                semantic_map=semantic_map,
-                mode=NavMode.SEARCH,
+                waypoint_id="return_in_bounds_{}".format(step_id),
+                mode="search",
+                position=tuple(target_position),
+                desired_yaw=current_pose.yaw,
+                source=ActionSource.GEOMETRIC_EXPLORE.value,
                 target_type="in_bounds_region",
-                action_source=ActionSource.GEOMETRIC_EXPLORE,
+                target_id=None,
+                region_id=None,
+                arrive_radius=self.action_adapter.config.position_tolerance,
                 reason="uav outside semantic map; return to nearest in-bounds position",
                 debug_info={
                     "navigator_reason": "out_of_bounds",
                     "target_position": list(target_position),
+                    "map_debug": self._build_map_debug(semantic_map, top_k=3),
                 },
             )
 
@@ -125,7 +173,6 @@ class SearchNavigator:
         )
 
         created_new = False
-
         if active is None or replan_reason is not None:
             viewpoint = self.viewpoint_planner.plan_best_viewpoint(
                 current_pose=current_pose,
@@ -135,18 +182,27 @@ class SearchNavigator:
 
             if viewpoint is None:
                 self.active_by_episode.pop(episode_id, None)
-                return NavDecision(
+                return NavigationWaypoint(
                     episode_id=episode_id,
                     step_id=step_id,
-                    mode=NavMode.SEARCH,
+                    waypoint_id="observe_rotate_{}".format(step_id),
+                    mode="search",
+                    position=(float(current_pose.x), float(current_pose.y), float(current_pose.z)),
+                    desired_yaw=float(current_pose.yaw) + self.action_adapter.config.rotation_step_min,
+                    source=ActionSource.GEOMETRIC_EXPLORE.value,
                     target_type="none",
-                    action="rotl",
-                    step_size=self.action_adapter.config.rotation_step_min,
-                    action_source=ActionSource.GEOMETRIC_EXPLORE,
+                    arrive_radius=self.action_adapter.config.position_tolerance,
                     reason="no valid search viewpoint; rotate to observe",
                     debug_info={
                         "navigator_reason": "no_valid_viewpoint",
                         "replan_reason": replan_reason,
+                        "fallback_action": "rotate_observe",
+                        "map_debug": self._build_map_debug(semantic_map, top_k=3),
+                        "region_debug": self._build_region_debug(
+                            current_pose,
+                            semantic_map,
+                            top_k=3,
+                        ),
                     },
                 )
 
@@ -165,48 +221,50 @@ class SearchNavigator:
 
         viewpoint = active.viewpoint
         source = (
-            ActionSource.SEMANTIC_MAP
+            ActionSource.SEMANTIC_MAP.value
             if viewpoint.region.source == "semantic"
-            else ActionSource.GEOMETRIC_EXPLORE
+            else ActionSource.GEOMETRIC_EXPLORE.value
         )
 
-        return self.action_adapter.follow_viewpoint(
+        debug_info = {
+            "navigator_reason": "follow_active_viewpoint",
+            "active_viewpoint": active.to_log_dict(),
+            "viewpoint_id": getattr(viewpoint, "viewpoint_id", None),
+            "region_id": getattr(viewpoint, "region_id", None),
+            "viewpoint_distance": self._distance_to_viewpoint(current_pose, viewpoint),
+            "viewpoint_yaw_error": self._view_yaw_error(current_pose, viewpoint),
+            "progress_metric": self._progress_metric(current_pose, viewpoint),
+            "map_debug": self._build_map_debug(semantic_map, top_k=3),
+            "region_debug": self._build_region_debug(
+                current_pose,
+                semantic_map,
+                top_k=3,
+            ),
+        }
+
+        return NavigationWaypoint(
             episode_id=episode_id,
             step_id=step_id,
-            current_pose=current_pose,
-            viewpoint=viewpoint,
-            observation=observation,
-            semantic_map=semantic_map,
-            mode=NavMode.SEARCH,
+            waypoint_id=str(getattr(viewpoint, "viewpoint_id", "search_viewpoint")),
+            mode="search",
+            position=tuple(viewpoint.position),
+            desired_yaw=float(viewpoint.yaw),
+            source=source,
             target_type="search_viewpoint",
-            action_source=source,
+            target_id=getattr(viewpoint, "viewpoint_id", None),
+            region_id=getattr(viewpoint, "region_id", None),
+            arrive_radius=self.action_adapter.config.position_tolerance,
+            yaw_tolerance=self.action_adapter.config.observe_yaw_tolerance_deg,
             reason="follow active search viewpoint",
-            debug_info={
-                "navigator_reason": "follow_active_viewpoint",
-                "active_viewpoint": active.to_log_dict(),
-                "viewpoint_distance": self._distance_to_viewpoint(
-                    current_pose,
-                    viewpoint,
-                ),
-                "viewpoint_yaw_error": self._view_yaw_error(
-                    current_pose,
-                    viewpoint,
-                ),
-                "progress_metric": self._progress_metric(
-                    current_pose,
-                    viewpoint,
-                ),
-                "map_debug": self._build_map_debug(
-                    semantic_map,
-                    top_k=3,
-                ),
-                "region_debug": self._build_region_debug(
-                    current_pose,
-                    semantic_map,
-                    top_k=3,
-                ),
-            },
+            debug_info=debug_info,
         )
+
+    @staticmethod
+    def _source_to_action_source(source: str) -> ActionSource:
+        try:
+            return ActionSource(source)
+        except Exception:
+            return ActionSource.GEOMETRIC_EXPLORE
 
     def _need_replan(
         self,
