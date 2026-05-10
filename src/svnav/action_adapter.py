@@ -39,9 +39,20 @@ class ActionAdapterConfig:
     rotate_left_action: str = "rotl"
     rotate_right_action: str = "rotr"
 
-    min_safe_depth: float = 2.0
-    depth_percentile: float = 20.0
     use_depth_safety: bool = True
+    depth_percentile: float = 20.0
+
+    # Step-aware depth safety.
+    # If the controller wants to move 5m, the corresponding depth direction
+    # should be at least 5m + depth_safety_margin. Otherwise the step is clipped
+    # or rejected.
+    depth_safety_margin: float = 0.8
+    min_safe_translation_step: float = 0.75
+    unsafe_depth_hard_stop: float = 0.9
+
+    # Kept for compatibility with older code/logs. The new safety check is
+    # step-aware and does not rely on this fixed threshold alone.
+    min_safe_depth: float = 2.0
 
     def __post_init__(self) -> None:
         self.translation_step_min = float(self.translation_step_min)
@@ -55,8 +66,11 @@ class ActionAdapterConfig:
         self.strafe_yaw_threshold_deg = float(self.strafe_yaw_threshold_deg)
         self.observe_yaw_tolerance_deg = float(self.observe_yaw_tolerance_deg)
 
-        self.min_safe_depth = float(self.min_safe_depth)
         self.depth_percentile = float(self.depth_percentile)
+        self.depth_safety_margin = float(self.depth_safety_margin)
+        self.min_safe_translation_step = float(self.min_safe_translation_step)
+        self.unsafe_depth_hard_stop = float(self.unsafe_depth_hard_stop)
+        self.min_safe_depth = float(self.min_safe_depth)
 
         if self.translation_step_min <= 0.0:
             self.translation_step_min = 1.0
@@ -73,17 +87,24 @@ class ActionAdapterConfig:
         if self.hard_turn_yaw_threshold_deg < self.soft_turn_yaw_threshold_deg:
             self.hard_turn_yaw_threshold_deg = self.soft_turn_yaw_threshold_deg
 
+        if self.depth_safety_margin < 0.0:
+            self.depth_safety_margin = 0.0
+        if self.min_safe_translation_step <= 0.0:
+            self.min_safe_translation_step = 0.5
+        if self.unsafe_depth_hard_stop <= 0.0:
+            self.unsafe_depth_hard_stop = 0.5
+
 
 class ActionAdapter:
     """
-    Waypoint controller for SVNav.
+    Safety-aware waypoint controller for SVNav.
 
     The navigator selects a continuous waypoint. This adapter tracks that
     waypoint and converts it to UAV-ON's existing parameterized bottom-level
     action API.
 
-    This file does not add Inspect, does not change TargetEvidence, and does
-    not change StopGate.
+    Search and Approach both use this controller. Therefore depth safety here
+    protects both exploration movement and target-approach movement.
     """
 
     def __init__(self, config: Optional[ActionAdapterConfig] = None) -> None:
@@ -148,7 +169,7 @@ class ActionAdapter:
                 "distance_to_waypoint": distance_xy,
                 "yaw_to_waypoint_deg": yaw_to_waypoint_deg,
                 "observe_yaw_error_deg": observe_yaw_error_deg,
-                "controller": "continuous_waypoint_controller",
+                "controller": "safety_aware_continuous_waypoint_controller",
                 "hard_turn_yaw_threshold_deg": self.config.hard_turn_yaw_threshold_deg,
                 "soft_turn_yaw_threshold_deg": self.config.soft_turn_yaw_threshold_deg,
             }
@@ -217,46 +238,58 @@ class ActionAdapter:
 
         if abs_yaw >= self.config.soft_turn_yaw_threshold_deg:
             preferred_actions = self._soft_translation_actions(yaw_to_waypoint_deg)
-            step_size = self._soft_translation_step(distance_xy, abs_yaw)
+            requested_step = self._soft_translation_step(distance_xy, abs_yaw)
             phase = "turn_while_tracking_waypoint"
         else:
             preferred_actions = self._direct_translation_actions(yaw_to_waypoint_deg)
-            step_size = self._translation_step(distance_xy)
+            requested_step = self._translation_step(distance_xy)
             phase = "move_to_waypoint"
 
+        safety_reports: List[Dict[str, Any]] = []
         for action in preferred_actions:
-            if self._is_action_safe(
+            report = self._evaluate_translation_candidate(
                 action=action,
                 current_pose=current_pose,
                 observation=observation,
                 semantic_map=semantic_map,
-                step_size=step_size,
+                requested_step_size=requested_step,
                 waypoint_position=position,
-            ):
-                debug["preferred_actions"] = preferred_actions
-                debug["selected_action"] = action
-                debug["selected_step_size"] = step_size
-                command = ControlCommand(
-                    action=action,
-                    step_size=step_size,
-                    source="waypoint_controller",
-                    phase=phase,
-                    reason=waypoint.reason or "follow continuous waypoint",
-                    waypoint_id=waypoint.waypoint_id,
-                    debug_info=debug,
-                )
-                feedback = self._build_feedback(
-                    waypoint=waypoint,
-                    distance_xy=distance_xy,
-                    yaw_to_waypoint_deg=yaw_to_waypoint_deg,
-                    observe_yaw_error_deg=observe_yaw_error_deg,
-                    command=command,
-                    last_feedback=last_feedback,
-                    translation_safe=True,
-                )
-                return command, feedback
+            )
+            safety_reports.append(report)
 
-        action, fallback_step, safe_reason = self._safe_scan_action(
+            if not report["safe"]:
+                continue
+
+            selected_step = float(report["step_size"])
+            debug["preferred_actions"] = preferred_actions
+            debug["selected_action"] = action
+            debug["requested_step_size"] = float(requested_step)
+            debug["selected_step_size"] = selected_step
+            debug["safety_adjusted"] = bool(report.get("safety_adjusted", False))
+            debug["depth_safety"] = report.get("depth_safety", {})
+            debug["translation_safety_reports"] = safety_reports
+
+            command = ControlCommand(
+                action=action,
+                step_size=selected_step,
+                source="waypoint_controller",
+                phase=phase,
+                reason=waypoint.reason or "follow continuous waypoint",
+                waypoint_id=waypoint.waypoint_id,
+                debug_info=debug,
+            )
+            feedback = self._build_feedback(
+                waypoint=waypoint,
+                distance_xy=distance_xy,
+                yaw_to_waypoint_deg=yaw_to_waypoint_deg,
+                observe_yaw_error_deg=observe_yaw_error_deg,
+                command=command,
+                last_feedback=last_feedback,
+                translation_safe=True,
+            )
+            return command, feedback
+
+        action, fallback_step, safe_reason, safe_debug = self._safe_scan_action(
             current_pose=current_pose,
             observation=observation,
             semantic_map=semantic_map,
@@ -265,9 +298,12 @@ class ActionAdapter:
             yaw_error_deg=yaw_to_waypoint_deg,
         )
         debug["preferred_actions"] = preferred_actions
+        debug["requested_step_size"] = float(requested_step)
         debug["selected_action"] = action
         debug["selected_step_size"] = fallback_step
         debug["safe_reason"] = safe_reason
+        debug["translation_safety_reports"] = safety_reports
+        debug["fallback_safety"] = safe_debug
 
         command = ControlCommand(
             action=action,
@@ -466,7 +502,7 @@ class ActionAdapter:
         waypoint_position: Tuple[float, float, float],
         preferred_actions: List[str],
         yaw_error_deg: float,
-    ) -> Tuple[str, float, str]:
+    ) -> Tuple[str, float, str, Dict[str, Any]]:
         translation_candidates = []
         for action in preferred_actions + [
             self.config.forward_action,
@@ -478,23 +514,156 @@ class ActionAdapter:
 
         micro_steps = [
             self.config.translation_step_min,
-            max(0.5, self.config.translation_step_min * 0.5),
+            max(self.config.min_safe_translation_step, self.config.translation_step_min * 0.5),
+            self.config.min_safe_translation_step,
         ]
 
+        reports: List[Dict[str, Any]] = []
         for step_size in micro_steps:
             for action in translation_candidates:
-                if self._is_action_safe(
+                report = self._evaluate_translation_candidate(
                     action=action,
                     current_pose=current_pose,
                     observation=observation,
                     semantic_map=semantic_map,
-                    step_size=step_size,
+                    requested_step_size=step_size,
                     waypoint_position=waypoint_position,
-                ):
-                    return action, step_size, "micro translation selected after safety check"
+                )
+                reports.append(report)
+                if report["safe"]:
+                    return (
+                        action,
+                        float(report["step_size"]),
+                        "micro translation selected after step-aware depth safety check",
+                        {"reports": reports, "selected_report": report},
+                    )
 
         action = self._turn_action(yaw_error_deg)
-        return action, self.config.rotation_step_min, "no safe translation; minimal rotate for observation"
+        return (
+            action,
+            self.config.rotation_step_min,
+            "no safe translation; minimal rotate for observation",
+            {"reports": reports},
+        )
+
+    def _evaluate_translation_candidate(
+        self,
+        action: str,
+        current_pose: PoseRecord,
+        observation: Optional[ObservationRecord],
+        semantic_map: Optional[SemanticMap],
+        requested_step_size: float,
+        waypoint_position: Tuple[float, float, float],
+    ) -> Dict[str, Any]:
+        requested_step_size = float(requested_step_size)
+
+        report: Dict[str, Any] = {
+            "action": action,
+            "requested_step_size": requested_step_size,
+            "step_size": requested_step_size,
+            "safe": True,
+            "safety_adjusted": False,
+            "reason": "safe",
+            "depth_safety": {},
+            "boundary_safe": True,
+        }
+
+        if action not in (
+            self.config.forward_action,
+            self.config.left_action,
+            self.config.right_action,
+        ):
+            return report
+
+        depth_report = self._clip_step_by_depth(
+            action=action,
+            observation=observation,
+            requested_step_size=requested_step_size,
+        )
+        report["depth_safety"] = depth_report
+
+        if not depth_report["safe"]:
+            report["safe"] = False
+            report["reason"] = depth_report["reason"]
+            report["step_size"] = 0.0
+            return report
+
+        adjusted_step = float(depth_report["step_size"])
+        report["step_size"] = adjusted_step
+        report["safety_adjusted"] = bool(depth_report.get("safety_adjusted", False))
+
+        if not self._is_boundary_safe(
+            action=action,
+            current_pose=current_pose,
+            semantic_map=semantic_map,
+            step_size=adjusted_step,
+            waypoint_position=waypoint_position,
+        ):
+            report["safe"] = False
+            report["boundary_safe"] = False
+            report["reason"] = "boundary unsafe"
+            return report
+
+        return report
+
+    def _clip_step_by_depth(
+        self,
+        action: str,
+        observation: Optional[ObservationRecord],
+        requested_step_size: float,
+    ) -> Dict[str, Any]:
+        requested_step_size = float(requested_step_size)
+        result: Dict[str, Any] = {
+            "depth_available": False,
+            "depth_value": None,
+            "requested_step_size": requested_step_size,
+            "step_size": requested_step_size,
+            "required_clearance": requested_step_size + self.config.depth_safety_margin,
+            "safety_adjusted": False,
+            "safe": True,
+            "reason": "depth unavailable or disabled",
+        }
+
+        if not self.config.use_depth_safety:
+            result["reason"] = "depth safety disabled"
+            return result
+
+        depth_value = self._get_action_depth_value(action, observation)
+        if depth_value is None:
+            return result
+
+        depth_value = float(depth_value)
+        result["depth_available"] = True
+        result["depth_value"] = depth_value
+
+        if depth_value <= self.config.unsafe_depth_hard_stop:
+            result["safe"] = False
+            result["step_size"] = 0.0
+            result["reason"] = "depth below hard stop"
+            return result
+
+        available_step = depth_value - self.config.depth_safety_margin
+        result["available_step"] = available_step
+
+        if available_step >= requested_step_size:
+            result["safe"] = True
+            result["step_size"] = requested_step_size
+            result["reason"] = "depth supports requested step"
+            return result
+
+        if available_step >= self.config.min_safe_translation_step:
+            clipped_step = min(requested_step_size, available_step)
+            clipped_step = max(self.config.min_safe_translation_step, clipped_step)
+            result["safe"] = True
+            result["step_size"] = float(clipped_step)
+            result["safety_adjusted"] = True
+            result["reason"] = "step clipped by depth"
+            return result
+
+        result["safe"] = False
+        result["step_size"] = 0.0
+        result["reason"] = "not enough clearance for minimum safe translation"
+        return result
 
     def _translation_step(self, distance: float) -> float:
         return self._clamp(distance, self.config.translation_step_min, self.config.translation_step_max)
@@ -522,20 +691,16 @@ class ActionAdapter:
         step_size: float,
         waypoint_position: Tuple[float, float, float],
     ) -> bool:
-        if not self._is_boundary_safe(
-            action=action,
-            current_pose=current_pose,
-            semantic_map=semantic_map,
-            step_size=step_size,
-            waypoint_position=waypoint_position,
-        ):
-            return False
-
-        if self.config.use_depth_safety:
-            if not self._is_depth_safe(action, observation):
-                return False
-
-        return True
+        return bool(
+            self._evaluate_translation_candidate(
+                action=action,
+                current_pose=current_pose,
+                observation=observation,
+                semantic_map=semantic_map,
+                requested_step_size=step_size,
+                waypoint_position=waypoint_position,
+            )["safe"]
+        )
 
     def _is_boundary_safe(
         self,
@@ -598,28 +763,48 @@ class ActionAdapter:
             quaternion=pose.quaternion,
         )
 
+    def _get_action_depth_value(
+        self,
+        action: str,
+        observation: Optional[ObservationRecord],
+    ) -> Optional[float]:
+        if observation is None:
+            return None
+
+        view_id = self._action_to_view(action)
+        if view_id is None:
+            return None
+
+        frame = None
+        try:
+            frame = observation.get_frame(view_id)
+        except Exception:
+            frame = None
+
+        if frame is None:
+            return None
+
+        values = self._extract_depth_values(frame.depth, frame.depth_grid3x3)
+        if values.size == 0:
+            return None
+
+        depth_value = float(np.percentile(values, self.config.depth_percentile))
+        if not np.isfinite(depth_value) or depth_value <= 0.0:
+            return None
+
+        return depth_value
+
     def _is_depth_safe(
         self,
         action: str,
         observation: Optional[ObservationRecord],
     ) -> bool:
-        if observation is None:
-            return True
-
-        view_id = self._action_to_view(action)
-        if view_id is None:
-            return True
-
-        frame = observation.get_frame(view_id)
-        if frame is None:
-            return True
-
-        values = self._extract_depth_values(frame.depth, frame.depth_grid3x3)
-        if values.size == 0:
-            return True
-
-        depth_value = float(np.percentile(values, self.config.depth_percentile))
-        return depth_value >= self.config.min_safe_depth
+        report = self._clip_step_by_depth(
+            action=action,
+            observation=observation,
+            requested_step_size=self.config.translation_step_min,
+        )
+        return bool(report["safe"])
 
     def _action_to_view(self, action: str) -> Optional[ViewID]:
         if action == self.config.forward_action:
@@ -667,6 +852,7 @@ class ActionAdapter:
             or "return_in_bounds" in waypoint_id
             or "outside semantic map" in reason
             or "nearest in-bounds" in reason
+            or "interior in-bounds" in reason
         )
 
     @staticmethod
