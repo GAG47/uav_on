@@ -10,6 +10,7 @@ import numpy as np
 
 from common.param import args
 from model_wrapper.ON_Air_2 import ONAir
+from svnav.async_manager import AsyncManager, AsyncManagerConfig
 
 from svnav.gdino_client import GDINOClientConfig, SVNavGDINOClient
 from svnav.keyframe_manager import (
@@ -24,6 +25,7 @@ from svnav.task1_reasoner import Task1Reasoner, Task1ReasonerConfig
 from svnav.target_verifier import TargetVerifier, TargetVerifierConfig
 from svnav.target_evidence import TargetEvidenceManager, TargetEvidenceManagerConfig
 from svnav.types import (
+    AsyncTaskType,
     FrameRecord,
     GDINOResult,
     NavMode,
@@ -48,6 +50,7 @@ class SVNAVEpisodeState:
     target_verifier: TargetVerifier
     target_evidence_manager: TargetEvidenceManager
     navigator: SearchNavigator
+    async_manager: AsyncManager
 
     created_at: float = field(default_factory=now_ts)
     last_step_id: int = -1
@@ -95,6 +98,7 @@ class SVNAVEpisodeState:
             "gdino_keyframe_manager": self.gdino_keyframe_manager.to_log_dict(),
             "target_verifier": self.target_verifier.to_log_dict(),
             "target_evidence_manager": self.target_evidence_manager.to_log_dict(),
+            "async_manager": self.async_manager.to_log_dict(),
             "last_task2_batch_id": self.last_task2_batch_id,
             "last_task2_summary": self.last_task2_summary,
             "last_task2_cleanup_summary": self.last_task2_cleanup_summary,
@@ -134,6 +138,32 @@ class ONAirSV(ONAir):
             )
         )
         self.gdino_client = SVNavGDINOClient(GDINOClientConfig.from_env())
+
+    def _cleanup_svnav_episode_async(self, episode_id: str) -> None:
+        state = self.svnav_states.get(episode_id)
+        if state is None:
+            return
+
+        manager = getattr(state, "async_manager", None)
+        if manager is None:
+            return
+
+        try:
+            summary = manager.cleanup_episode(episode_id)
+            manager.shutdown()
+            print(
+                "[SVNavAsync] cleanup episode={} removed_inflight={}".format(
+                    episode_id,
+                    summary.get("removed_inflight", 0),
+                )
+            )
+        except Exception as exc:
+            print(
+                "[SVNavAsync] cleanup episode={} error={}".format(
+                    episode_id,
+                    exc,
+                )
+            )
 
     # ------------------------------------------------------------------
     # Main eval interface
@@ -178,6 +208,10 @@ class ONAirSV(ONAir):
                     current_pose.z,
                     current_pose.yaw,
                 ]
+                previous_episode_id = self.batch_episode_ids[batch_index]
+                if previous_episode_id and previous_episode_id != episode_id:
+                    self._cleanup_svnav_episode_async(previous_episode_id)
+
                 self.batch_episode_ids[batch_index] = episode_id
 
                 state = self._ensure_episode_state(
@@ -208,7 +242,7 @@ class ONAirSV(ONAir):
                     )
                     state.frame_lookup = dict(items[-120:])
 
-                self._update_semantic_map_from_observation(
+                self._observe_semantic_map_and_submit_task1_async(
                     state=state,
                     observation=observation,
                     step_id=step_id,
@@ -266,11 +300,30 @@ class ONAirSV(ONAir):
                 episode_id = item["episode_id"]
                 step_id = item["step_id"]
 
+                self._poll_svnav_async_results(
+                    state=state,
+                    episode_id=episode_id,
+                    step_id=step_id,
+                )
+
+                self._update_target_cues_to_semantic_map(
+                    state=state,
+                    step_id=step_id,
+                )
+
                 decision = self._select_svnav_navigation_decision(
                     state=state,
                     episode_id=episode_id,
                     step_id=step_id,
                     observation=observation,
+                )
+
+                decision = self._svnav_apply_pre_action_safety(
+                    state=state,
+                    episode_id=episode_id,
+                    step_id=step_id,
+                    observation=observation,
+                    decision=decision,
                 )
 
                 state.last_nav_decision = decision.to_log_dict()
@@ -309,6 +362,320 @@ class ONAirSV(ONAir):
         return actions, steps_size, predict_dones
 
 
+
+
+    # ------------------------------------------------------------------
+    # Async result application
+    # ------------------------------------------------------------------
+
+    def _poll_svnav_async_results(
+        self,
+        state: SVNAVEpisodeState,
+        episode_id: str,
+        step_id: int,
+    ) -> None:
+        if state is None or getattr(state, "async_manager", None) is None:
+            return
+
+        results = state.async_manager.poll_results(
+            current_step=step_id,
+            episode_id=episode_id,
+        )
+
+        for async_record in results:
+            if async_record.episode_id != state.episode_id:
+                print(
+                    "[SVNavAsync] drop episode={} step={} type={} request={} reason=episode_mismatch".format(
+                        episode_id,
+                        step_id,
+                        async_record.task_type.value,
+                        async_record.request_id,
+                    )
+                )
+                continue
+
+            if async_record.is_stale(state.async_manager.config):
+                self._drop_stale_async_result(
+                    state=state,
+                    async_record=async_record,
+                    step_id=step_id,
+                )
+                continue
+
+            if not async_record.success:
+                self._apply_failed_async_result(
+                    state=state,
+                    async_record=async_record,
+                    step_id=step_id,
+                )
+                continue
+
+            if async_record.task_type == AsyncTaskType.TASK1:
+                self._apply_async_task1_result(
+                    state=state,
+                    async_record=async_record,
+                    step_id=step_id,
+                )
+            elif async_record.task_type == AsyncTaskType.GDINO:
+                self._apply_async_gdino_result(
+                    state=state,
+                    async_record=async_record,
+                    step_id=step_id,
+                )
+            elif async_record.task_type == AsyncTaskType.TASK2:
+                self._apply_async_task2_result(
+                    state=state,
+                    async_record=async_record,
+                    step_id=step_id,
+                )
+
+    def _drop_stale_async_result(
+        self,
+        state: SVNAVEpisodeState,
+        async_record,
+        step_id: int,
+    ) -> None:
+        if async_record.task_type == AsyncTaskType.TASK1:
+            try:
+                state.keyframe_manager.mark_request_completed(async_record.request_id)
+            except Exception:
+                pass
+        elif async_record.task_type == AsyncTaskType.GDINO:
+            try:
+                state.gdino_keyframe_manager.mark_request_completed(async_record.request_id)
+            except Exception:
+                pass
+        elif async_record.task_type == AsyncTaskType.TASK2:
+            try:
+                state.target_verifier.mark_batch_completed(async_record.request_id)
+            except Exception:
+                pass
+
+        print(
+            "[SVNavAsync] drop episode={} step={} type={} request={} reason=stale age_steps={}".format(
+                state.episode_id,
+                step_id,
+                async_record.task_type.value,
+                async_record.request_id,
+                async_record.age_steps,
+            )
+        )
+
+    def _apply_failed_async_result(
+        self,
+        state: SVNAVEpisodeState,
+        async_record,
+        step_id: int,
+    ) -> None:
+        if async_record.task_type == AsyncTaskType.TASK1:
+            try:
+                cleanup = state.keyframe_manager.mark_request_completed(
+                    async_record.request_id
+                )
+            except Exception:
+                cleanup = None
+            state.last_task1_cleanup_summary = cleanup
+            state.last_task1_update_summary = {
+                "accepted": False,
+                "reason": "async_task1_failed",
+                "request_id": async_record.request_id,
+                "error": async_record.error,
+            }
+        elif async_record.task_type == AsyncTaskType.GDINO:
+            try:
+                cleanup = state.gdino_keyframe_manager.mark_request_completed(
+                    async_record.request_id
+                )
+            except Exception:
+                cleanup = None
+            state.last_gdino_cleanup_summary = cleanup
+            state.last_gdino_summary = {
+                "request_id": async_record.request_id,
+                "success": False,
+                "candidate_count": 0,
+                "error": async_record.error,
+            }
+        elif async_record.task_type == AsyncTaskType.TASK2:
+            try:
+                cleanup = state.target_verifier.mark_batch_completed(
+                    async_record.request_id
+                )
+            except Exception:
+                cleanup = None
+            state.last_task2_cleanup_summary = cleanup
+            state.last_task2_summary = {
+                "batch_id": async_record.request_id,
+                "result_count": 0,
+                "error": async_record.error,
+            }
+
+        shorten = getattr(
+            self,
+            "_svnav_debug_shorten",
+            lambda value, limit=180: str(value)[:limit],
+        )
+        print(
+            "[SVNavAsync] failed episode={} step={} type={} request={} error={}".format(
+                state.episode_id,
+                step_id,
+                async_record.task_type.value,
+                async_record.request_id,
+                shorten(async_record.error, limit=180),
+            )
+        )
+
+    def _apply_async_task1_result(
+        self,
+        state: SVNAVEpisodeState,
+        async_record,
+        step_id: int,
+    ) -> None:
+        task1_result = async_record.result
+        try:
+            task1_result.return_step = int(step_id)
+        except Exception:
+            pass
+
+        apply_summary = self.apply_task1_result_to_map(
+            episode_id=state.episode_id,
+            task1_result=task1_result,
+        )
+
+        if apply_summary.get("accepted"):
+            print(
+                "[SVNavTask1] episode={} submit_step={} return_step={} request={} "
+                "success={} updated_cells={} latency_ms={} age_steps={}".format(
+                    state.episode_id,
+                    async_record.submit_step,
+                    step_id,
+                    async_record.request_id,
+                    getattr(task1_result, "success", None),
+                    apply_summary.get("update_summary", {}).get("updated_cells", 0),
+                    self._svnav_debug_fmt(async_record.latency_ms)
+                    if hasattr(self, "_svnav_debug_fmt")
+                    else async_record.latency_ms,
+                    async_record.age_steps,
+                )
+            )
+        else:
+            print(
+                "[SVNavTask1] episode={} submit_step={} return_step={} request={} rejected={}".format(
+                    state.episode_id,
+                    async_record.submit_step,
+                    step_id,
+                    async_record.request_id,
+                    apply_summary.get("reason"),
+                )
+            )
+
+    def _apply_async_gdino_result(
+        self,
+        state: SVNAVEpisodeState,
+        async_record,
+        step_id: int,
+    ) -> None:
+        gdino_result = async_record.result
+        request = async_record.request
+        update = (async_record.metadata or {}).get("update")
+
+        try:
+            gdino_result.return_step = int(step_id)
+        except Exception:
+            pass
+
+        self._update_task2_from_gdino_result(
+            state=state,
+            gdino_result=gdino_result,
+            step_id=step_id,
+        )
+
+        cleanup_summary = state.gdino_keyframe_manager.mark_request_completed(
+            async_record.request_id
+        )
+
+        state.latest_gdino_result = gdino_result
+        state.gdino_history.append(gdino_result)
+        if len(state.gdino_history) > 50:
+            state.gdino_history = state.gdino_history[-50:]
+
+        state.last_gdino_result_id = gdino_result.request_id
+        state.last_gdino_cleanup_summary = cleanup_summary
+
+        if update is not None and request is not None:
+            state.last_gdino_summary = self._build_gdino_summary(
+                request=request,
+                result=gdino_result,
+                update=update,
+            )
+            self._print_svnav_gdino_summary(
+                state=state,
+                request=request,
+                result=gdino_result,
+                update=update,
+            )
+        else:
+            candidates = gdino_result.candidates or []
+            state.last_gdino_summary = {
+                "request_id": gdino_result.request_id,
+                "success": bool(gdino_result.success),
+                "candidate_count": len(candidates),
+                "error": gdino_result.error,
+                "latency_ms": gdino_result.latency_ms,
+            }
+
+    def _apply_async_task2_result(
+        self,
+        state: SVNAVEpisodeState,
+        async_record,
+        step_id: int,
+    ) -> None:
+        results = async_record.result or []
+        batch = async_record.request
+        update = (async_record.metadata or {}).get("update")
+
+        for result in results:
+            try:
+                result.return_step = int(step_id)
+            except Exception:
+                pass
+
+        cleanup = state.target_verifier.mark_batch_completed(async_record.request_id)
+
+        state.latest_task2_results = results
+        state.task2_history.extend(results)
+        if len(state.task2_history) > 80:
+            state.task2_history = state.task2_history[-80:]
+
+        state.last_task2_cleanup_summary = cleanup
+
+        if batch is not None and update is not None:
+            state.last_task2_summary = self._build_task2_summary(
+                batch=batch,
+                results=results,
+                update=update,
+            )
+            self._update_target_evidence_from_task2_results(
+                state=state,
+                results=results,
+                step_id=step_id,
+            )
+            self._print_svnav_task2_summary(
+                state=state,
+                batch=batch,
+                results=results,
+                update=update,
+            )
+        else:
+            state.last_task2_summary = {
+                "batch_id": async_record.request_id,
+                "result_count": len(results),
+                "error": None,
+            }
+            self._update_target_evidence_from_task2_results(
+                state=state,
+                results=results,
+                step_id=step_id,
+            )
 
     # ------------------------------------------------------------------
     # Search / Approach mode selection
@@ -809,6 +1176,107 @@ class ONAirSV(ONAir):
     # End SVNav StopGate helpers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # SVNav PreActionSafety helpers
+    # ------------------------------------------------------------------
+
+    def _svnav_get_pre_action_safety_gate(self, state):
+        gate = getattr(state, "pre_action_safety_gate", None)
+        if gate is not None:
+            return gate
+
+        try:
+            from svnav.pre_action_safety import (
+                PreActionSafetyConfig,
+                PreActionSafetyGate,
+            )
+        except Exception:
+            return None
+
+        gate = PreActionSafetyGate(PreActionSafetyConfig())
+        setattr(state, "pre_action_safety_gate", gate)
+        return gate
+
+    def _svnav_apply_pre_action_safety(
+        self,
+        state,
+        episode_id,
+        step_id,
+        observation,
+        decision,
+    ):
+        gate = self._svnav_get_pre_action_safety_gate(state)
+        if gate is None:
+            return decision
+
+        semantic_map = getattr(state, "semantic_map", None)
+
+        filtered_decision, result = gate.filter_decision(
+            decision=decision,
+            observation=observation,
+            semantic_map=semantic_map,
+        )
+
+        setattr(state, "last_pre_action_safety_result", result.to_log_dict())
+
+        if result.changed or not result.safe:
+            print(
+                "[SVNavPreActionSafety] episode={} step={} changed={} safe={} "
+                "reason={} original={}:{} final={}:{}".format(
+                    episode_id,
+                    step_id,
+                    result.changed,
+                    result.safe,
+                    result.reason,
+                    result.original_action,
+                    self._svnav_debug_fmt(result.original_step_size)
+                    if hasattr(self, "_svnav_debug_fmt") else result.original_step_size,
+                    result.final_action,
+                    self._svnav_debug_fmt(result.final_step_size)
+                    if hasattr(self, "_svnav_debug_fmt") else result.final_step_size,
+                )
+            )
+
+            original = result.original_check
+            selected = result.selected_check
+            if original is not None:
+                print(
+                    "[SVNavPreActionSafetyDebug] original action={} safe={} "
+                    "reason={} depth={} min_depth={} view={} boundary={}".format(
+                        original.action,
+                        original.safe,
+                        original.reason,
+                        self._svnav_debug_fmt(original.depth_value)
+                        if hasattr(self, "_svnav_debug_fmt") else original.depth_value,
+                        self._svnav_debug_fmt(original.min_depth)
+                        if hasattr(self, "_svnav_debug_fmt") else original.min_depth,
+                        original.view_id,
+                        original.boundary_safe,
+                    )
+                )
+
+            if selected is not None and selected is not original:
+                print(
+                    "[SVNavPreActionSafetyDebug] selected action={} safe={} "
+                    "reason={} depth={} min_depth={} view={} boundary={}".format(
+                        selected.action,
+                        selected.safe,
+                        selected.reason,
+                        self._svnav_debug_fmt(selected.depth_value)
+                        if hasattr(self, "_svnav_debug_fmt") else selected.depth_value,
+                        self._svnav_debug_fmt(selected.min_depth)
+                        if hasattr(self, "_svnav_debug_fmt") else selected.min_depth,
+                        selected.view_id,
+                        selected.boundary_safe,
+                    )
+                )
+
+        return filtered_decision
+
+    # ------------------------------------------------------------------
+    # End SVNav PreActionSafety helpers
+    # ------------------------------------------------------------------
+
     def _select_svnav_navigation_decision(
         self,
         state: SVNAVEpisodeState,
@@ -1097,6 +1565,8 @@ class ONAirSV(ONAir):
     # GDINO Search keyframe update
     # ------------------------------------------------------------------
 
+
+
     def _update_gdino_from_observation(
         self,
         state: SVNAVEpisodeState,
@@ -1105,12 +1575,11 @@ class ONAirSV(ONAir):
         nav_decision: Any,
     ) -> None:
         """
-        Search-stage GDINO keyframe selection and candidate generation.
+        Search / Approach GDINO keyframe selection and async candidate generation.
 
-        This method intentionally does not change semantic_map, navigation
-        action, mode, Approach state, or Stop decision. It only asks the
-        GDINOKeyframeManager whether any admitted keyframe should be consumed,
-        calls the GDINO client when a request is built, and stores the result.
+        This method only submits a GDINO request. It does not wait for GDINO,
+        does not update SemanticMap, does not verify Task2, does not switch
+        navigation mode, and does not decide stop.
         """
         try:
             update = state.gdino_keyframe_manager.observe(
@@ -1137,36 +1606,42 @@ class ONAirSV(ONAir):
 
         state.last_gdino_request_id = request.request_id
 
-        gdino_result = self.gdino_client.detect_request(request)
-
-        self._update_task2_from_gdino_result(
-            state=state,
-            gdino_result=gdino_result,
-            step_id=step_id,
-        )
-
-        cleanup_summary = state.gdino_keyframe_manager.mark_request_completed(
-            request.request_id
-        )
-
-        state.latest_gdino_result = gdino_result
-        state.gdino_history.append(gdino_result)
-        if len(state.gdino_history) > 50:
-            state.gdino_history = state.gdino_history[-50:]
-
-        state.last_gdino_result_id = gdino_result.request_id
-        state.last_gdino_cleanup_summary = cleanup_summary
-        state.last_gdino_summary = self._build_gdino_summary(
+        submitted = state.async_manager.submit_gdino(
             request=request,
-            result=gdino_result,
-            update=update,
+            gdino_client=self.gdino_client,
+            metadata={
+                "update": update,
+                "source": "svnav_gdino_keyframe",
+            },
         )
 
-        self._print_svnav_gdino_summary(
-            state=state,
-            request=request,
-            result=gdino_result,
-            update=update,
+        if submitted is None:
+            cleanup_summary = state.gdino_keyframe_manager.mark_request_completed(
+                request.request_id
+            )
+            state.last_gdino_cleanup_summary = cleanup_summary
+            state.last_gdino_summary = {
+                "request_id": request.request_id,
+                "success": False,
+                "candidate_count": 0,
+                "error": "async_gdino_submit_rejected_or_disabled",
+                "cleanup_summary": cleanup_summary,
+            }
+            print(
+                "[SVNavGDINO] episode={} step={} request={} async_submit=rejected".format(
+                    state.episode_id,
+                    step_id,
+                    request.request_id,
+                )
+            )
+            return
+
+        print(
+            "[SVNavAsync] submit type=gdino episode={} step={} request={}".format(
+                state.episode_id,
+                step_id,
+                request.request_id,
+            )
         )
 
     def _build_gdino_summary(self, request, result, update) -> Dict[str, Any]:
@@ -1331,6 +1806,8 @@ class ONAirSV(ONAir):
     # Task2 target candidate verification
     # ------------------------------------------------------------------
 
+
+
     def _update_task2_from_gdino_result(
         self,
         state: SVNAVEpisodeState,
@@ -1338,11 +1815,12 @@ class ONAirSV(ONAir):
         step_id: int,
     ) -> None:
         """
-        Add filtered/geometrically-completed GDINO candidates into Task2 pending,
-        optionally verify a small batch, and store Task2Result.
+        Add filtered/geometrically-completed GDINO candidates into Task2 pending
+        and submit a Task2 verification batch asynchronously.
 
-        Task2 does not change action, semantic_map, navigation mode, Approach,
-        or Stop. TargetEvidence will consume Task2Result in the next step.
+        Task2 does not change action, SemanticMap, navigation mode, Approach,
+        or Stop. TargetEvidence consumes completed Task2Result only when
+        poll_results() returns it in the main thread.
         """
         try:
             update = state.target_verifier.observe_gdino_result(
@@ -1367,35 +1845,49 @@ class ONAirSV(ONAir):
 
         state.last_task2_batch_id = batch.batch_id
 
-        results = state.target_verifier.verify_batch(
+        submitted = state.async_manager.submit_task2(
             batch=batch,
-            return_step=step_id,
-        )
-        cleanup = state.target_verifier.mark_batch_completed(batch.batch_id)
-
-        state.latest_task2_results = results
-        state.task2_history.extend(results)
-        if len(state.task2_history) > 80:
-            state.task2_history = state.task2_history[-80:]
-
-        state.last_task2_cleanup_summary = cleanup
-        state.last_task2_summary = self._build_task2_summary(
-            batch=batch,
-            results=results,
-            update=update,
+            target_verifier=state.target_verifier,
+            metadata={
+                "update": update,
+                "source": "svnav_task2_candidate_verification",
+            },
         )
 
-        self._update_target_evidence_from_task2_results(
-            state=state,
-            results=results,
-            step_id=step_id,
-        )
+        if submitted is None:
+            cleanup = state.target_verifier.mark_batch_completed(batch.batch_id)
+            state.last_task2_cleanup_summary = cleanup
+            state.last_task2_summary = {
+                "batch_id": batch.batch_id,
+                "candidate_ids": batch.candidate_ids,
+                "result_count": 0,
+                "decision_counts": {
+                    "match": 0,
+                    "maybe": 0,
+                    "no": 0,
+                    "unknown": 0,
+                },
+                "accepted_count": len(update.accepted),
+                "rejected_count": len(update.rejected),
+                "pending_count": len(update.accepted),
+                "error": "async_task2_submit_rejected_or_disabled",
+            }
+            print(
+                "[SVNavTask2] episode={} step={} batch={} async_submit=rejected".format(
+                    state.episode_id,
+                    step_id,
+                    batch.batch_id,
+                )
+            )
+            return
 
-        self._print_svnav_task2_summary(
-            state=state,
-            batch=batch,
-            results=results,
-            update=update,
+        print(
+            "[SVNavAsync] submit type=task2 episode={} step={} batch={} candidates={}".format(
+                state.episode_id,
+                step_id,
+                batch.batch_id,
+                ",".join(batch.candidate_ids),
+            )
         )
 
     def _build_task2_summary(self, batch, results, update) -> Dict[str, Any]:
@@ -1460,12 +1952,20 @@ class ONAirSV(ONAir):
     # SVNav step update
     # ------------------------------------------------------------------
 
-    def _update_semantic_map_from_observation(
+
+    def _observe_semantic_map_and_submit_task1_async(
         self,
         state: SVNAVEpisodeState,
         observation: ObservationRecord,
         step_id: int,
     ) -> None:
+        """
+        Mark visited area synchronously, then submit Task1 asynchronously.
+
+        Task1Result is applied later in _poll_svnav_async_results().
+        The result must be projected using request-time frames and poses,
+        not the current pose when the result returns.
+        """
         state.semantic_map.mark_visited(observation.pose, step_id=step_id)
         state.semantic_map.decay(step_id)
 
@@ -1481,35 +1981,53 @@ class ONAirSV(ONAir):
 
         state.last_task1_request_id = request.request_id
 
-        task1_result = self.task1_reasoner.run(
+        submitted = state.async_manager.submit_task1(
             request=request,
-            return_step=step_id,
+            reasoner=self.task1_reasoner,
+            metadata={
+                "source": "svnav_task1_keyframe",
+            },
         )
 
-        apply_summary = self.apply_task1_result_to_map(
-            episode_id=state.episode_id,
-            task1_result=task1_result,
-        )
-
-        if apply_summary.get("accepted"):
+        if submitted is None:
+            cleanup_summary = state.keyframe_manager.mark_request_completed(
+                request.request_id
+            )
+            state.last_task1_cleanup_summary = cleanup_summary
+            state.last_task1_update_summary = {
+                "accepted": False,
+                "reason": "async_task1_submit_rejected_or_disabled",
+                "request_id": request.request_id,
+            }
             print(
-                "[SVNavTask1] episode={} step={} request={} success={} updated_cells={}".format(
+                "[SVNavTask1] episode={} step={} request={} async_submit=rejected".format(
                     state.episode_id,
                     step_id,
                     request.request_id,
-                    task1_result.success,
-                    apply_summary.get("update_summary", {}).get("updated_cells", 0),
                 )
             )
-        else:
-            print(
-                "[SVNavTask1] episode={} step={} request={} rejected={}".format(
-                    state.episode_id,
-                    step_id,
-                    request.request_id,
-                    apply_summary.get("reason"),
-                )
+            return
+
+        print(
+            "[SVNavAsync] submit type=task1 episode={} step={} request={}".format(
+                state.episode_id,
+                step_id,
+                request.request_id,
             )
+        )
+
+    def _update_semantic_map_from_observation(
+        self,
+        state: SVNAVEpisodeState,
+        observation: ObservationRecord,
+        step_id: int,
+    ) -> None:
+        # Backward compatible alias. The main SVNav loop now uses async Task1.
+        self._observe_semantic_map_and_submit_task1_async(
+            state=state,
+            observation=observation,
+            step_id=step_id,
+        )
 
     def apply_task1_result_to_map(
         self,
@@ -1652,6 +2170,11 @@ class ONAirSV(ONAir):
         navigator = SearchNavigator(
             config=navigator_config or SearchNavigatorConfig()
         )
+        async_manager = AsyncManager(
+            AsyncManagerConfig(
+                verbose=True,
+            )
+        )
 
         state = SVNAVEpisodeState(
             episode_id=episode_id,
@@ -1663,6 +2186,7 @@ class ONAirSV(ONAir):
             target_verifier=target_verifier,
             target_evidence_manager=target_evidence_manager,
             navigator=navigator,
+            async_manager=async_manager,
         )
 
         self.svnav_states[episode_id] = state
