@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from .types import (
     CandidateStatus,
     TargetEvidence,
+    TargetCueResult,
+    TargetCueScore,
     Task2Decision,
     Task2Result,
     clamp01,
@@ -192,6 +194,19 @@ class TargetEvidenceManagerConfig:
     recent_bonus_weight: float = 0.12
     bbox_bonus_weight: float = 0.06
 
+
+    # Target-aware value map cue generation.
+    visual_cue_yes_weight: float = 0.95
+    visual_cue_maybe_weight: float = 0.55
+    spatial_cue_yes_weight: float = 1.00
+    spatial_cue_maybe_weight: float = 0.65
+    cue_recent_window_steps: int = 30
+
+    # Approach requires stable spatial evidence.
+    approach_min_position_confidence: float = 0.35
+    approach_min_position_stability: float = 0.35
+    approach_min_position_observations: int = 1
+
     position_history_size: int = 6
 
     # Step 15: Approach rollback / failure feedback.
@@ -218,6 +233,14 @@ class TargetEvidenceManagerConfig:
         self.spatial_anchor_bonus = float(self.spatial_anchor_bonus)
         self.recent_bonus_weight = float(self.recent_bonus_weight)
         self.bbox_bonus_weight = float(self.bbox_bonus_weight)
+        self.visual_cue_yes_weight = float(self.visual_cue_yes_weight)
+        self.visual_cue_maybe_weight = float(self.visual_cue_maybe_weight)
+        self.spatial_cue_yes_weight = float(self.spatial_cue_yes_weight)
+        self.spatial_cue_maybe_weight = float(self.spatial_cue_maybe_weight)
+        self.cue_recent_window_steps = max(1, int(self.cue_recent_window_steps))
+        self.approach_min_position_confidence = float(self.approach_min_position_confidence)
+        self.approach_min_position_stability = float(self.approach_min_position_stability)
+        self.approach_min_position_observations = max(1, int(self.approach_min_position_observations))
         self.position_history_size = max(1, int(self.position_history_size))
         self.approach_feedback_cooldown_steps = max(1, int(self.approach_feedback_cooldown_steps))
         self.approach_no_progress_limit = max(1, int(self.approach_no_progress_limit))
@@ -376,6 +399,7 @@ class TargetEvidenceUpdate:
 
     best_evidence: Optional[TargetEvidence] = None
     best_approach_candidate: Optional[TargetEvidence] = None
+    target_cue_result: Optional[TargetCueResult] = None
     summary: Dict[str, Any] = field(default_factory=dict)
 
     def to_log_dict(self) -> Dict[str, Any]:
@@ -391,6 +415,7 @@ class TargetEvidenceUpdate:
             "ignored_results": dict(self.ignored_results),
             "best_evidence": None if self.best_evidence is None else self.best_evidence.to_log_dict(),
             "best_approach_candidate": None if self.best_approach_candidate is None else self.best_approach_candidate.to_log_dict(),
+            "target_cue_result": None if self.target_cue_result is None else self.target_cue_result.to_log_dict(),
             "summary": dict(self.summary),
         }
 
@@ -575,6 +600,10 @@ class TargetEvidenceManager:
 
         update.best_approach_candidate = self.get_best_approach_candidate()
         update.best_evidence = self.get_best_evidence(allow_tentative=True)
+        update.target_cue_result = self.build_target_cue_result(
+            current_step=int(current_step),
+            source_update=update,
+        )
         update.summary = self._build_summary()
 
         self.latest_update = update
@@ -886,7 +915,11 @@ class TargetEvidenceManager:
 
         if self._is_task2_passed(track, current_step=current_step):
             track.task2_admission = "passed"
-            track.approach_ready = True
+            track.approach_ready = self._has_stable_spatial_anchor(track)
+            if track.approach_ready:
+                evidence.set_verified("stable spatial target position ready for approach")
+            elif evidence.status == CandidateStatus.VERIFIED:
+                evidence.status = CandidateStatus.TENTATIVE
         else:
             track.task2_admission = "pending"
             track.approach_ready = False
@@ -926,6 +959,151 @@ class TargetEvidenceManager:
             return True
 
         return False
+
+
+    def _has_stable_spatial_anchor(self, track: EvidenceTrack) -> bool:
+        evidence = track.evidence
+
+        if evidence.position_3d is None:
+            return False
+        if len(track.position_history) < self.config.approach_min_position_observations:
+            return False
+        if evidence.position_confidence < self.config.approach_min_position_confidence:
+            return False
+        if evidence.position_stability < self.config.approach_min_position_stability:
+            return False
+
+        return True
+
+    def build_target_cue_result(
+        self,
+        current_step: int,
+        source_update: Optional[TargetEvidenceUpdate] = None,
+    ) -> TargetCueResult:
+        current_step = int(current_step)
+        cues: List[TargetCueScore] = []
+
+        if source_update is not None:
+            track_ids = list(source_update.updated_track_ids)
+        else:
+            track_ids = list(self.tracks.keys())
+
+        for track_id in track_ids:
+            track = self.tracks.get(track_id)
+            if track is None:
+                continue
+
+            cue = self._track_to_target_cue(track, current_step=current_step)
+            if cue is not None:
+                cues.append(cue)
+
+        return TargetCueResult(
+            request_id=new_id("targetcue"),
+            episode_id=self.current_episode_id or "unknown_episode",
+            submit_step=current_step,
+            return_step=current_step,
+            cues=cues,
+            success=True,
+            metadata={
+                "source": "TargetEvidenceManager",
+                "track_count": len(self.tracks),
+                "cue_count": len(cues),
+            },
+        )
+
+    def _track_to_target_cue(
+        self,
+        track: EvidenceTrack,
+        current_step: int,
+    ) -> Optional[TargetCueScore]:
+        evidence = track.evidence
+
+        if evidence.status in (CandidateStatus.REJECTED, CandidateStatus.LOST):
+            return None
+        if track.task2_admission == "rejected":
+            return None
+        if track.approach_ready:
+            return None
+
+        latest = track.latest_observation()
+        if latest is None:
+            return None
+        if not latest.is_positive_like():
+            return None
+
+        age = max(0, int(current_step) - int(latest.step_id))
+        if age > self.config.cue_recent_window_steps:
+            return None
+
+        if latest.has_spatial_anchor():
+            cue_type = "spatial"
+            base_value = (
+                self.config.spatial_cue_yes_weight
+                if latest.decision == Task2Decision.YES
+                else self.config.spatial_cue_maybe_weight
+            )
+        else:
+            cue_type = "visual"
+            base_value = (
+                self.config.visual_cue_yes_weight
+                if latest.decision == Task2Decision.YES
+                else self.config.visual_cue_maybe_weight
+            )
+
+        recent_factor = max(
+            0.25,
+            1.0 - float(age) / float(max(1, self.config.cue_recent_window_steps)),
+        )
+        task2_conf = clamp01(latest.confidence)
+        gdino_score = clamp01(latest.gdino_score)
+        quality_score = clamp01(latest.quality_score)
+
+        cue_value = clamp01(base_value * (0.65 + 0.35 * task2_conf))
+        cue_confidence = clamp01(
+            recent_factor
+            * (
+                0.45 * task2_conf
+                + 0.25 * max(gdino_score, quality_score)
+                + 0.20 * self._bbox_quality_bonus(latest)
+                + 0.10
+            )
+        )
+
+        if cue_type == "spatial":
+            cue_confidence = clamp01(
+                cue_confidence
+                * (0.60 + 0.40 * clamp01(latest.position_confidence))
+            )
+
+        return TargetCueScore(
+            request_id=new_id("cue"),
+            episode_id=latest.episode_id,
+            step_id=int(latest.step_id),
+            view_id=latest.view_id or "front",
+            frame_id=latest.frame_id or "",
+            cue_type=cue_type,
+            cue_value=cue_value,
+            cue_confidence=cue_confidence,
+            candidate_id=latest.candidate_id,
+            track_id=evidence.target_id,
+            bbox_center_norm=latest.bbox_center_norm,
+            bbox_area_ratio=latest.bbox_area_ratio,
+            candidate_position=latest.position_3d,
+            position_confidence=latest.position_confidence,
+            depth_valid=latest.depth_valid,
+            task2_decision=latest.decision,
+            task2_confidence=latest.confidence,
+            gdino_score=latest.gdino_score,
+            reason="target evidence cue: {} candidate without stable approach target".format(cue_type),
+            metadata={
+                "task2_admission": track.task2_admission,
+                "approach_ready": bool(track.approach_ready),
+                "anchor_type": track.anchor_type,
+                "rank_score": float(track.rank_score),
+                "position_stability": float(evidence.position_stability),
+                "position_confidence": float(evidence.position_confidence),
+            },
+        )
 
     def _should_reject(self, track: EvidenceTrack) -> bool:
         evidence = track.evidence

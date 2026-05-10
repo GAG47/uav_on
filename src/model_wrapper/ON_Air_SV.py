@@ -52,6 +52,7 @@ class SVNAVEpisodeState:
     created_at: float = field(default_factory=now_ts)
     last_step_id: int = -1
     last_observation_id: Optional[str] = None
+    frame_lookup: Dict[str, FrameRecord] = field(default_factory=dict)
     last_task1_request_id: Optional[str] = None
     last_task1_result_id: Optional[str] = None
     last_task1_update_summary: Optional[Dict[str, Any]] = None
@@ -69,6 +70,7 @@ class SVNAVEpisodeState:
     last_task2_summary: Optional[Dict[str, Any]] = None
     last_task2_cleanup_summary: Optional[Dict[str, Any]] = None
     last_target_evidence_summary: Optional[Dict[str, Any]] = None
+    last_target_cue_summary: Optional[Dict[str, Any]] = None
     best_target_evidence: Optional[Dict[str, Any]] = None
 
     def to_log_dict(self) -> Dict[str, Any]:
@@ -269,6 +271,10 @@ class ONAirSV(ONAir):
                     step_id=step_id,
                     nav_decision=decision,
                 )
+                self._update_target_cues_to_semantic_map(
+                    state=state,
+                    step_id=step_id,
+                )
 
                 action = decision.action or "rotl"
                 step_size = decision.step_size
@@ -297,6 +303,92 @@ class ONAirSV(ONAir):
     # ------------------------------------------------------------------
     # Search / Approach mode selection
     # ------------------------------------------------------------------
+
+
+    def _update_target_cues_to_semantic_map(
+        self,
+        state: SVNAVEpisodeState,
+        step_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Feed GDINO/Task2 target cues back into the target-aware SemanticMap.
+
+        This makes visual/spatial candidates influence Search through the map,
+        while Approach still requires a stable 3D target_position.
+        """
+        evidence_manager = getattr(state, "target_evidence_manager", None)
+        semantic_map = getattr(state, "semantic_map", None)
+
+        if evidence_manager is None or semantic_map is None:
+            return None
+        if not hasattr(evidence_manager, "build_target_cue_result"):
+            return None
+        if not hasattr(semantic_map, "update_from_target_cue_result"):
+            return None
+
+        frame_lookup = getattr(state, "frame_lookup", None)
+        if frame_lookup is None:
+            frame_lookup = {}
+
+        cue_result = evidence_manager.build_target_cue_result(current_step=int(step_id))
+        summary = semantic_map.update_from_target_cue_result(
+            result=cue_result,
+            frame_lookup=frame_lookup,
+        )
+
+        state.last_target_cue_summary = summary
+
+        if summary and int(summary.get("updated_cells", 0)) > 0:
+            print(
+                "[SVNavTargetCue] episode={} step={} cues={} visual={} spatial={} updated_cells={}".format(
+                    state.episode_id,
+                    step_id,
+                    summary.get("cue_count", 0),
+                    summary.get("visual_cue_count", 0),
+                    summary.get("spatial_cue_count", 0),
+                    summary.get("updated_cells", 0),
+                )
+            )
+
+        return summary
+
+    def _svnav_evidence_can_approach(self, evidence, step_id: int) -> bool:
+        if evidence is None:
+            return False
+
+        metadata = getattr(evidence, "metadata", {}) or {}
+        status = getattr(getattr(evidence, "status", None), "value", str(getattr(evidence, "status", "")))
+        if status in ("rejected", "lost"):
+            return False
+
+        if metadata.get("task2_admission") != "passed":
+            return False
+        if metadata.get("approach_ready") is False:
+            return False
+
+        position = getattr(evidence, "position_3d", None)
+        if position is None:
+            return False
+
+        try:
+            pos_conf = float(getattr(evidence, "position_confidence", 0.0))
+            pos_stability = float(getattr(evidence, "position_stability", 0.0))
+        except Exception:
+            return False
+
+        if pos_conf <= 0.0 or pos_stability <= 0.0:
+            return False
+
+        blocked_until = metadata.get("approach_blocked_until_step")
+        if blocked_until is not None:
+            try:
+                if int(step_id) < int(blocked_until):
+                    return False
+            except Exception:
+                pass
+
+        return True
+
 
     # ------------------------------------------------------------------
     # SVNav Step15 approach session helpers
@@ -328,7 +420,7 @@ class ONAirSV(ONAir):
             setattr(state, "active_approach_target_id", None)
             return None
 
-        if metadata.get("task2_admission") != "passed":
+        if not self._svnav_evidence_can_approach(evidence, step_id):
             setattr(state, "active_approach_target_id", None)
             return None
 
@@ -357,6 +449,8 @@ class ONAirSV(ONAir):
 
         candidate = evidence_manager.get_best_approach_candidate(current_step=step_id)
         if candidate is None:
+            return None
+        if not self._svnav_evidence_can_approach(candidate, step_id):
             return None
 
         setattr(state, "active_approach_target_id", candidate.target_id)

@@ -897,6 +897,121 @@ class Task2Result:
         }
 
 
+
+@dataclass
+class TargetCueScore:
+    """
+    Target-aware search cue generated from GDINO + Task2 evidence.
+
+    This is not a stable target position and must not directly trigger
+    Approach or Stop. It is used by SemanticMap to update target-aware
+    search values.
+
+    cue_type:
+        visual  - candidate is visually plausible but has no reliable 3D position
+        spatial - candidate has a coarse candidate_position but is not stable yet
+    """
+    request_id: str
+    episode_id: str
+    step_id: int
+    view_id: ViewID
+    frame_id: str
+    cue_type: str
+    cue_value: float
+    cue_confidence: float
+
+    candidate_id: Optional[str] = None
+    track_id: Optional[str] = None
+
+    bbox_center_norm: Optional[Tuple[float, float]] = None
+    bbox_area_ratio: float = 0.0
+
+    candidate_position: Optional[Tuple[float, float, float]] = None
+    position_confidence: float = 0.0
+    depth_valid: bool = False
+
+    task2_decision: Task2Decision = Task2Decision.UNKNOWN
+    task2_confidence: float = 0.0
+    gdino_score: float = 0.0
+
+    reason: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.view_id = ViewID.from_any(self.view_id)
+        self.cue_type = str(self.cue_type or "visual").lower()
+        if self.cue_type not in ("visual", "spatial"):
+            self.cue_type = "visual"
+
+        self.cue_value = clamp01(self.cue_value)
+        self.cue_confidence = clamp01(self.cue_confidence)
+        self.bbox_area_ratio = clamp01(self.bbox_area_ratio)
+        self.position_confidence = clamp01(self.position_confidence)
+        self.task2_decision = Task2Decision.from_any(self.task2_decision)
+        self.task2_confidence = clamp01(self.task2_confidence)
+        self.gdino_score = clamp01(self.gdino_score)
+
+    def to_log_dict(self) -> Dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "episode_id": self.episode_id,
+            "step_id": int(self.step_id),
+            "view_id": self.view_id.value,
+            "frame_id": self.frame_id,
+            "cue_type": self.cue_type,
+            "cue_value": float(self.cue_value),
+            "cue_confidence": float(self.cue_confidence),
+            "candidate_id": self.candidate_id,
+            "track_id": self.track_id,
+            "bbox_center_norm": _json_safe(self.bbox_center_norm),
+            "bbox_area_ratio": float(self.bbox_area_ratio),
+            "candidate_position": _json_safe(self.candidate_position),
+            "position_confidence": float(self.position_confidence),
+            "depth_valid": bool(self.depth_valid),
+            "task2_decision": self.task2_decision.value,
+            "task2_confidence": float(self.task2_confidence),
+            "gdino_score": float(self.gdino_score),
+            "reason": self.reason,
+            "metadata": _json_safe(self.metadata),
+        }
+
+
+@dataclass
+class TargetCueResult:
+    """
+    A batch of TargetCueScore objects.
+
+    This mirrors Task1Result structurally, but it is produced by
+    TargetEvidenceManager and consumed by SemanticMap.
+    """
+    request_id: str
+    episode_id: str
+    submit_step: int
+    return_step: int
+    cues: List[TargetCueScore] = field(default_factory=list)
+    success: bool = True
+    error: Optional[str] = None
+    raw_response: Optional[str] = None
+    latency_ms: Optional[float] = None
+    returned_at: float = field(default_factory=now_ts)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_log_dict(self) -> Dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "episode_id": self.episode_id,
+            "submit_step": int(self.submit_step),
+            "return_step": int(self.return_step),
+            "cues": [cue.to_log_dict() for cue in self.cues],
+            "success": bool(self.success),
+            "error": self.error,
+            "raw_response": self.raw_response,
+            "latency_ms": self.latency_ms,
+            "returned_at": float(self.returned_at),
+            "metadata": _json_safe(self.metadata),
+        }
+
+
 @dataclass
 class TargetEvidence:
     """
@@ -1267,6 +1382,8 @@ __all__ = [
     "ObservationRecord",
     "PoseRecord",
     "RegionScore",
+    "TargetCueScore",
+    "TargetCueResult",
     "TargetEvidence",
     "TargetInfo",
     "Task1Request",
