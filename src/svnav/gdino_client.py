@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .candidate_filter import GDINOCandidateFilter, GDINOCandidateFilterConfig
 from .candidate_geometry import CandidateGeometryEstimator, CandidateGeometryConfig
+from .prompts import build_gdino_detection_prompt
 from .types import (
     BBox,
     FrameRecord,
@@ -177,67 +178,27 @@ class SVNavGDINOClient:
             }
 
     def build_prompt(self, target_info: TargetInfo) -> str:
+        """
+        Build GroundingDINO detection prompt from TargetInfo.
+
+        Keep the prompt as short object phrases, but use target size /
+        description / instruction to extract useful visual phrases.
+        Full target description is still handled by Task1 and Task2 prompts.
+        """
+        try:
+            prompt = build_gdino_detection_prompt(
+                target_info=target_info,
+                max_phrases=10,
+                max_words=6,
+            )
+            if prompt:
+                return prompt
+        except Exception:
+            pass
+
         name = target_info.name or ""
         name_words = _camel_to_words(name)
-
-        phrases = [
-            name_words,
-            name.lower(),
-        ]
-
-        aliases = {
-            "woodenbox": [
-                "wooden box",
-                "wood box",
-                "wooden crate",
-                "crate",
-                "storage box",
-                "box",
-            ],
-            "wooden box": [
-                "wooden box",
-                "wood box",
-                "wooden crate",
-                "crate",
-                "storage box",
-                "box",
-            ],
-            "barrel": [
-                "barrel",
-                "oil barrel",
-                "drum",
-            ],
-            "trashcan": [
-                "trash can",
-                "garbage can",
-                "bin",
-            ],
-            "trash can": [
-                "trash can",
-                "garbage can",
-                "bin",
-            ],
-        }
-
-        key_candidates = [
-            name.strip().lower(),
-            name_words.strip().lower(),
-            name.strip().lower().replace(" ", ""),
-        ]
-
-        for key in key_candidates:
-            if key in aliases:
-                phrases.extend(aliases[key])
-
-        if target_info.description:
-            description_words = _camel_to_words(target_info.description)
-            if 0 < len(description_words.split()) <= 5:
-                phrases.append(description_words)
-
-        prompt_phrases = _deduplicate_keep_order(phrases)
-        if not prompt_phrases:
-            prompt_phrases = ["object"]
-
+        prompt_phrases = _deduplicate_keep_order([name_words, name.lower(), "object"])
         return ". ".join(prompt_phrases) + "."
 
     def detect_frame(
