@@ -14,7 +14,7 @@ root_dir="/home/tjn2004/uav/UAV_ON"
 SCENE_NAME="${SCENE_NAME:-CabinLake}"
 
 DATASET_ROOT="/home/tjn2004/uav/DATASET/UAV-ON-data/valset"
-DATASET_PATH="/home/tjn2004/uav/DATASET/UAV-ON-data/valset/DownTown.json"
+DATASET_PATH="/home/tjn2004/uav/DATASET/UAV-ON-data/valset/Barnyard.json"
 
 # 用法：
 #   bash scripts/eval_random_batched.sh
