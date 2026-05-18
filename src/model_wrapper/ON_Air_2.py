@@ -53,8 +53,19 @@ class ONAir(BaseModelWrapper):
         self.local_planners = [None for _ in range(batch_size)]
         self.planned_paths = [{} for _ in range(batch_size)]
 
-        self.grounding_dino_client = GroundingDINOClient()
+        self.ablate_no_gdino = os.environ.get("AIRHUNT_ABLATE_NO_GDINO", "0") == "1"
+        if self.ablate_no_gdino:
+            self.grounding_dino_client = None
+            print("[Ablation] w/o GDINO: GroundingDINO disabled, use VLM semantic stop.")
+        else:
+            self.grounding_dino_client = GroundingDINOClient()
         self.grounding_dino_results = [{} for _ in range(batch_size)]
+        self.wo_gdino_modes = ["explore" for _ in range(batch_size)]
+        self.wo_gdino_approach_counts = [0 for _ in range(batch_size)]
+        self.wo_gdino_lost_counts = [0 for _ in range(batch_size)]
+        self.wo_gdino_last_regions = [None for _ in range(batch_size)]
+        self.vlm_stop_counts = [0 for _ in range(batch_size)]
+        self.vlm_stop_last_regions = [None for _ in range(batch_size)]
 
         self.target_trackers = [TargetTracker() for _ in range(batch_size)]
         self.target_tracker_infos = [{} for _ in range(batch_size)]
@@ -193,39 +204,45 @@ class ONAir(BaseModelWrapper):
             self.grounding_dino_results[i] = grounding_result
             self.print_grounding_dino_result(i, grounding_result)
 
-            tracker_info = self.target_trackers[i].update(
-                grounding_result=grounding_result,
-                current_pose=self.current_poses[i],
-                depth_info=depth_info,
-                step_num=step_num
-            )
-
-            verification_info = self.target_verifier.verify_sync(
-                object_name=object_name,
-                object_size=object_size,
-                description=description,
-                captions4=captions4,
-                rgb_images=episode_rgb_images[i],
-                tracker_info=tracker_info,
-                semantic_result=None,
-                encode_image_fn=encode_image,
-                generate_caption_fn=generate_caption
-            )
-
-            tracker_info = self.target_trackers[i].apply_verification(
-                tracker_info=tracker_info,
-                verification_info=verification_info
-            )
-
+            if self.ablate_no_gdino:
+                tracker_info = self.empty_tracker_info(step_num)
+                verification_info = self.empty_verification_info(
+                    reason="ablation: GroundingDINO disabled, use VLM semantic stop"
+                )
+            else:
+                tracker_info = self.target_trackers[i].update(
+                    grounding_result=grounding_result,
+                    current_pose=self.current_poses[i],
+                    depth_info=depth_info,
+                    step_num=step_num
+                )
+            
+                verification_info = self.target_verifier.verify_sync(
+                    object_name=object_name,
+                    object_size=object_size,
+                    description=description,
+                    captions4=captions4,
+                    rgb_images=episode_rgb_images[i],
+                    tracker_info=tracker_info,
+                    semantic_result=None,
+                    encode_image_fn=encode_image,
+                    generate_caption_fn=generate_caption
+                )
+            
+                tracker_info = self.target_trackers[i].apply_verification(
+                    tracker_info=tracker_info,
+                    verification_info=verification_info
+                )
+            
             self.target_tracker_infos[i] = tracker_info
             self.target_verification_infos[i] = verification_info
-
+            
             navigation_info = self.navigation_states[i].update(
                 tracker_info=tracker_info,
                 step_num=step_num
             )
             self.navigation_infos[i] = navigation_info
-
+            
             self.print_target_tracker(i, tracker_info)
             self.print_target_verification(i, verification_info)
             self.print_navigation_state(i, navigation_info)
@@ -321,11 +338,86 @@ class ONAir(BaseModelWrapper):
             self.navigation_infos[index] = {}
 
             self.grounding_dino_results[index] = {}
+            if hasattr(self, "wo_gdino_modes"):
+                self.wo_gdino_modes[index] = "explore"
+                self.wo_gdino_approach_counts[index] = 0
+                self.wo_gdino_lost_counts[index] = 0
+                self.wo_gdino_last_regions[index] = None
+            if hasattr(self, "vlm_stop_counts"):
+                self.vlm_stop_counts[index] = 0
+            if hasattr(self, "vlm_stop_last_regions"):
+                self.vlm_stop_last_regions[index] = None
 
             if os.environ.get("AIRHUNT_VERBOSE_EVAL", "0") == "1":
                 print(f"[Semantic Memory] Episode {index}: initialized")
 
+    def empty_tracker_info(self, step_num=0):
+        return {
+            "candidate": False,
+            "horizontal_candidate": False,
+            "down_candidate": False,
+            "overhead_candidate": False,
+            "consistent": False,
+            "same_object": False,
+            "stable_track": False,
+            "geometric_confirmed": False,
+            "verification_required": False,
+            "confirmed": False,
+            "verified": False,
+            "stop_ready": False,
+            "geometric_stop_ready": False,
+            "planner_target": self.default_memory_target(),
+            "stable_target_position": None,
+            "stable_target_score": 0.0,
+            "verified_target": None,
+            "verified_target_position": None,
+            "verified_candidate_id": None,
+            "verified_track_id": None,
+            "best_track": None,
+            "best_stable_track": None,
+            "track_count": 0,
+            "candidate_buffer_size": 0,
+            "confirm_count": 0,
+            "required_count": 0,
+            "lost_count": 0,
+            "navigate_count": 0,
+            "step_num": step_num,
+            "observation": {},
+            "reason": "ablation: GroundingDINO disabled"
+        }
+
+    def empty_verification_info(self, reason=""):
+        return {
+            "checked": False,
+            "verified": False,
+            "confidence": 0.0,
+            "same_object": False,
+            "selected_candidate_id": None,
+            "selected_track_id": None,
+            "selected_candidate": None,
+            "reason": reason,
+            "reject_reason": "",
+            "hard_reject": False,
+            "candidate_count": 0,
+            "candidates": [],
+            "candidate_debug": [],
+            "crop_caption": "",
+            "raw_response": "",
+            "parsed_response": {}
+        }
+
     def run_grounding_dino_detection(self, index, rgb_images, object_name, description, step_num):
+        if self.ablate_no_gdino:
+            return {
+                "available": False,
+                "ablated": True,
+                "error": "ablation: GroundingDINO disabled",
+                "detections": [],
+                "best_detection": None,
+                "best_score": 0.0,
+                "num_detections": 0
+            }
+
         try:
             if self.grounding_dino_client is None:
                 return {
@@ -345,7 +437,6 @@ class ONAir(BaseModelWrapper):
                 step_num=step_num
             )
             return result
-
         except Exception as e:
             print(f"[GroundingDINO] Episode {index}: detection failed: {e}")
             return {
@@ -447,10 +538,222 @@ class ONAir(BaseModelWrapper):
             print(f"[WARNING] failed to update semantic memory for episode {index}: {e}")
             return None
 
+    def wo_gdino_target_controller(self, index, semantic_result):
+        target_visible = bool(semantic_result.get("target_visible", False))
+        target_confidence = self.normalize_score(
+            semantic_result.get("target_confidence", 0.0),
+            default_score=0.0
+        )
+
+        stop_ready = bool(semantic_result.get("stop_ready", False))
+        stop_confidence = self.normalize_score(
+            semantic_result.get("stop_confidence", 0.0),
+            default_score=0.0
+        )
+
+        best_region = semantic_result.get("best_region", "front")
+        if best_region not in ["front", "left", "right"]:
+            best_region = "front"
+
+        previous_mode = self.wo_gdino_modes[index]
+        confidence = max(target_confidence, stop_confidence)
+
+        can_stop = (
+            (stop_ready and stop_confidence >= 0.55 and (target_visible or target_confidence >= 0.50))
+            or (target_visible and target_confidence >= 0.75)
+        )
+
+        if can_stop:
+            self.wo_gdino_modes[index] = "stop"
+            self.wo_gdino_approach_counts[index] = 0
+            self.wo_gdino_lost_counts[index] = 0
+            self.wo_gdino_last_regions[index] = best_region
+            return {
+                "decision": "stop",
+                "previous_mode": previous_mode,
+                "mode": "stop",
+                "confidence": confidence,
+                "target_visible": target_visible,
+                "target_confidence": target_confidence,
+                "stop_ready": stop_ready,
+                "stop_confidence": stop_confidence,
+                "best_region": best_region,
+                "approach_count": 0,
+                "lost_count": 0,
+                "reason": semantic_result.get("stop_reason", "VLM target controller stop")
+            }
+
+        can_approach = target_visible and target_confidence >= 0.50
+        keep_approach = (
+            previous_mode == "approach"
+            and target_visible
+            and target_confidence >= 0.40
+        )
+
+        if can_approach or keep_approach:
+            if self.wo_gdino_last_regions[index] == best_region:
+                self.wo_gdino_approach_counts[index] += 1
+            else:
+                self.wo_gdino_last_regions[index] = best_region
+                self.wo_gdino_approach_counts[index] = 1
+
+            self.wo_gdino_lost_counts[index] = 0
+            self.wo_gdino_modes[index] = "approach"
+
+            return {
+                "decision": "approach",
+                "previous_mode": previous_mode,
+                "mode": "approach",
+                "confidence": confidence,
+                "target_visible": target_visible,
+                "target_confidence": target_confidence,
+                "stop_ready": stop_ready,
+                "stop_confidence": stop_confidence,
+                "best_region": best_region,
+                "approach_count": self.wo_gdino_approach_counts[index],
+                "lost_count": 0,
+                "reason": "VLM target visible but not ready to stop"
+            }
+
+        if previous_mode == "approach":
+            self.wo_gdino_lost_counts[index] += 1
+        else:
+            self.wo_gdino_lost_counts[index] = 0
+
+        if self.wo_gdino_lost_counts[index] >= 2:
+            self.wo_gdino_modes[index] = "explore"
+            self.wo_gdino_approach_counts[index] = 0
+            self.wo_gdino_last_regions[index] = None
+
+        return {
+            "decision": "explore",
+            "previous_mode": previous_mode,
+            "mode": self.wo_gdino_modes[index],
+            "confidence": confidence,
+            "target_visible": target_visible,
+            "target_confidence": target_confidence,
+            "stop_ready": stop_ready,
+            "stop_confidence": stop_confidence,
+            "best_region": best_region,
+            "approach_count": self.wo_gdino_approach_counts[index],
+            "lost_count": self.wo_gdino_lost_counts[index],
+            "reason": "no reliable VLM target evidence"
+        }
+
+    def make_wo_gdino_semantic_target(self, index, controller_info):
+        current_pose = self.current_poses[index]
+        if not current_pose or len(current_pose) < 4:
+            current_pose = [0.0, 0.0, 0.0, 0.0]
+
+        x, y, z, yaw = current_pose[0], current_pose[1], current_pose[2], current_pose[3]
+        region = controller_info.get("best_region", "front")
+        confidence = float(controller_info.get("confidence", 0.0))
+
+        if region == "left":
+            relative_angle = 45.0
+        elif region == "right":
+            relative_angle = -45.0
+        else:
+            relative_angle = 0.0
+
+        distance = 4.0 if confidence < 0.65 else 5.0
+        heading = math.radians(yaw + relative_angle)
+        tx = round(x + math.cos(heading) * distance, 2)
+        ty = round(y + math.sin(heading) * distance, 2)
+
+        semantic_result = self.semantic_results[index] if index < len(self.semantic_results) else {}
+        if not isinstance(semantic_result, dict):
+            semantic_result = {}
+
+        safety_scores = semantic_result.get("safety_scores", {})
+        region_scores = semantic_result.get("region_scores", {})
+        novelty_scores = semantic_result.get("novelty_scores", {})
+
+        target = self.default_memory_target()
+        target["valid"] = True
+        target["target_type"] = "vlm_semantic_target_wo_gdino"
+        target["position"] = (tx, ty)
+        target["viewpoint_position"] = (tx, ty)
+        target["frontier_position"] = (tx, ty)
+        target["score"] = confidence
+        target["semantic_value"] = region_scores.get(region, confidence)
+        target["confidence"] = confidence
+        target["safety_value"] = safety_scores.get(region, 0.5)
+        target["novelty_value"] = novelty_scores.get(region, 0.5)
+        target["distance"] = distance
+        target["target_yaw"] = yaw + relative_angle
+        target["relative_angle"] = relative_angle
+        target["relative_region"] = region
+        target["stop_reason"] = ""
+        target["controller_info"] = controller_info
+        return target
+
+    def make_wo_gdino_stop_target(self, index, controller_info):
+        target = self.default_memory_target()
+        target["valid"] = True
+        target["target_type"] = "vlm_semantic_stop_wo_gdino"
+        target["position"] = self.get_current_xy(index)
+        target["viewpoint_position"] = self.get_current_xy(index)
+        target["target_world_position"] = None
+        target["score"] = controller_info.get("confidence", 0.0)
+        target["confidence"] = controller_info.get("confidence", 0.0)
+        target["relative_region"] = controller_info.get("best_region", "front")
+        target["stop_reason"] = controller_info.get("reason", "VLM target controller stop")
+        target["controller_info"] = controller_info
+        return target
+
     def select_navigation_action(self, index, semantic_result, fixed):
         navigation_info = self.navigation_infos[index]
         mode = navigation_info.get("mode", "explore")
         planner_target = navigation_info.get("planner_target", None)
+
+        if self.ablate_no_gdino:
+            controller_info = self.wo_gdino_target_controller(index, semantic_result)
+            decision = controller_info.get("decision", "explore")
+
+            print(
+                "[w/o GDINO] VLM TargetController "
+                f"Episode {index}: "
+                f"decision={decision}, "
+                f"mode={controller_info.get('previous_mode', 'explore')}->{controller_info.get('mode', 'explore')}, "
+                f"target_visible={controller_info.get('target_visible', False)}, "
+                f"target_conf={controller_info.get('target_confidence', 0.0):.2f}, "
+                f"stop_ready={controller_info.get('stop_ready', False)}, "
+                f"stop_conf={controller_info.get('stop_confidence', 0.0):.2f}, "
+                f"region={controller_info.get('best_region', 'front')}, "
+                f"approach={controller_info.get('approach_count', 0)}, "
+                f"lost={controller_info.get('lost_count', 0)}"
+            )
+
+            if decision == "stop":
+                stop_target = self.make_wo_gdino_stop_target(index, controller_info)
+                self.memory_targets[index] = stop_target
+                print(
+                    "[w/o GDINO] VLM STOP "
+                    f"Episode {index}: "
+                    f"conf={stop_target.get('confidence', 0.0):.2f}, "
+                    f"region={stop_target.get('relative_region', 'front')}, "
+                    f"reason={stop_target.get('stop_reason', '')}"
+                )
+                return "stop", 0, True, stop_target
+
+            if decision == "approach":
+                semantic_target = self.make_wo_gdino_semantic_target(index, controller_info)
+                action, value, done = self.target_to_legacy_action(
+                    target=semantic_target,
+                    semantic_result=semantic_result,
+                    fixed=fixed
+                )
+                self.memory_targets[index] = semantic_target
+                print(
+                    "[w/o GDINO] VLM APPROACH "
+                    f"Episode {index}: "
+                    f"action={action}, value={value}, "
+                    f"target={semantic_target.get('position')}, "
+                    f"conf={semantic_target.get('confidence', 0.0):.2f}, "
+                    f"region={semantic_target.get('relative_region', 'front')}"
+                )
+                return action, value, done, semantic_target
 
         if isinstance(planner_target, dict):
             if planner_target.get("target_type", "") in [
@@ -541,7 +844,8 @@ class ONAir(BaseModelWrapper):
             "verified_target_stop",
             "gdino_stop",
             "gdino_verified_stop",
-            "gdino_position_stop"
+            "gdino_position_stop",
+            "vlm_semantic_stop_wo_gdino"
         ]:
             return "stop", 0, True
 
@@ -577,7 +881,11 @@ class ONAir(BaseModelWrapper):
         else:
             if action in ["rotl", "rotr"]:
                 value = min(60, max(15, abs(relative_angle)))
-            elif target_type.startswith("gdino") or target_type.startswith("verified"):
+            elif (
+                target_type.startswith("gdino")
+                or target_type.startswith("verified")
+                or target_type.startswith("vlm_semantic_target")
+            ):
                 value = self.estimate_target_step_size(target)
             else:
                 value = self.estimate_unfixed_step_size(
@@ -673,6 +981,14 @@ class ONAir(BaseModelWrapper):
         target_confidence = semantic_result.get("target_confidence", 0.0)
         target_confidence = self.normalize_score(target_confidence, default_score=0.0)
 
+        stop_ready = semantic_result.get("stop_ready", False)
+        stop_ready = self.normalize_bool(stop_ready)
+        stop_confidence = semantic_result.get("stop_confidence", target_confidence if target_visible else 0.0)
+        stop_confidence = self.normalize_score(stop_confidence, default_score=0.0)
+        stop_reason = semantic_result.get("stop_reason", "")
+        if not isinstance(stop_reason, str):
+            stop_reason = str(stop_reason)
+
         altitude_assessment = semantic_result.get("altitude_assessment", {})
         if not isinstance(altitude_assessment, dict):
             altitude_assessment = {}
@@ -697,6 +1013,9 @@ class ONAir(BaseModelWrapper):
             "best_region": best_region,
             "target_visible": target_visible,
             "target_confidence": target_confidence,
+            "stop_ready": stop_ready,
+            "stop_confidence": stop_confidence,
+            "stop_reason": stop_reason,
             "altitude_assessment": altitude_assessment,
             "reason": reason,
             "evidence": evidence
@@ -759,6 +1078,9 @@ class ONAir(BaseModelWrapper):
             "best_region": "front",
             "target_visible": False,
             "target_confidence": 0.0,
+            "stop_ready": False,
+            "stop_confidence": 0.0,
+            "stop_reason": "",
             "altitude_assessment": {
                 "target_size_level": "unknown",
                 "height_suitability": "unknown",
@@ -868,7 +1190,18 @@ class ONAir(BaseModelWrapper):
         try:
             if grounding_result is None:
                 return
-
+            if self.ablate_no_gdino:
+                print(
+                    "[GroundingDINO] "
+                    f"Episode {index}: disabled by ablation, detections=0"
+                )
+                return
+            if self.grounding_dino_client is None:
+                print(
+                    "[GroundingDINO] "
+                    f"Episode {index}: client is None, detections=0"
+                )
+                return
             summary = self.grounding_dino_client.summarize_result(grounding_result)
             print(
                 "[GroundingDINO] "
@@ -1076,6 +1409,8 @@ class ONAir(BaseModelWrapper):
             f"best={semantic_result['best_region']}, "
             f"llm_visible={semantic_result['target_visible']}, "
             f"llm_conf={semantic_result['target_confidence']:.2f}, "
+            f"llm_stop={semantic_result.get('stop_ready', False)}, "
+            f"stop_conf={semantic_result.get('stop_confidence', 0.0):.2f}, "
             f"action=[{action}, {value}]"
         )
 

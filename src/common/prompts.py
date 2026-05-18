@@ -3,7 +3,7 @@ unfixed_system_prompt = """# Prompt Header: Role & Rules
             Follow the given task goal and interpret the multimodal inputs to evaluate the target-finding potential of each observed spatial region.
 
             Your output will be used by a semantic memory module and a continuous path planner.
-            Your output must be a JSON object describing region-level semantic scores, safety scores, novelty scores, target visibility, and concise evidence.
+            Your output must be a JSON object describing region-level semantic scores, safety scores, novelty scores, target visibility, stop readiness, and concise evidence.
 
             # Coordinate System
             All positions are represented in the format: (x, y, z)
@@ -162,6 +162,11 @@ unfixed_system_prompt = """# Prompt Header: Role & Rules
             - Do not confuse a promising search region with confirmed target visibility.
 
             # Target Visibility Logic
+Additional stop rule:
+- target_visible should be true only when the target object itself is likely visible.
+- stop_ready should be true only when the target itself is likely visible and stopping now is appropriate.
+- Contextual cues can increase region scores, but they are not enough to confirm stop_ready.
+
             Set target_visible to true only when the current observations likely contain the target object itself.
 
             target_visible should be false when:
@@ -176,7 +181,15 @@ unfixed_system_prompt = """# Prompt Header: Role & Rules
             - 0.4 to 0.6: strong contextual cues or possible weak target evidence
             - 0.7 to 1.0: target object itself is likely visible
 
-            # Output Format Instruction
+            
+# Stop Decision Logic
+stop_ready indicates whether the UAV should stop at the current position.
+Set stop_ready to true only when the target object itself is likely visible and the current observation suggests that stopping now is appropriate.
+Do not set stop_ready to true for contextual cues only.
+stop_confidence should represent confidence that stopping now is correct.
+stop_reason should briefly explain the stop decision.
+
+# Output Format Instruction
             Return exactly one valid JSON object.
             Do not include Markdown.
             Do not include explanations outside the JSON object.
@@ -202,7 +215,7 @@ unfixed_system_prompt = """# Prompt Header: Role & Rules
               },
               "best_region": "front",
               "target_visible": false,
-              "target_confidence": 0.0,
+              "target_confidence": 0.0, "stop_ready": false, "stop_confidence": 0.0, "stop_reason": "brief reason for whether to stop now",
               "altitude_assessment": {
                 "target_size_level": "unknown",
                 "height_suitability": "unknown",
@@ -289,7 +302,7 @@ fixed_system_prompt = """# Prompt Header: Role & Rules
             Follow the given task goal and interpret the multimodal inputs to evaluate the target-finding potential of each observed spatial region.
 
             Your output will be used by a semantic memory module and a continuous path planner.
-            Your output must be a JSON object describing region-level semantic scores, safety scores, novelty scores, target visibility, and concise evidence.
+            Your output must be a JSON object describing region-level semantic scores, safety scores, novelty scores, target visibility, stop readiness, and concise evidence.
 
             # Coordinate System
             All positions are represented in the format: (x, y, z)
@@ -488,7 +501,7 @@ fixed_system_prompt = """# Prompt Header: Role & Rules
               },
               "best_region": "front",
               "target_visible": false,
-              "target_confidence": 0.0,
+              "target_confidence": 0.0, "stop_ready": false, "stop_confidence": 0.0, "stop_reason": "brief reason for whether to stop now",
               "altitude_assessment": {
                 "target_size_level": "unknown",
                 "height_suitability": "unknown",
